@@ -240,6 +240,119 @@ describe("Notion Markdown mapping", () => {
     );
   });
 
+  it("chooses reverse tokens against entity-decoded Markdown", () => {
+    const reversed = fromNotionMarkdown(
+      `GRANDBOXLOCAL&#84;OKEN0X0END and [paired](${PAGE_URL})\n`,
+      FIXTURE_LINKS,
+    );
+
+    expect(reversed.markdown).toBe(
+      "GRANDBOXLOCALTOKEN0X0END and [[Research/Paired Note.md|paired]]\n",
+    );
+    expect(reversed.unsupportedKinds).toEqual([]);
+  });
+
+  it.each([
+    [
+      "wiki",
+      "Ordinary [[Injected]] and \\[\\[Authorized\\]\\] then [[unclosed.\n",
+      "Ordinary \\[\\[Injected\\]\\] and [[Authorized]] then \\[\\[unclosed.\n",
+    ],
+    [
+      "embed",
+      "Ordinary ![[Injected]] and !\\[\\[Authorized\\]\\] then ![[unclosed.\n",
+      "Ordinary !\\[\\[Injected\\]\\] and ![[Authorized]] then !\\[\\[unclosed.\n",
+    ],
+  ])(
+    "fails closed per source range when a later %s construct is malformed",
+    (_kind, source, expected) => {
+      const reversed = fromNotionMarkdown(source, FIXTURE_LINKS);
+
+      expect(reversed.markdown).toBe(expected);
+      expect(reversed.unsupportedKinds).toEqual(["malformed-wikilink"]);
+    },
+  );
+
+  it("restores 4,097 reverse constructs with one bounded token pass", () => {
+    const prefixCollisions = [0, 1, 2, 3]
+      .map((index) => `GRANDBOXLOCALTOKEN${index}X`)
+      .join(" ");
+    const constructCount = 4_097;
+    const source = `${prefixCollisions}\n${"\\[\\[x\\]\\]".repeat(constructCount)}\n`;
+    const originalIncludes = String.prototype.includes;
+    const originalReplace = String.prototype.replace;
+    const originalReplaceAll = String.prototype.replaceAll;
+    let prefixChecks = 0;
+    let restorationPasses = 0;
+
+    String.prototype.includes = function boundedIncludes(
+      this: string,
+      searchString: string,
+      position?: number,
+    ): boolean {
+      if (searchString.startsWith("GRANDBOXLOCALTOKEN")) {
+        prefixChecks += 1;
+        if (prefixChecks > 8) {
+          throw new Error("unbounded reverse token prefix checks");
+        }
+      }
+      return originalIncludes.call(this, searchString, position);
+    };
+    String.prototype.replace = function boundedReplace(
+      this: string,
+      searchValue: string | RegExp,
+      replaceValue: string | ((substring: string, ...args: unknown[]) => string),
+    ): string {
+      if (
+        searchValue instanceof RegExp &&
+        originalIncludes.call(searchValue.source, "GRANDBOXLOCALTOKEN")
+      ) {
+        restorationPasses += 1;
+        if (restorationPasses > 1) {
+          throw new Error("multiple reverse token restoration passes");
+        }
+      }
+      return Reflect.apply(originalReplace, this, [searchValue, replaceValue]) as string;
+    };
+    String.prototype.replaceAll = function boundedReplaceAll(
+      this: string,
+      searchValue: string | RegExp,
+      replaceValue: string | ((substring: string, ...args: unknown[]) => string),
+    ): string {
+      if (typeof searchValue === "string" && searchValue.startsWith("GRANDBOXLOCALTOKEN")) {
+        restorationPasses += 1;
+        if (restorationPasses > 1) {
+          throw new Error("multiple reverse token restoration passes");
+        }
+      }
+      return Reflect.apply(originalReplaceAll, this, [searchValue, replaceValue]) as string;
+    };
+
+    try {
+      const reversed = fromNotionMarkdown(source, FIXTURE_LINKS);
+
+      expect(reversed.markdown).toBe(
+        `${prefixCollisions}\n${"[[x]]".repeat(constructCount)}\n`,
+      );
+      expect(prefixChecks).toBeLessThanOrEqual(8);
+      expect(restorationPasses).toBe(1);
+    } finally {
+      String.prototype.includes = originalIncludes;
+      String.prototype.replace = originalReplace;
+      String.prototype.replaceAll = originalReplaceAll;
+    }
+  });
+
+  it("preserves a paired Markdown link whose decoded label ends in a backslash", () => {
+    const source = `[alias\\\\](${PAGE_URL})\n`;
+    const reversed = fromNotionMarkdown(source, FIXTURE_LINKS);
+
+    expect(reversed.markdown).toBe(source);
+    expect(reversed.markdown).not.toContain("[[");
+    expect(reversed.unsupportedKinds).toEqual(["unsupported-paired-link-label"]);
+    expect(parseMarkdown(reversed.markdown).unsupportedKinds).not.toContain("malformed-wikilink");
+  });
+
   it("fails closed for duplicate or ambiguous reverse page mappings", async () => {
     const fixtureData = await jsonFixture<{ secondLocalTarget: string }>(
       "duplicate-page-mapping.fixture.json",

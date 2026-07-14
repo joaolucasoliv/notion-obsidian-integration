@@ -35,4 +35,12 @@ describe("normalizeLocal", () => {
 
     expect(semantic.tags).toEqual(["alpha", "\uE000", "😀"]);
   });
+
+  it("chooses internal wiki tokens against entity-decoded Markdown", () => {
+    const semantic = normalizeLocal(
+      parseMarkdown("GRANDBOXWIKI&#84;OKEN0X0END and [[Safe]]\n"),
+    );
+
+    expect(semantic.bodyMarkdown).toBe("GRANDBOXWIKITOKEN0X0END and [[Safe]]\n");
+  });
 });

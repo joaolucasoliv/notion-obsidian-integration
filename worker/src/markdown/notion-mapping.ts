@@ -11,6 +11,7 @@ import {
   stringifyMarkdown,
 } from "./normalize.js";
 import {
+  createDecodedTokenPrefix,
   maskObsidianSyntax,
   parseMarkdown,
   scanObsidianText,
@@ -433,31 +434,36 @@ function escapeLiteral(value: string): string {
 }
 
 class LocalTokenRegistry {
-  readonly #replacements = new Map<string, string>();
+  readonly #replacements: string[] = [];
   readonly #prefix: string;
-  #index = 0;
 
-  public constructor(source: string) {
-    let suffix = 0;
-    while (source.includes(`GRANDBOXLOCALTOKEN${suffix}X`)) {
-      suffix += 1;
-    }
-    this.#prefix = `GRANDBOXLOCALTOKEN${suffix}X`;
+  public constructor(document: ParsedMarkdownDocument, additionalValues: Iterable<string>) {
+    this.#prefix = createDecodedTokenPrefix(
+      document,
+      "GRANDBOXLOCALTOKEN",
+      additionalValues,
+    );
   }
 
   public token(value: string): Text {
-    const token = `${this.#prefix}${this.#index}END`;
-    this.#index += 1;
-    this.#replacements.set(token, value);
+    const index = this.#replacements.length;
+    if (index > 9_999_999) {
+      throw invalidMapping();
+    }
+    const token = `${this.#prefix}${index}END`;
+    this.#replacements.push(value);
     return text(token);
   }
 
   public restore(markdown: string): string {
-    let restored = markdown;
-    for (const [token, value] of this.#replacements) {
-      restored = restored.replaceAll(token, value);
+    if (this.#replacements.length === 0) {
+      return markdown;
     }
-    return restored;
+    const tokenPattern = new RegExp(`${this.#prefix}([0-9]{1,7})END`, "gu");
+    return markdown.replace(tokenPattern, (token, encodedIndex: string) => {
+      const replacement = this.#replacements[Number(encodedIndex)];
+      return replacement ?? token;
+    });
   }
 }
 
@@ -477,7 +483,7 @@ function validAlias(value: string): boolean {
     value.length > 0 &&
     value.trim() === value &&
     utf8Length(value) <= MAX_LINK_TARGET_BYTES &&
-    !/[|\[\]\r\n\u0000-\u001f\u007f]/u.test(value)
+    !/[\\|\[\]\r\n\u0000-\u001f\u007f]/u.test(value)
   );
 }
 
@@ -589,10 +595,9 @@ function splitDecodedCustomText(
   const scan = scanObsidianText(value);
   if (scan.malformed) {
     unsupported.add("malformed-wikilink");
-    return [registry.token(value)];
   }
   if (scan.constructs.length === 0) {
-    return [text(value)];
+    return [scan.malformed ? registry.token(escapeLiteral(value)) : text(value)];
   }
   const decodedBoundaries = new Set<number>();
   for (const construct of scan.constructs) {
@@ -604,7 +609,8 @@ function splitDecodedCustomText(
   let cursor = 0;
   for (const construct of scan.constructs) {
     if (construct.start > cursor) {
-      nodes.push(text(value.slice(cursor, construct.start)));
+      const before = value.slice(cursor, construct.start);
+      nodes.push(scan.malformed ? registry.token(escapeLiteral(before)) : text(before));
     }
     const rawStart = rawOffsets.get(construct.start);
     const rawEnd = rawOffsets.get(construct.end);
@@ -616,7 +622,8 @@ function splitDecodedCustomText(
     cursor = construct.end;
   }
   if (cursor < value.length) {
-    nodes.push(text(value.slice(cursor)));
+    const after = value.slice(cursor);
+    nodes.push(scan.malformed ? registry.token(escapeLiteral(after)) : text(after));
   }
   return nodes;
 }
@@ -727,7 +734,7 @@ export function fromNotionMarkdown(
   const unsupported = new Set(
     document.unsupportedKinds.filter((kind) => kind !== "raw-html" && kind !== "html-comment"),
   );
-  const registry = new LocalTokenRegistry(document.source);
+  const registry = new LocalTokenRegistry(document, index.byTarget.keys());
   transformFromNotion(root, document, index, unsupported, registry);
   const bodyMarkdown = registry.restore(stringifyMarkdown(root));
   const semantic = { bodyMarkdown, tags: normalizeTags(tags) };

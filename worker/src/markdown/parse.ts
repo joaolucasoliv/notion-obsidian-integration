@@ -121,9 +121,15 @@ function scanTextSource(raw: string, absoluteStart: number): TextScan {
     const contentStart = cursor + openingLength;
     const close = findUnescaped(raw, "]]", contentStart);
     const nested = findUnescaped(raw, "[[", contentStart);
-    if (close === -1 || (nested !== -1 && nested < close)) {
+    if (close === -1) {
       malformed = true;
-      break;
+      cursor = contentStart;
+      continue;
+    }
+    if (nested !== -1 && nested < close) {
+      malformed = true;
+      cursor = nested;
+      continue;
     }
 
     const content = raw.slice(contentStart, close);
@@ -137,7 +143,8 @@ function scanTextSource(raw: string, absoluteStart: number): TextScan {
       (alias !== null && !isValidCustomPart(alias))
     ) {
       malformed = true;
-      break;
+      cursor = close + 2;
+      continue;
     }
 
     const end = close + 2;
@@ -152,7 +159,7 @@ function scanTextSource(raw: string, absoluteStart: number): TextScan {
     cursor = end;
   }
 
-  return { constructs: malformed ? [] : constructs, malformed };
+  return { constructs, malformed };
 }
 
 export function scanObsidianText(value: string): TextScan {
@@ -242,12 +249,41 @@ export function parseMarkdown(markdown: string): ParsedMarkdownDocument {
   }
 }
 
-function createTokenPrefix(source: string): string {
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+}
+
+export function createDecodedTokenPrefix(
+  document: ParsedMarkdownDocument,
+  stem: string,
+  additionalValues: Iterable<string> = [],
+): string {
+  const usedSuffixes = new Set<number>();
+  const pattern = new RegExp(`${escapeRegExp(stem)}([0-9]{1,7})X`, "gu");
+  const collect = (value: string): void => {
+    pattern.lastIndex = 0;
+    for (let match = pattern.exec(value); match !== null; match = pattern.exec(value)) {
+      usedSuffixes.add(Number(match[1]));
+    }
+  };
+
+  collect(document.source);
+  visitTree(document.root, (node) => {
+    for (const value of Object.values(node)) {
+      if (typeof value === "string") {
+        collect(value);
+      }
+    }
+  });
+  for (const value of additionalValues) {
+    collect(value);
+  }
+
   let suffix = 0;
-  while (source.includes(`GRANDBOXWIKITOKEN${suffix}X`)) {
+  while (usedSuffixes.has(suffix)) {
     suffix += 1;
   }
-  return `GRANDBOXWIKITOKEN${suffix}X`;
+  return `${stem}${suffix}X`;
 }
 
 export function maskObsidianSyntax(document: ParsedMarkdownDocument): MarkdownMask {
@@ -256,7 +292,7 @@ export function maskObsidianSyntax(document: ParsedMarkdownDocument): MarkdownMa
     string,
     ObsidianConstruct | { readonly kind: "malformed"; readonly raw: string }
   >();
-  const prefix = createTokenPrefix(document.source);
+  const prefix = createDecodedTokenPrefix(document, "GRANDBOXWIKITOKEN");
   let tokenIndex = 0;
 
   visitTree(document.root, (node) => {
