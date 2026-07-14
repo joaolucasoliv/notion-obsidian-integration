@@ -915,6 +915,7 @@ function batchCollision(inputs: readonly PairPlanningInput[]): boolean {
     const pathClaims = [
       ...valuesFrom(local, "path"),
       ...valuesFrom(prior, "localPath"),
+      ...valuesFrom(valuesFrom(notion, "managed")[0], "obsidianPath"),
     ].map((value) => claim(value, isSafeRelativePath)).filter((value): value is string => value !== null);
     for (const path of new Set(pathClaims)) {
       if (register(paths, path, index)) return true;

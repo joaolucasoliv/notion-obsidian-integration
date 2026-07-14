@@ -259,6 +259,13 @@ function fenced(value: string, fence: string, info: string): string {
   return `${fence}${info}\n${value}${value.endsWith("\n") ? "" : "\n"}${fence}`;
 }
 
+function fencedBody(value: string, fence: string): string {
+  return [
+    `Body UTF-8 bytes: ${byteLength(value)}`,
+    fenced(value, fence, "text"),
+  ].join("\n");
+}
+
 function escapedLinkLabel(value: string): string {
   return value.replace(/[\\`*_{}\[\]()<>#+.!|~-]/gu, "\\$&");
 }
@@ -284,7 +291,7 @@ export function renderConflictArtifact(input: ConflictArtifactInput): string {
     fenced(JSON.stringify(localTags), fence, "json"),
     "",
     "Body",
-    fenced(input.localSemantic.bodyMarkdown, fence, "text"),
+    fencedBody(input.localSemantic.bodyMarkdown, fence),
     "",
     "## Notion semantic note",
     "",
@@ -292,7 +299,7 @@ export function renderConflictArtifact(input: ConflictArtifactInput): string {
     fenced(JSON.stringify(notionTags), fence, "json"),
     "",
     "Body",
-    fenced(input.notionSemantic.bodyMarkdown, fence, "text"),
+    fencedBody(input.notionSemantic.bodyMarkdown, fence),
     "",
   ].join("\n");
   if (byteLength(artifact) > MAX_ARTIFACT_BYTES) throw tooLargeArtifact();

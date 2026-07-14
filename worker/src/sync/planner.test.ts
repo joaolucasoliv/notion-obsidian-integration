@@ -603,6 +603,25 @@ describe("validatePlanningBatch", () => {
     });
   });
 
+  it("rejects duplicate remote managed paths across otherwise distinct pairs", () => {
+    const first = mutable(planningFixture());
+    const second = mutable(planningFixture({
+      prior: priorState({ bridgeId: OTHER_BRIDGE_ID, notionPageId: OTHER_PAGE_ID, localPath: "Notes/Beta.md" }),
+    }));
+    second.local.bridgeId = OTHER_BRIDGE_ID;
+    second.local.path = "Notes/Beta.md";
+    second.notion.bridgeId = OTHER_BRIDGE_ID;
+    second.notion.pageId = OTHER_PAGE_ID;
+    second.notion.pageUrl = `https://www.notion.so/Beta-${OTHER_PAGE_ID.replaceAll("-", "")}`;
+    second.notion.managed = { title: "Beta", obsidianPath: first.notion.managed.obsidianPath, status: "synced" };
+
+    expect(validatePlanningBatch([first as PairPlanningInput, second as PairPlanningInput])).toEqual({
+      ok: false,
+      reason: "identity-collision",
+      error: { code: "identity-collision", retryable: false },
+    });
+  });
+
   it("permits repeated matching identity claims within a single consistent pair", () => {
     expect(validatePlanningBatch([planningFixture()])).toEqual({ ok: true });
   });

@@ -122,6 +122,25 @@ describe("conflict artifact rendering", () => {
     expect(renderConflictArtifact(input)).toBe(renderConflictArtifact(structuredClone(input)));
   });
 
+  it("records trailing-newline distinction without weakening a collision-safe body fence", () => {
+    const withoutTrailingNewline = artifactFixture({
+      localSemantic: { bodyMarkdown: "x\n~~~~", tags: [] },
+      notionSemantic: { bodyMarkdown: "remote", tags: [] },
+    });
+    const withTrailingNewline = artifactFixture({
+      localSemantic: { bodyMarkdown: "x\n~~~~\n", tags: [] },
+      notionSemantic: { bodyMarkdown: "remote", tags: [] },
+    });
+    const withoutArtifact = renderConflictArtifact(withoutTrailingNewline);
+    const withArtifact = renderConflictArtifact(withTrailingNewline);
+
+    expect(withoutArtifact).not.toBe(withArtifact);
+    expect(withoutArtifact).toContain("Body UTF-8 bytes: 6");
+    expect(withArtifact).toContain("Body UTF-8 bytes: 7");
+    expect(withoutArtifact).toContain("~~~~~~~text\nx\n~~~~\n~~~~~~~");
+    expect(withArtifact).toContain("~~~~~~~text\nx\n~~~~\n~~~~~~~");
+  });
+
   it("fails closed when either semantic body exceeds its exact cap", () => {
     expect(() => renderConflictArtifact(artifactFixture({
       localSemantic: { bodyMarkdown: "x".repeat(1_048_577), tags: [] },
