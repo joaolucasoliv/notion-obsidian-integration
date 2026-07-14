@@ -15,6 +15,7 @@ import {
   createDecodedTokenPrefix,
   maskObsidianSyntax,
   parseMarkdown,
+  restoreSerializedSlashParity,
   restoreMarkdownMask,
   scanObsidianText,
   type MarkdownMask,
@@ -511,7 +512,9 @@ class LocalTokenRegistry {
         return `${slashes}\\!${replacement.value}`;
       }
       const restoredSlashes =
-        bang === undefined && replacement.kind !== "literal" ? `${slashes}${slashes}` : slashes;
+        bang === undefined && replacement.kind !== "literal"
+          ? restoreSerializedSlashParity(slashes)
+          : slashes;
       return `${restoredSlashes}${bang ?? ""}${replacement.value}`;
     });
   }

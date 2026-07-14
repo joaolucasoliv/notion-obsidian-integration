@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { normalizeLocal, semanticHash } from "./normalize.js";
-import { parseMarkdown, scanObsidianText } from "./parse.js";
+import { MAX_MARKDOWN_BYTES, parseMarkdown, scanObsidianText } from "./parse.js";
 
 describe("normalizeLocal", () => {
   it("canonicalizes syntactic equivalents while preserving valid Obsidian syntax", () => {
@@ -87,6 +87,63 @@ describe("normalizeLocal", () => {
       );
     },
   );
+
+  it.each(["wiki", "embed"] as const)(
+    "keeps zero through eight backslashes idempotent around %s syntax",
+    (kind) => {
+      for (let slashCount = 0; slashCount <= 8; slashCount += 1) {
+        const source = "\\".repeat(slashCount) + (
+          kind === "wiki" ? "[[Research/Paired Note.md]]\n" : "![[Research/Paired Note.md]]\n"
+        );
+        const first = normalizeLocal(parseMarkdown(source));
+        const second = normalizeLocal(parseMarkdown(first.bodyMarkdown));
+        const expectedKind =
+          slashCount % 2 === 0 ? (kind === "wiki" ? "wikilink" : "embed") : kind === "wiki" ? null : "wikilink";
+
+        expect(second).toEqual(first);
+        expect(scanObsidianText(first.bodyMarkdown).constructs.map((construct) => construct.kind)).toEqual(
+          expectedKind === null ? [] : [expectedKind],
+        );
+        if (slashCount % 2 === 0) {
+          expect(first.bodyMarkdown).toBe(source);
+        }
+      }
+    },
+  );
+
+  it("restores a near-limit even slash run in one bounded pass", () => {
+    const suffix = "[[x]]\n";
+    const source = "\\".repeat(MAX_MARKDOWN_BYTES - suffix.length - 64) + suffix;
+    const originalIncludes = String.prototype.includes;
+    const originalReplace = String.prototype.replace;
+    let restorationPasses = 0;
+
+    String.prototype.replace = function boundedReplace(
+      this: string,
+      searchValue: string | RegExp,
+      replaceValue: string | ((substring: string, ...args: unknown[]) => string),
+    ): string {
+      if (
+        searchValue instanceof RegExp &&
+        originalIncludes.call(searchValue.source, "GRANDBOXWIKITOKEN")
+      ) {
+        restorationPasses += 1;
+        if (restorationPasses > 1) {
+          throw new Error("multiple near-limit slash restoration passes");
+        }
+      }
+      return Reflect.apply(originalReplace, this, [searchValue, replaceValue]) as string;
+    };
+
+    try {
+      const normalized = normalizeLocal(parseMarkdown(source));
+
+      expect(normalized.bodyMarkdown).toBe(source);
+      expect(restorationPasses).toBe(1);
+    } finally {
+      String.prototype.replace = originalReplace;
+    }
+  });
 
   it("restores 4,096 normalized constructs with one token pass", () => {
     const source = "[[x]]".repeat(4_096);

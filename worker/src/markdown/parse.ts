@@ -287,6 +287,10 @@ function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
 }
 
+export function restoreSerializedSlashParity(slashes: string): string {
+  return slashes.length % 2 === 0 ? slashes : `${slashes}\\`;
+}
+
 export function createDecodedTokenPrefix(
   document: ParsedMarkdownDocument,
   stem: string,
@@ -402,7 +406,9 @@ export function restoreMarkdownMask(value: string, mask: MarkdownMask): string {
         return `${slashes}\\!${replacement.raw}`;
       }
       const restoredSlashes =
-        bang === undefined && replacement.kind !== "malformed" ? `${slashes}${slashes}` : slashes;
+        bang === undefined && replacement.kind !== "malformed"
+          ? restoreSerializedSlashParity(slashes)
+          : slashes;
       return `${restoredSlashes}${bang ?? ""}${replacement.raw}`;
     },
   );

@@ -133,6 +133,35 @@ describe("Notion Markdown mapping", () => {
     expect(fromNotionMarkdown(mapped.markdown, FIXTURE_LINKS).semantic).toEqual(semantic);
   });
 
+  it.each(["wiki", "embed"] as const)(
+    "stabilizes repeated normalize/map/reverse cycles for zero through eight slashes before a %s",
+    (kind) => {
+      for (let slashCount = 0; slashCount <= 8; slashCount += 1) {
+        const source = "\\".repeat(slashCount) + (
+          kind === "wiki"
+            ? "[[Research/Paired Note.md|alias]]\n"
+            : "![[Research/Paired Note.md|alias]]\n"
+        );
+        const first = normalizeLocal(parseMarkdown(source));
+        const mapped = toNotionMarkdown(first, FIXTURE_LINKS);
+        const once = fromNotionMarkdown(mapped.markdown, FIXTURE_LINKS).semantic;
+        const twice = fromNotionMarkdown(
+          toNotionMarkdown(once, FIXTURE_LINKS).markdown,
+          FIXTURE_LINKS,
+        ).semantic;
+
+        expect(normalizeLocal(parseMarkdown(once.bodyMarkdown))).toEqual(once);
+        expect(twice).toEqual(once);
+        if (slashCount % 2 === 0) {
+          expect(once).toEqual(first);
+        }
+        if (kind === "embed") {
+          expect(mapped.markdown.includes('"grandbox-bridge:embed:v1"')).toBe(slashCount % 2 === 0);
+        }
+      }
+    },
+  );
+
   it("fails closed for a forward paired alias that cannot be safely emitted locally", () => {
     const semantic = normalizeLocal(
       parseMarkdown("[[Research/Paired Note.md|\\*alias\\*]]\n"),
