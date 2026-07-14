@@ -1,0 +1,25 @@
+{
+  "name": "notion-obsidian-integration",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Private Notion and Obsidian sync with an encrypted knowledge graph",
+  "author": "João Lucas Oliveira with Codex 5.6",
+  "license": "MIT",
+  "type": "module",
+  "engines": { "node": ">=22.12.0" },
+  "workspaces": ["shared"],
+  "scripts": {
+    "test": "vitest run",
+    "test:integration": "vitest run --config vitest.integration.config.ts",
+    "test:coverage": "vitest run --coverage",
+    "typecheck": "tsc -b shared",
+    "build": "npm run build -w @grandbox-bridge/shared",
+    "check": "npm test && npm run typecheck && npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "26.1.1",
+    "@vitest/coverage-v8": "4.1.10",
+    "typescript": "5.9.3",
+    "vitest": "4.1.10"
+  }
+}
