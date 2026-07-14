@@ -10,6 +10,9 @@ const MAX_AST_NODES = 16_384;
 const MAX_AST_DEPTH = 64;
 const MAX_CUSTOM_CONSTRUCTS = 4_096;
 const MAX_CUSTOM_TARGET_BYTES = 1_024;
+const MIN_PRECONDITIONED_LEADING_BACKSLASHES = 65_536;
+const PRIVATE_USE_START = 0xe000;
+const PRIVATE_USE_END = 0xf8ff;
 
 const SUPPORTED_NODE_TYPES = new Set([
   "root",
@@ -83,6 +86,59 @@ function utf8Length(value: string): number {
 
 function parseRoot(source: string): Root {
   return unified().use(remarkParse).use(remarkGfm).parse(source);
+}
+
+interface LeadingSlashPrecondition {
+  readonly parserSource: string;
+  readonly shield: string;
+}
+
+function preconditionLeadingSlashRun(source: string): LeadingSlashPrecondition | null {
+  let slashCount = 0;
+  while (source[slashCount] === "\\") {
+    slashCount += 1;
+  }
+  if (
+    slashCount < MIN_PRECONDITIONED_LEADING_BACKSLASHES ||
+    (!source.startsWith("[[", slashCount) && !source.startsWith("![[", slashCount))
+  ) {
+    return null;
+  }
+
+  const usedPrivateUse = new Uint8Array(PRIVATE_USE_END - PRIVATE_USE_START + 1);
+  for (let index = 0; index < source.length; index += 1) {
+    const code = source.charCodeAt(index);
+    if (code >= PRIVATE_USE_START && code <= PRIVATE_USE_END) {
+      usedPrivateUse[code - PRIVATE_USE_START] = 1;
+    }
+  }
+  const shieldOffset = usedPrivateUse.findIndex((used) => used === 0);
+  if (shieldOffset === -1) {
+    return null;
+  }
+
+  const shield = String.fromCharCode(PRIVATE_USE_START + shieldOffset);
+  // The shield is one UTF-16 code unit, so mdast offsets remain aligned to `source`.
+  // Keeping an odd final slash literal preserves its escape of the following `[` or `!`.
+  const shieldedSlashCount = slashCount - (slashCount % 2);
+  return {
+    parserSource: `${shield.repeat(shieldedSlashCount)}${source.slice(shieldedSlashCount)}`,
+    shield,
+  };
+}
+
+function restoreLeadingShieldedSlashPairs(value: string, shield: string): string {
+  let shieldCount = 0;
+  while (value[shieldCount] === shield) {
+    shieldCount += 1;
+  }
+  if (shieldCount === 0) {
+    throw invalidMarkdown();
+  }
+  if (shieldCount % 2 === 1) {
+    throw invalidMarkdown();
+  }
+  return `${"\\".repeat(shieldCount / 2)}${value.slice(shieldCount)}`;
 }
 
 function escapedAsciiPositions(value: string): Uint8Array {
@@ -245,10 +301,20 @@ export function parseMarkdown(markdown: string): ParsedMarkdownDocument {
       throw invalidMarkdown();
     }
     const source = normalizeLineEndings(markdown);
-    const root = parseRoot(source);
+    const precondition = preconditionLeadingSlashRun(source);
+    const root = parseRoot(precondition?.parserSource ?? source);
     const unsupported = new Set<string>();
+    let restoredPrecondition = precondition === null;
 
     visitTree(root, (node) => {
+      if (
+        node.type === "text" &&
+        precondition !== null &&
+        node.position?.start.offset === 0
+      ) {
+        node.value = restoreLeadingShieldedSlashPairs(node.value, precondition.shield);
+        restoredPrecondition = true;
+      }
       const kind = unsupportedNodeKind(node);
       if (kind !== null) {
         unsupported.add(kind);
@@ -266,6 +332,9 @@ export function parseMarkdown(markdown: string): ParsedMarkdownDocument {
         }
       }
     });
+    if (!restoredPrecondition) {
+      throw invalidMarkdown();
+    }
 
     return { source, root, unsupportedKinds: sortedUnique(unsupported) };
   } catch (caught) {

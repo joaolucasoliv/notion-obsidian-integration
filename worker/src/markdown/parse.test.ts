@@ -37,6 +37,28 @@ describe("parseMarkdown", () => {
     expect(() => parseMarkdown("x".repeat(1_048_577))).toThrow(MarkdownParseError);
   });
 
+  it("preserves a very long leading slash run with occupied private-use input", () => {
+    const slashCount = 65_537;
+    const source = "\\".repeat(slashCount) + "![[x]]\uE000&#xE001;&#xE001;\n";
+    const parsed = parseMarkdown(source);
+    const paragraph = parsed.root.children[0];
+    const expectedSlashes = "\\".repeat(Math.floor(slashCount / 2));
+    const expectedSuffix = "![[x]]\uE000\uE001\uE001";
+
+    if (paragraph?.type !== "paragraph") {
+      throw new Error("expected a paragraph");
+    }
+    const child = paragraph.children[0];
+    if (child?.type !== "text") {
+      throw new Error("expected a text child");
+    }
+    expect(child.value.startsWith(expectedSlashes)).toBe(true);
+    expect(child.value.endsWith(expectedSuffix)).toBe(true);
+    expect(child.value).toHaveLength(expectedSlashes.length + expectedSuffix.length);
+    expect(parsed.source).toBe(source);
+    expect(parsed.unsupportedKinds).toEqual([]);
+  });
+
   it("bounds the number of custom wiki constructs masked for normalization", () => {
     const parsed = parseMarkdown("[[x]] ".repeat(4_097));
 
