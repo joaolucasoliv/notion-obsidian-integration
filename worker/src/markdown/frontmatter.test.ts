@@ -3,11 +3,22 @@ import {
   LocalNoteParseError,
   parseLocalNote,
   replaceSyncedTags,
+  type ParsedLocalNote,
   upsertBridgeId,
 } from "./frontmatter.js";
 
 const BRIDGE_ID = "5c343dbe-23b1-4e13-af1e-ffed61ecb290";
 const OTHER_BRIDGE_ID = "26cad23b-f8f7-448f-a70e-e84c1861dd8d";
+
+function assertParsedContractIsWritable(note: ParsedLocalNote): void {
+  note.path = note.path;
+  note.bytes = note.bytes;
+  note.frontmatter = note.frontmatter;
+  note.body = note.body;
+  note.notionSync = note.notionSync;
+  note.bridgeId = note.bridgeId;
+  note.tags = note.tags;
+}
 
 function expectSafeParseFailure(action: () => unknown): void {
   try {
@@ -21,7 +32,7 @@ function expectSafeParseFailure(action: () => unknown): void {
 }
 
 describe("parseLocalNote", () => {
-  it("parses exact owned types while preserving the original bytes and body", () => {
+  it("returns the exact mutable contract while preserving the original bytes and body", () => {
     const bytes = `---\n# keep this\nnotion_sync: true\nbridge_id: ${BRIDGE_ID}\ntags: [research, active]\ncustom:\n  nested: 7\n---\nBody  \n`;
 
     const parsed = parseLocalNote("Research/Example.md", bytes);
@@ -33,9 +44,27 @@ describe("parseLocalNote", () => {
     expect(parsed.bridgeId).toBe(BRIDGE_ID);
     expect(parsed.tags).toEqual(["research", "active"]);
     expect(parsed.frontmatter.custom).toEqual({ nested: 7 });
+    expect(Object.keys(parsed).sort()).toEqual([
+      "body",
+      "bridgeId",
+      "bytes",
+      "frontmatter",
+      "notionSync",
+      "path",
+      "tags",
+    ]);
     expect(Object.getPrototypeOf(parsed.frontmatter)).toBeNull();
     expect(Object.isFrozen(parsed.frontmatter)).toBe(true);
-    expect(Object.isFrozen(parsed.tags)).toBe(true);
+    expect(Object.isFrozen(parsed)).toBe(false);
+    expect(Object.isFrozen(parsed.tags)).toBe(false);
+
+    assertParsedContractIsWritable(parsed);
+    parsed.path = "Research/Renamed.md";
+    parsed.tags.push("mutable-contract");
+    expect(parsed.path).toBe("Research/Renamed.md");
+    expect(parsed.tags).toEqual(["research", "active", "mutable-contract"]);
+    expect(parsed.bytes).toBe(bytes);
+    expect(bytes.endsWith("Body  \n")).toBe(true);
   });
 
   it("treats a note without a document-start frontmatter delimiter as not opted in", () => {
@@ -55,6 +84,26 @@ describe("parseLocalNote", () => {
     "---\n\"notion_sync\": true\nnotion_sync: false\n---\nfixture-secret",
   ])("rejects duplicate YAML keys at every mapping depth", (bytes) => {
     expectSafeParseFailure(() => parseLocalNote("Notes/duplicate.md", bytes));
+  });
+
+  it.each([
+    ["root plain", "---\n<<: { injected: fixture-secret }\nnotion_sync: true\n---\nBody"],
+    ["root quoted", "---\n\"<<\": { injected: fixture-secret }\nnotion_sync: true\n---\nBody"],
+    ["root explicit", "---\n? <<\n: { injected: fixture-secret }\nnotion_sync: true\n---\nBody"],
+    ["nested plain", "---\nnotion_sync: true\ncustom:\n  <<: { injected: fixture-secret }\n---\nBody"],
+    ["nested quoted", "---\nnotion_sync: true\ncustom:\n  \"<<\": { injected: fixture-secret }\n---\nBody"],
+    ["nested explicit", "---\nnotion_sync: true\ncustom:\n  ? <<\n  : { injected: fixture-secret }\n---\nBody"],
+  ])("rejects the YAML merge mapping key at every depth: %s", (_label, bytes) => {
+    expectSafeParseFailure(() => parseLocalNote("Notes/merge-key.md", bytes));
+  });
+
+  it("allows merge-looking scalar values that are not mapping keys", () => {
+    const parsed = parseLocalNote(
+      "Notes/scalar-value.md",
+      "---\nnotion_sync: true\ncustom: \"<<\"\ntags: [\"<<\"]\n---\nBody",
+    );
+    expect(parsed.frontmatter.custom).toBe("<<");
+    expect(parsed.tags).toEqual(["<<"]);
   });
 
   it.each([
@@ -229,7 +278,7 @@ describe("replaceSyncedTags", () => {
     [" padded", "leading whitespace"],
     ["line\nbreak", "newline"],
     ["x".repeat(257), "overlong"],
-  ] as const)("rejects an %s tag without changing the note", (tag) => {
+  ] as const)("rejects an %s tag without changing the note", (tag, _label) => {
     const before = "---\nnotion_sync: true\ntags: [safe]\n---\nfixture-secret";
     expectSafeParseFailure(() => replaceSyncedTags(before, [tag]));
     expect(before).toBe("---\nnotion_sync: true\ntags: [safe]\n---\nfixture-secret");

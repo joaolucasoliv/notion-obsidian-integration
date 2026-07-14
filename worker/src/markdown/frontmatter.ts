@@ -23,13 +23,13 @@ const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3
 const PROTOTYPE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 
 export interface ParsedLocalNote {
-  readonly path: string;
-  readonly bytes: string;
-  readonly frontmatter: Readonly<Record<string, unknown>>;
-  readonly body: string;
-  readonly notionSync: boolean;
-  readonly bridgeId: string | null;
-  readonly tags: readonly string[];
+  path: string;
+  bytes: string;
+  frontmatter: Readonly<Record<string, unknown>>;
+  body: string;
+  notionSync: boolean;
+  bridgeId: string | null;
+  tags: string[];
 }
 
 export class LocalNoteParseError extends Error {
@@ -157,7 +157,12 @@ function convertYamlNode(
     const record: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
     for (const pair of node.items) {
       const key = pair.key;
-      if (!isScalar(key) || typeof key.value !== "string" || PROTOTYPE_KEYS.has(key.value)) {
+      if (
+        !isScalar(key) ||
+        typeof key.value !== "string" ||
+        key.value === "<<" ||
+        PROTOTYPE_KEYS.has(key.value)
+      ) {
         throw invalidLocalNote();
       }
       assertSupportedNode(key, depth + 1, budget);
@@ -202,7 +207,7 @@ function assertValidTag(value: unknown): asserts value is string {
   }
 }
 
-function tagsFromOwnedValue(value: unknown): readonly string[] {
+function tagsFromOwnedValue(value: unknown): string[] {
   const candidates = Array.isArray(value) ? value : [value];
   if (candidates.length > MAX_TAG_COUNT) {
     throw invalidLocalNote();
@@ -210,7 +215,7 @@ function tagsFromOwnedValue(value: unknown): readonly string[] {
   for (const candidate of candidates) {
     assertValidTag(candidate);
   }
-  return Object.freeze([...candidates] as string[]);
+  return [...candidates] as string[];
 }
 
 function normalizeTags(tags: readonly string[]): readonly string[] {
@@ -239,15 +244,15 @@ function parseLocalNoteInternal(path: string, bytes: string): ParsedInternals {
         bounds: null,
         root: null,
         tagsPair: null,
-        note: Object.freeze({
+        note: {
           path,
           bytes,
           frontmatter: empty,
           body: bytes,
           notionSync: false,
           bridgeId: null,
-          tags: Object.freeze([] as string[]),
-        }),
+          tags: [],
+        },
       };
     }
 
@@ -296,14 +301,14 @@ function parseLocalNoteInternal(path: string, bytes: string): ParsedInternals {
       throw invalidLocalNote();
     }
     const tagsValue = frontmatter.tags;
-    const tags = tagsValue === undefined ? Object.freeze([] as string[]) : tagsFromOwnedValue(tagsValue);
+    const tags = tagsValue === undefined ? [] : tagsFromOwnedValue(tagsValue);
     const tagsPair = root === null ? null : pairForKey(root, "tags");
 
     return {
       bounds,
       root,
       tagsPair,
-      note: Object.freeze({
+      note: {
         path,
         bytes,
         frontmatter,
@@ -311,7 +316,7 @@ function parseLocalNoteInternal(path: string, bytes: string): ParsedInternals {
         notionSync: notionValue === true,
         bridgeId: typeof bridgeValue === "string" ? bridgeValue : null,
         tags,
-      }),
+      },
     };
   } catch (caught) {
     if (caught instanceof LocalNoteParseError) {

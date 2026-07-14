@@ -2,7 +2,14 @@ import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { LocalNoteParseError, parseLocalNote } from "../markdown/frontmatter.js";
-import { classifyEligibility } from "./eligibility.js";
+import { classifyEligibility, type Eligibility } from "./eligibility.js";
+
+function assertEligibilityContractIsWritable(value: Eligibility): void {
+  value.eligible = value.eligible;
+  if (!value.eligible) {
+    value.reason = value.reason;
+  }
+}
 
 const fixture = (relativePath: string): Promise<string> =>
   readFile(
@@ -16,9 +23,19 @@ describe("classifyEligibility", () => {
     const optedOut = parseLocalNote("Notes/opted-out.md", "---\nnotion_sync: false\n---\nBody");
     const absent = parseLocalNote("Notes/absent.md", "Body");
 
-    expect(classifyEligibility(optedIn)).toEqual({ eligible: true });
-    expect(classifyEligibility(optedOut)).toEqual({ eligible: false, reason: "not-opted-in" });
-    expect(classifyEligibility(absent)).toEqual({ eligible: false, reason: "not-opted-in" });
+    const eligible = classifyEligibility(optedIn);
+    const optedOutEligibility = classifyEligibility(optedOut);
+    const absentEligibility = classifyEligibility(absent);
+
+    expect(eligible).toEqual({ eligible: true });
+    expect(optedOutEligibility).toEqual({ eligible: false, reason: "not-opted-in" });
+    expect(absentEligibility).toEqual({ eligible: false, reason: "not-opted-in" });
+    expect(Object.keys(eligible)).toEqual(["eligible"]);
+    expect(Object.keys(optedOutEligibility).sort()).toEqual(["eligible", "reason"]);
+    expect(Object.isFrozen(eligible)).toBe(false);
+    expect(Object.isFrozen(optedOutEligibility)).toBe(false);
+    assertEligibilityContractIsWritable(eligible);
+    assertEligibilityContractIsWritable(optedOutEligibility);
     expect(() =>
       parseLocalNote("Notes/string.md", "---\nnotion_sync: \"true\"\n---\nBody"),
     ).toThrow(LocalNoteParseError);

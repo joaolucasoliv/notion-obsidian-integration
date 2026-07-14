@@ -1,10 +1,10 @@
 import type { ParsedLocalNote } from "../markdown/frontmatter.js";
 
 export type Eligibility =
-  | { readonly eligible: true }
+  | { eligible: true }
   | {
-      readonly eligible: false;
-      readonly reason:
+      eligible: false;
+      reason:
         | "not-opted-in"
         | "technical-path"
         | "generated-github"
@@ -59,7 +59,7 @@ export function inspectGithubManagedBytes(bytes: string): GithubManagedState {
 
 export function classifyPathExclusion(
   path: string,
-): Extract<Eligibility, { readonly eligible: false }> | null {
+): Extract<Eligibility, { eligible: false }> | null {
   const segments = path.split("/");
   const baseName = segments.at(-1) ?? "";
 

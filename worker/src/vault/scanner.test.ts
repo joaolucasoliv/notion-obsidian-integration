@@ -55,6 +55,9 @@ describe("scanVaultNotes", () => {
       { eligible: false, reason: "not-opted-in" },
     ]);
     expect("note" in (scanned[2] as object)).toBe(false);
+    expect(Object.isFrozen(scanned[1]?.eligibility)).toBe(false);
+    expect(Object.isFrozen(scanned[1]?.note)).toBe(false);
+    expect(Object.isFrozen(scanned[1]?.note?.tags)).toBe(false);
   });
 
   it("classifies a well-formed exact GitHub pair before unrelated invalid YAML", async () => {

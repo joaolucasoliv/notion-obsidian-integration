@@ -18,12 +18,12 @@ import { resolveSafeVaultPath, type CanonicalVaultRoot } from "./safety.js";
 export type ScannedVaultNote =
   | {
       readonly path: string;
-      readonly eligibility: { readonly eligible: true };
+      readonly eligibility: Extract<Eligibility, { eligible: true }>;
       readonly note: ParsedLocalNote;
     }
   | {
       readonly path: string;
-      readonly eligibility: Extract<Eligibility, { readonly eligible: false }>;
+      readonly eligibility: Extract<Eligibility, { eligible: false }>;
       readonly note?: ParsedLocalNote;
     };
 
@@ -183,7 +183,6 @@ async function readBoundedNote(root: CanonicalVaultRoot, relativePath: string): 
 }
 
 function freezeEntry(entry: ScannedVaultNote): ScannedVaultNote {
-  Object.freeze(entry.eligibility);
   return Object.freeze(entry);
 }
 
