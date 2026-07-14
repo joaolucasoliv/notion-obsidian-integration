@@ -81,24 +81,86 @@ export type PairIdentityRef =
   | { kind: "existing"; bridgeId: string }
   | { kind: "allocate-on-apply"; allocationId: string };
 
+export type RemoteRevisionRef =
+  | { readonly kind: "observed"; readonly editedAt: string }
+  | { readonly kind: "effect-result"; readonly effectIndex: number };
+
+export interface ManagedPropertiesSnapshot {
+  readonly title: string;
+  readonly obsidianPath: string;
+  readonly tags: readonly string[];
+  readonly status: PairStatus;
+}
+
+export type EvidenceSource =
+  | { readonly kind: "observation" }
+  | { readonly kind: "effect-result"; readonly effectIndex: number };
+
+export type PairStateAdvance =
+  | { readonly kind: "none" }
+  | {
+      readonly kind: "preserve-common";
+      readonly base: Readonly<PairStateV1>;
+      readonly status: PairStatus;
+      readonly localPath: string;
+      readonly notionRevision: EvidenceSource | null;
+    }
+  | {
+      readonly kind: "establish-common";
+      readonly identity: PairIdentityRef;
+      readonly localPath: string;
+      readonly semanticHash: string;
+      readonly localEvidence: EvidenceSource;
+      readonly notionEvidence: EvidenceSource;
+    };
+
 export type PlannedEffect =
-  | { kind: "initialize-pair"; identity: PairIdentityRef; path: string; expectedByteHash: string }
-  | { kind: "create-notion-page"; identity: PairIdentityRef; path: string }
   | {
-      kind: "update-notion-body-exact";
-      pageId: string;
-      oldMarkdown: string;
-      newMarkdown: string;
-      observedEditedAt: string;
+      readonly kind: "initialize-pair";
+      readonly identity: PairIdentityRef;
+      readonly path: string;
+      readonly expectedByteHash: string;
     }
   | {
-      kind: "update-notion-properties";
-      pageId: string;
-      title: string;
-      obsidianPath: string;
-      tags: string[];
-      status: PairStatus;
+      readonly kind: "create-notion-page";
+      readonly identity: PairIdentityRef;
+      readonly title: string;
+      readonly obsidianPath: string;
+      readonly tags: readonly string[];
+      readonly markdown: string;
+      readonly status: "synced";
     }
-  | { kind: "write-local"; path: string; expectedByteHash: string; nextBytes: string }
-  | { kind: "create-conflict"; path: string; content: string }
-  | { kind: "set-notion-status"; pageId: string; status: PairStatus };
+  | {
+      readonly kind: "update-notion-body-exact";
+      readonly pageId: string;
+      readonly oldMarkdown: string;
+      readonly newMarkdown: string;
+      readonly expectedRevision: RemoteRevisionRef;
+    }
+  | {
+      readonly kind: "update-notion-properties";
+      readonly pageId: string;
+      readonly expected: ManagedPropertiesSnapshot;
+      readonly next: ManagedPropertiesSnapshot;
+      readonly expectedRevision: RemoteRevisionRef;
+    }
+  | {
+      readonly kind: "write-local";
+      readonly path: string;
+      readonly expectedByteHash: string;
+      readonly nextBytes: string;
+      readonly expectedNextByteHash: string;
+    }
+  | {
+      readonly kind: "create-conflict";
+      readonly path: string;
+      readonly expectedAbsent: true;
+      readonly content: string;
+    }
+  | {
+      readonly kind: "set-notion-status";
+      readonly pageId: string;
+      readonly expectedStatus: PairStatus;
+      readonly nextStatus: PairStatus;
+      readonly expectedRevision: RemoteRevisionRef;
+    };
