@@ -12,6 +12,7 @@ const relativePathSchema = z
     const segments = value.split("/");
     const unsafe =
       value.startsWith("/") ||
+      /^[A-Za-z]:/.test(value) ||
       value.includes("\\") ||
       value.includes("\0") ||
       /[\r\n]/.test(value) ||

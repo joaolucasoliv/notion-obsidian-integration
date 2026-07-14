@@ -55,7 +55,16 @@ describe("journal schemas", () => {
     },
   );
 
-  it.each(["/absolute.md", "../outside.md", "Notes/\0bad.md", "Notes/line\nbreak.md", "x".repeat(1_025)])(
+  it.each([
+    "/absolute.md",
+    "C:/Windows/System32/x.md",
+    "C:relative.md",
+    "z:relative.md",
+    "../outside.md",
+    "Notes/\0bad.md",
+    "Notes/line\nbreak.md",
+    "x".repeat(1_025),
+  ])(
     "rejects unsafe or overlong journal path %s",
     (relativePath) => {
       expect(() => parseJournalIntent({ ...validIntent(), relativePath })).toThrow(/relativePath/i);

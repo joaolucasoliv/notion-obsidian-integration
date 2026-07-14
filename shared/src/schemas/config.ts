@@ -5,6 +5,11 @@ const loopbackHosts = new Set(["localhost", "127.0.0.1", "[::1]"]);
 
 function persistedWebUrlSchema(options: { bareOrigin: boolean }) {
   return z.string().superRefine((value, context) => {
+    if (/[\u0000-\u0020\u007f\\]/.test(value)) {
+      context.addIssue({ code: "custom", message: "Expected a canonical web URL without raw whitespace" });
+      return;
+    }
+
     let url: URL;
     try {
       url = new URL(value);
@@ -30,11 +35,17 @@ function persistedWebUrlSchema(options: { bareOrigin: boolean }) {
       url.password !== "" ||
       remainder.includes("?") ||
       remainder.includes("#");
-    const hasNonCanonicalCharacters = value !== value.trim() || value.includes("\\");
-    const isCanonicalOrigin = value === url.origin || value === `${url.origin}/`;
+    const isBareOrigin =
+      url.pathname === "/" &&
+      url.search === "" &&
+      url.hash === "" &&
+      url.username === "" &&
+      url.password === "";
+    const matchesCanonicalUrl = value === url.href || (isBareOrigin && value === url.origin);
+    const isCanonicalOrigin = isBareOrigin && (value === url.origin || value === `${url.origin}/`);
     const hasForbiddenPath = options.bareOrigin && !isCanonicalOrigin;
 
-    if (!approvedProtocol || hasForbiddenComponents || hasNonCanonicalCharacters || hasForbiddenPath) {
+    if (!approvedProtocol || hasForbiddenComponents || !matchesCanonicalUrl || hasForbiddenPath) {
       context.addIssue({ code: "custom", message: "Expected an approved credential-free web URL" });
     }
   });

@@ -5,6 +5,7 @@ import { parseBridgeConfig } from "./config";
 const ID = "5c343dbe-23b1-4e13-af1e-ffed61ecb290";
 const PAGE_ID = "59833787-2cf9-4fdf-8782-e53db20768a5";
 const HASH = "727315411367e16793c5140eedbe2371b9619a47ce90e2b3e3b3704e2e725adc";
+const ASCII_CONTROL_SPACE_CODES = [...Array.from({ length: 33 }, (_, codePoint) => codePoint), 0x7f];
 
 function validConfig() {
   return {
@@ -92,6 +93,40 @@ describe("parseBridgeConfig", () => {
     config.relay.baseUrl = baseUrl;
 
     expect(() => parseBridgeConfig(config)).toThrow(/baseUrl/i);
+  });
+
+  it.each(ASCII_CONTROL_SPACE_CODES)("rejects raw ASCII control/space U+%i in relay URLs", (codePoint) => {
+    const config = validConfig();
+    const unsafeCharacter = String.fromCharCode(codePoint);
+    config.relay.baseUrl = `https://relay.example.test/functions${unsafeCharacter}v1/bridge`;
+
+    expect(() => parseBridgeConfig(config)).toThrow(/baseUrl/i);
+  });
+
+  it.each([
+    "https://relay.example.test/a/../functions/v1/bridge",
+    "https://relay.example.test/a/%2e%2e/functions/v1/bridge",
+    "https://relay.example.test/functions/./v1/bridge",
+    "HTTPS://RELAY.EXAMPLE.TEST/functions/v1/bridge",
+    "https://relay.example.test:443/functions/v1/bridge",
+    "http://LOCALHOST:54321/functions/v1/bridge",
+  ])("rejects parser-normalized noncanonical relay URL %s", (baseUrl) => {
+    const config = validConfig();
+    config.relay.baseUrl = baseUrl;
+
+    expect(() => parseBridgeConfig(config)).toThrow(/baseUrl/i);
+  });
+
+  it.each([
+    "https://relay.example.test",
+    "https://relay.example.test/",
+    "https://relay.example.test:8443/functions/v1/bridge",
+    "http://localhost:54321/functions/v1/bridge",
+  ])("accepts canonical relay URL %s", (baseUrl) => {
+    const config = validConfig();
+    config.relay.baseUrl = baseUrl;
+
+    expect(parseBridgeConfig(config).relay?.baseUrl).toBe(baseUrl);
   });
 
   it.each([
