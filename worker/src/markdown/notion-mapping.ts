@@ -387,26 +387,33 @@ function transformToNotion(
   parent.children = transformed as Parent["children"];
 }
 
+function literalTokenPrefix(value: string): string {
+  const usedSuffixes = new Set<number>();
+  const pattern = /GRANDBOXLITERAL([0-9]{1,7})X/gu;
+  for (const match of value.matchAll(pattern)) {
+    usedSuffixes.add(Number(match[1]));
+  }
+  let suffix = 0;
+  while (usedSuffixes.has(suffix)) {
+    suffix += 1;
+  }
+  return `GRANDBOXLITERAL${suffix}X`;
+}
+
 function notionTextHandler(): TextHandle {
-  let tokenIndex = 0;
   return (node, _parent, state, info) => {
     const value = (node as Text).value;
-    const replacements = new Map<string, string>();
-    const masked = value.replace(NOTION_LITERAL_SPECIALS, (character) => {
-      let token = `GRANDBOXLITERAL${tokenIndex}X`;
-      tokenIndex += 1;
-      while (value.includes(token)) {
-        token = `GRANDBOXLITERAL${tokenIndex}X`;
-        tokenIndex += 1;
-      }
-      replacements.set(token, character);
-      return token;
+    const prefix = literalTokenPrefix(value);
+    const masked = value.replace(
+      NOTION_LITERAL_SPECIALS,
+      (character) => `${prefix}${character.codePointAt(0)?.toString(16).toUpperCase()}END`,
+    );
+    const safe = state.safe(masked, info);
+    const tokenPattern = new RegExp(`${prefix}([0-9A-F]{1,6})END`, "gu");
+    return safe.replace(tokenPattern, (_token, encoded: string) => {
+      const codePoint = Number.parseInt(encoded, 16);
+      return `\\${String.fromCodePoint(codePoint)}`;
     });
-    let safe = state.safe(masked, info);
-    for (const [token, character] of replacements) {
-      safe = safe.replaceAll(token, `\\${character}`);
-    }
-    return safe;
   };
 }
 
@@ -523,6 +530,50 @@ function decodedHtmlKind(value: string): string | null {
   return "raw-html";
 }
 
+function isAsciiPunctuation(character: string): boolean {
+  const codePoint = character.codePointAt(0);
+  return (
+    codePoint !== undefined &&
+    ((codePoint >= 0x21 && codePoint <= 0x2f) ||
+      (codePoint >= 0x3a && codePoint <= 0x40) ||
+      (codePoint >= 0x5b && codePoint <= 0x60) ||
+      (codePoint >= 0x7b && codePoint <= 0x7e))
+  );
+}
+
+function rawOffsetsForDecodedBoundaries(
+  rawSource: string,
+  decodedValue: string,
+  boundaries: ReadonlySet<number>,
+): ReadonlyMap<number, number> {
+  let rawCursor = 0;
+  let decodedCursor = 0;
+  const offsets = new Map<number, number>();
+
+  while (rawCursor < rawSource.length) {
+    if (boundaries.has(decodedCursor)) {
+      offsets.set(decodedCursor, rawCursor);
+    }
+
+    const rawCharacter = String.fromCodePoint(rawSource.codePointAt(rawCursor) as number);
+    const escapedCharacter = rawCharacter === "\\"
+      ? String.fromCodePoint(rawSource.codePointAt(rawCursor + rawCharacter.length) ?? 0)
+      : "";
+    const isEscape = rawCharacter === "\\" && isAsciiPunctuation(escapedCharacter);
+    const decodedCharacter = isEscape ? escapedCharacter : rawCharacter;
+    if (!decodedValue.startsWith(decodedCharacter, decodedCursor)) {
+      return offsets;
+    }
+    rawCursor += rawCharacter.length + (isEscape ? escapedCharacter.length : 0);
+    decodedCursor += decodedCharacter.length;
+  }
+
+  if (boundaries.has(decodedCursor)) {
+    offsets.set(decodedCursor, rawCursor);
+  }
+  return offsets;
+}
+
 function splitDecodedCustomText(
   value: string,
   rawSource: string,
@@ -543,16 +594,25 @@ function splitDecodedCustomText(
   if (scan.constructs.length === 0) {
     return [text(value)];
   }
-  if (!rawSource.includes("\\[\\[")) {
-    return [registry.token(escapeLiteral(value))];
+  const decodedBoundaries = new Set<number>();
+  for (const construct of scan.constructs) {
+    decodedBoundaries.add(construct.start);
+    decodedBoundaries.add(construct.end);
   }
+  const rawOffsets = rawOffsetsForDecodedBoundaries(rawSource, value, decodedBoundaries);
   const nodes: Nodes[] = [];
   let cursor = 0;
   for (const construct of scan.constructs) {
     if (construct.start > cursor) {
       nodes.push(text(value.slice(cursor, construct.start)));
     }
-    nodes.push(registry.token(construct.raw));
+    const rawStart = rawOffsets.get(construct.start);
+    const rawEnd = rawOffsets.get(construct.end);
+    const isAuthorized =
+      rawStart !== undefined &&
+      rawEnd !== undefined &&
+      rawSource.slice(rawStart, rawEnd) === escapeLiteral(construct.raw);
+    nodes.push(registry.token(isAuthorized ? construct.raw : escapeLiteral(construct.raw)));
     cursor = construct.end;
   }
   if (cursor < value.length) {

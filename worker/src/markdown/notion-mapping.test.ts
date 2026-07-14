@@ -161,6 +161,74 @@ describe("Notion Markdown mapping", () => {
     expect(reversed.unsupportedKinds).toEqual([]);
   });
 
+  it.each([
+    [
+      "wiki",
+      "Ordinary [[Injected]] and \\[\\[Missing\\|safe\\]\\].\n",
+      "Ordinary \\[\\[Injected\\]\\] and [[Missing|safe]].\n",
+    ],
+    [
+      "embed",
+      "Ordinary ![[Injected]] and !\\[\\[Missing Embed\\|safe\\]\\].\n",
+      "Ordinary !\\[\\[Injected\\]\\] and ![[Missing Embed|safe]].\n",
+    ],
+  ])("authorizes each escaped %s construct by its exact source range", (_kind, source, expected) => {
+    const reversed = fromNotionMarkdown(source, FIXTURE_LINKS);
+
+    expect(reversed.markdown).toBe(expected);
+    expect(reversed.unsupportedKinds).toEqual([]);
+  });
+
+  it("escapes a near-limit many-special-character note with bounded token operations", () => {
+    const prefixCollisions = [0, 1, 2, 3]
+      .map((index) => `GRANDBOXLITERAL${index}X`)
+      .join(" ");
+    const specialCount = 900_000;
+    const source = `${prefixCollisions}\n${"$".repeat(specialCount)}`;
+    const originalIncludes = String.prototype.includes;
+    const originalReplaceAll = String.prototype.replaceAll;
+    let literalPrefixChecks = 0;
+    let literalTokenRestorations = 0;
+
+    String.prototype.includes = function boundedIncludes(
+      this: string,
+      searchString: string,
+      position?: number,
+    ): boolean {
+      if (searchString.startsWith("GRANDBOXLITERAL")) {
+        literalPrefixChecks += 1;
+        if (literalPrefixChecks > 8) {
+          throw new Error("unbounded literal prefix checks");
+        }
+      }
+      return originalIncludes.call(this, searchString, position);
+    };
+    String.prototype.replaceAll = function boundedReplaceAll(
+      this: string,
+      searchValue: string | RegExp,
+      replaceValue: string | ((substring: string, ...args: unknown[]) => string),
+    ): string {
+      if (typeof searchValue === "string" && searchValue.startsWith("GRANDBOXLITERAL")) {
+        literalTokenRestorations += 1;
+        if (literalTokenRestorations > 1) {
+          throw new Error("multiple literal token restoration passes");
+        }
+      }
+      return Reflect.apply(originalReplaceAll, this, [searchValue, replaceValue]) as string;
+    };
+
+    try {
+      const mapped = toNotionMarkdown({ bodyMarkdown: source, tags: [] }, FIXTURE_LINKS);
+
+      expect(mapped.markdown).toBe(`${prefixCollisions}\n${"\\$".repeat(specialCount)}\n`);
+      expect(literalPrefixChecks).toBeLessThanOrEqual(8);
+      expect(literalTokenRestorations).toBeLessThanOrEqual(1);
+    } finally {
+      String.prototype.includes = originalIncludes;
+      String.prototype.replaceAll = originalReplaceAll;
+    }
+  });
+
   it("does not replace user text that resembles an internal local token", () => {
     const reversed = fromNotionMarkdown(
       `GRANDBOXLOCALTOKEN0END and [paired](${PAGE_URL})\n`,
