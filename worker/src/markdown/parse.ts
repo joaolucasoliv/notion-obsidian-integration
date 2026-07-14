@@ -377,20 +377,33 @@ export function restoreMarkdownMask(value: string, mask: MarkdownMask): string {
     return value;
   }
   const tokenPattern = new RegExp(
-    `(!)?(${escapeRegExp(mask.prefix)}[0-9]{1,7}END)`,
+    `(\\\\*)(!)?(${escapeRegExp(mask.prefix)}[0-9]{1,7}END)`,
     "gu",
   );
   return value.replace(
     tokenPattern,
-    (matched: string, bang: string | undefined, token: string, offset: number, source: string) => {
+    (
+      matched: string,
+      slashes: string,
+      bang: string | undefined,
+      token: string,
+      offset: number,
+      source: string,
+    ) => {
       const replacement = mask.replacements.get(token);
       if (replacement === undefined) {
         return matched;
       }
-      if (bang === "!" && replacement.kind === "wikilink" && !isEscaped(source, offset)) {
-        return `\\!${replacement.raw}`;
+      if (
+        bang === "!" &&
+        replacement.kind === "wikilink" &&
+        !isEscaped(source, offset + slashes.length)
+      ) {
+        return `${slashes}\\!${replacement.raw}`;
       }
-      return `${bang ?? ""}${replacement.raw}`;
+      const restoredSlashes =
+        bang === undefined && replacement.kind !== "malformed" ? `${slashes}${slashes}` : slashes;
+      return `${restoredSlashes}${bang ?? ""}${replacement.raw}`;
     },
   );
 }

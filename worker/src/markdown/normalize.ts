@@ -40,7 +40,7 @@ function utf8Length(value: string): number {
   return new TextEncoder().encode(value).byteLength;
 }
 
-function compareCodePointStrings(left: string, right: string): number {
+export function compareCodePointStrings(left: string, right: string): number {
   const leftPoints = Array.from(left, (character) => character.codePointAt(0) as number);
   const rightPoints = Array.from(right, (character) => character.codePointAt(0) as number);
   const length = Math.min(leftPoints.length, rightPoints.length);

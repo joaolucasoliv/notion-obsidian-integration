@@ -104,6 +104,56 @@ describe("Notion Markdown mapping", () => {
     expect(mapped.markdown).not.toContain(PAGE_URL);
   });
 
+  it.each([
+    ["emphasis", "*[[Research/Paired Note.md|alias]]*"],
+    ["strong", "**[[Research/Paired Note.md|alias]]**"],
+    ["delete", "~~[[Research/Paired Note.md|alias]]~~"],
+  ])("fails closed for a custom link inside %s below a Markdown link", (_format, formatted) => {
+    const semantic = normalizeLocal(
+      parseMarkdown(`[outer ${formatted}](https://example.com/resource)\n`),
+    );
+    const mapped = toNotionMarkdown(semantic, FIXTURE_LINKS);
+
+    expect(mapped.unsupportedKinds).toEqual(["nested-custom-link"]);
+    expect(mapped.markdown).not.toContain(PAGE_URL);
+    expect(mapped.markdown).toContain("\\[\\[Research/Paired Note.md\\|alias\\]\\]");
+    expect(parseMarkdown(mapped.markdown).unsupportedKinds).toEqual([]);
+  });
+
+  it("maps an even-backslash embed with an embed marker and preserves its local semantic", () => {
+    const source = "\\\\![[Research/Paired Note.md|alias]]\n";
+    const semantic = normalizeLocal(parseMarkdown(source));
+    const mapped = toNotionMarkdown(semantic, FIXTURE_LINKS);
+
+    expect(semantic.bodyMarkdown).toBe(source);
+    expect(mapped.markdown).toBe(
+      `\\\\[Embed: \\[\\[Research/Paired Note.md\\|alias\\]\\]](${PAGE_URL} "grandbox-bridge:embed:v1")\n`,
+    );
+    expect(mapped.unsupportedKinds).toEqual([]);
+    expect(fromNotionMarkdown(mapped.markdown, FIXTURE_LINKS).semantic).toEqual(semantic);
+  });
+
+  it("fails closed for a forward paired alias that cannot be safely emitted locally", () => {
+    const semantic = normalizeLocal(
+      parseMarkdown("[[Research/Paired Note.md|\\*alias\\*]]\n"),
+    );
+    const mapped = toNotionMarkdown(semantic, FIXTURE_LINKS);
+
+    expect(mapped.unsupportedKinds).toEqual(["unsupported-paired-link-label"]);
+    expect(mapped.markdown).toContain("Research/Paired Note.md");
+    expect(mapped.markdown).not.toContain(PAGE_URL);
+  });
+
+  it("round-trips a forward paired alias that is safe to emit locally", () => {
+    const semantic = normalizeLocal(
+      parseMarkdown("[[Research/Paired Note.md|alias]]\n"),
+    );
+    const mapped = toNotionMarkdown(semantic, FIXTURE_LINKS);
+
+    expect(mapped.unsupportedKinds).toEqual([]);
+    expect(fromNotionMarkdown(mapped.markdown, FIXTURE_LINKS).semantic).toEqual(semantic);
+  });
+
   it("escapes raw HTML and reports unsupported unknown Notion tags", async () => {
     const local = await fixture("raw-html.local.md");
     const expected = await fixture("raw-html.notion.md");

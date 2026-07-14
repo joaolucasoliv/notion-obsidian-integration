@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { normalizeLocal, semanticHash } from "./normalize.js";
-import { parseMarkdown } from "./parse.js";
+import { parseMarkdown, scanObsidianText } from "./parse.js";
 
 describe("normalizeLocal", () => {
   it("canonicalizes syntactic equivalents while preserving valid Obsidian syntax", () => {
@@ -49,6 +49,44 @@ describe("normalizeLocal", () => {
 
     expect(normalizeLocal(parseMarkdown(source)).bodyMarkdown).toBe(source);
   });
+
+  it.each([
+    [
+      "one backslash before a wiki",
+      "\\[[Research/Paired Note.md]]\n",
+      "\\[\\[Research/Paired Note.md]]\n",
+      null,
+    ],
+    [
+      "two backslashes before a wiki",
+      "\\\\[[Research/Paired Note.md]]\n",
+      "\\\\[[Research/Paired Note.md]]\n",
+      "wikilink",
+    ],
+    [
+      "one backslash before an embed",
+      "\\![[Research/Paired Note.md]]\n",
+      "\\![[Research/Paired Note.md]]\n",
+      "wikilink",
+    ],
+    [
+      "two backslashes before an embed",
+      "\\\\![[Research/Paired Note.md]]\n",
+      "\\\\![[Research/Paired Note.md]]\n",
+      "embed",
+    ],
+  ] as const)(
+    "preserves CommonMark escape parity for %s",
+    (_case, source, expected, expectedKind) => {
+      const normalized = normalizeLocal(parseMarkdown(source));
+      const scan = scanObsidianText(normalized.bodyMarkdown);
+
+      expect(normalized.bodyMarkdown).toBe(expected);
+      expect(scan.constructs.map((construct) => construct.kind)).toEqual(
+        expectedKind === null ? [] : [expectedKind],
+      );
+    },
+  );
 
   it("restores 4,096 normalized constructs with one token pass", () => {
     const source = "[[x]]".repeat(4_096);

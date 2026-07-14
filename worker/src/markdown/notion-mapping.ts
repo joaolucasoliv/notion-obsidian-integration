@@ -328,6 +328,8 @@ function transformToNotion(
   mask: MarkdownMask,
   links: LinkIndex,
   unsupported: Set<string>,
+  customValidationCache: Map<string, boolean>,
+  hasLinkAncestor = false,
 ): void {
   const transformed: Nodes[] = [];
   for (const original of parent.children as Nodes[]) {
@@ -338,12 +340,19 @@ function transformToNotion(
             unsupported.add("malformed-wikilink");
             return text(replacement.raw);
           }
-          if (parent.type === "link") {
+          if (hasLinkAncestor || parent.type === "link") {
             unsupported.add("nested-custom-link");
             return text(replacement.raw);
           }
           const record = links.byTarget.get(replacement.target);
           if (record === undefined) {
+            return text(replacement.raw);
+          }
+          if (
+            replacement.alias !== null &&
+            !validCustomEmission(replacement.raw, replacement.kind, customValidationCache)
+          ) {
+            unsupported.add("unsupported-paired-link-label");
             return text(replacement.raw);
           }
           if (replacement.kind === "embed") {
@@ -382,7 +391,14 @@ function transformToNotion(
     }
 
     if ("children" in original && Array.isArray(original.children)) {
-      transformToNotion(original as Parent, mask, links, unsupported);
+      transformToNotion(
+        original as Parent,
+        mask,
+        links,
+        unsupported,
+        customValidationCache,
+        hasLinkAncestor || parent.type === "link",
+      );
     }
     transformed.push(original);
   }
@@ -471,11 +487,12 @@ class LocalTokenRegistry {
       return markdown;
     }
     const tokenPattern = new RegExp(
-      `(!)?(${this.#prefix}([0-9]{1,7})END)`,
+      `(\\\\*)(!)?(${this.#prefix}([0-9]{1,7})END)`,
       "gu",
     );
     return markdown.replace(tokenPattern, (
       matched: string,
+      slashes: string,
       bang: string | undefined,
       _token: string,
       encodedIndex: string,
@@ -486,10 +503,16 @@ class LocalTokenRegistry {
       if (replacement === undefined) {
         return matched;
       }
-      if (bang === "!" && replacement.kind === "wikilink" && !isEscapedAt(source, offset)) {
-        return `\\!${replacement.value}`;
+      if (
+        bang === "!" &&
+        replacement.kind === "wikilink" &&
+        !isEscapedAt(source, offset + slashes.length)
+      ) {
+        return `${slashes}\\!${replacement.value}`;
       }
-      return `${bang ?? ""}${replacement.value}`;
+      const restoredSlashes =
+        bang === undefined && replacement.kind !== "literal" ? `${slashes}${slashes}` : slashes;
+      return `${restoredSlashes}${bang ?? ""}${replacement.value}`;
     });
   }
 }
@@ -900,7 +923,7 @@ export function toNotionMarkdown(note: SemanticNote, links: LinkMapping): Mappin
   const masked = maskObsidianSyntax(document);
   const root = structuredClone(masked.root);
   const unsupported = new Set(document.unsupportedKinds);
-  transformToNotion(root, masked, index, unsupported);
+  transformToNotion(root, masked, index, unsupported, new Map());
   return {
     semantic,
     markdown: stringifyNotion(root),

@@ -10,6 +10,7 @@ import {
   type YAMLMap,
   type YAMLSeq,
 } from "yaml";
+import { compareCodePointStrings } from "./normalize.js";
 
 export const MAX_LOCAL_NOTE_BYTES = 1_048_576;
 
@@ -226,7 +227,7 @@ function normalizeTags(tags: readonly string[]): readonly string[] {
     assertValidTag(tag);
   }
   return Object.freeze(
-    [...new Set(tags)].sort((left, right) => (left < right ? -1 : left > right ? 1 : 0)),
+    [...new Set(tags)].sort(compareCodePointStrings),
   );
 }
 

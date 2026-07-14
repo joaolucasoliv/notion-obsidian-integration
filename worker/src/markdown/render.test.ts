@@ -35,6 +35,21 @@ describe("renderLocalNote", () => {
     );
   });
 
+  it("writes synchronized tags in the semantic code-point canonical order", () => {
+    const bytes =
+      "---\nnotion_sync: true\nbridge_id: 11111111-1111-4111-8111-111111111111\ntags: [old]\n---\nBody\n";
+    const note = parseLocalNote("Research/Canonical tags.md", bytes);
+
+    expect(
+      renderLocalNote(note, {
+        bodyMarkdown: "Body\n",
+        tags: ["😀", "\uE000", "alpha", "😀"],
+      }),
+    ).toBe(
+      "---\nnotion_sync: true\nbridge_id: 11111111-1111-4111-8111-111111111111\ntags: [alpha, \uE000, 😀]\n---\nBody\n",
+    );
+  });
+
   it("never creates frontmatter or opts a note in", () => {
     const note = parseLocalNote("Research/Plain.md", "Body only");
 
