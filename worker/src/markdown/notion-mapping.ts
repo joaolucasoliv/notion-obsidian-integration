@@ -15,6 +15,7 @@ import {
   createDecodedTokenPrefix,
   maskObsidianSyntax,
   parseMarkdown,
+  restoreSerializedTokens,
   restoreSerializedSlashParity,
   restoreMarkdownMask,
   scanObsidianText,
@@ -453,14 +454,6 @@ function escapeLiteral(value: string): string {
 
 type LocalTokenKind = "embed" | "literal" | "wikilink";
 
-function isEscapedAt(value: string, index: number): boolean {
-  let slashCount = 0;
-  for (let cursor = index - 1; cursor >= 0 && value[cursor] === "\\"; cursor -= 1) {
-    slashCount += 1;
-  }
-  return slashCount % 2 === 1;
-}
-
 class LocalTokenRegistry {
   readonly #replacements: Array<{ readonly kind: LocalTokenKind; readonly value: string }> = [];
   readonly #prefix: string;
@@ -487,27 +480,17 @@ class LocalTokenRegistry {
     if (this.#replacements.length === 0) {
       return markdown;
     }
-    const tokenPattern = new RegExp(
-      `(\\\\*)(!)?(${this.#prefix}([0-9]{1,7})END)`,
-      "gu",
-    );
-    return markdown.replace(tokenPattern, (
-      matched: string,
-      slashes: string,
-      bang: string | undefined,
-      _token: string,
-      encodedIndex: string,
-      offset: number,
-      source: string,
-    ) => {
+    const tokenPattern = new RegExp(`${this.#prefix}[0-9]{1,7}END`, "gu");
+    return restoreSerializedTokens(markdown, tokenPattern, (token, slashes, bang) => {
+      const encodedIndex = token.slice(this.#prefix.length, -"END".length);
       const replacement = this.#replacements[Number(encodedIndex)];
       if (replacement === undefined) {
-        return matched;
+        return undefined;
       }
       if (
         bang === "!" &&
         replacement.kind === "wikilink" &&
-        !isEscapedAt(source, offset + slashes.length)
+        slashes.length % 2 === 0
       ) {
         return `${slashes}\\!${replacement.value}`;
       }

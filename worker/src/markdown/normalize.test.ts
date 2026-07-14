@@ -114,83 +114,37 @@ describe("normalizeLocal", () => {
   it("restores a near-limit even slash run in one bounded pass", () => {
     const suffix = "[[x]]\n";
     const source = "\\".repeat(MAX_MARKDOWN_BYTES - suffix.length - 64) + suffix;
-    const originalIncludes = String.prototype.includes;
-    const originalReplace = String.prototype.replace;
+    const parsed = parseMarkdown(source);
     let restorationPasses = 0;
 
-    String.prototype.replace = function boundedReplace(
-      this: string,
-      searchValue: string | RegExp,
-      replaceValue: string | ((substring: string, ...args: unknown[]) => string),
-    ): string {
-      if (
-        searchValue instanceof RegExp &&
-        originalIncludes.call(searchValue.source, "GRANDBOXWIKITOKEN")
-      ) {
+    const normalized = normalizeLocal(parsed, [], {
+      onMaskRestorationPass: () => {
         restorationPasses += 1;
         if (restorationPasses > 1) {
           throw new Error("multiple near-limit slash restoration passes");
         }
-      }
-      return Reflect.apply(originalReplace, this, [searchValue, replaceValue]) as string;
-    };
+      },
+    });
 
-    try {
-      const normalized = normalizeLocal(parseMarkdown(source));
-
-      expect(normalized.bodyMarkdown).toBe(source);
-      expect(restorationPasses).toBe(1);
-    } finally {
-      String.prototype.replace = originalReplace;
-    }
+    expect(normalized.bodyMarkdown).toBe(source);
+    expect(restorationPasses).toBe(1);
   });
 
   it("restores 4,096 normalized constructs with one token pass", () => {
     const source = "[[x]]".repeat(4_096);
     const parsed = parseMarkdown(source);
-    const originalIncludes = String.prototype.includes;
-    const originalReplace = String.prototype.replace;
-    const originalReplaceAll = String.prototype.replaceAll;
     let restorationPasses = 0;
 
-    String.prototype.replace = function boundedReplace(
-      this: string,
-      searchValue: string | RegExp,
-      replaceValue: string | ((substring: string, ...args: unknown[]) => string),
-    ): string {
-      if (
-        searchValue instanceof RegExp &&
-        originalIncludes.call(searchValue.source, "GRANDBOXWIKITOKEN")
-      ) {
+    const semantic = normalizeLocal(parsed, [], {
+      onMaskRestorationPass: () => {
         restorationPasses += 1;
         if (restorationPasses > 1) {
           throw new Error("multiple normalized token restoration passes");
         }
-      }
-      return Reflect.apply(originalReplace, this, [searchValue, replaceValue]) as string;
-    };
-    String.prototype.replaceAll = function boundedReplaceAll(
-      this: string,
-      searchValue: string | RegExp,
-      replaceValue: string | ((substring: string, ...args: unknown[]) => string),
-    ): string {
-      if (typeof searchValue === "string" && searchValue.startsWith("GRANDBOXWIKITOKEN")) {
-        restorationPasses += 1;
-        if (restorationPasses > 1) {
-          throw new Error("multiple normalized token restoration passes");
-        }
-      }
-      return Reflect.apply(originalReplaceAll, this, [searchValue, replaceValue]) as string;
-    };
+      },
+    });
 
-    try {
-      const semantic = normalizeLocal(parsed);
-
-      expect(semantic.bodyMarkdown).toBe(`${source}\n`);
-      expect(restorationPasses).toBe(1);
-    } finally {
-      String.prototype.replace = originalReplace;
-      String.prototype.replaceAll = originalReplaceAll;
-    }
+    expect(semantic.bodyMarkdown).toBe(`${source}\n`);
+    expect(restorationPasses).toBe(1);
   });
 });

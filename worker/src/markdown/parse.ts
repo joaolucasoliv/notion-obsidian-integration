@@ -1,4 +1,5 @@
 import type { Nodes, Root } from "mdast";
+import { decodeString } from "micromark-util-decode-string";
 import { unified } from "unified";
 import remarkGfm from "remark-gfm";
 import remarkParse from "remark-parse";
@@ -82,14 +83,6 @@ function utf8Length(value: string): number {
 
 function parseRoot(source: string): Root {
   return unified().use(remarkParse).use(remarkGfm).parse(source);
-}
-
-function isEscaped(value: string, index: number): boolean {
-  let slashCount = 0;
-  for (let cursor = index - 1; cursor >= 0 && value[cursor] === "\\"; cursor -= 1) {
-    slashCount += 1;
-  }
-  return slashCount % 2 === 1;
 }
 
 function escapedAsciiPositions(value: string): Uint8Array {
@@ -291,6 +284,49 @@ export function restoreSerializedSlashParity(slashes: string): string {
   return slashes.length % 2 === 0 ? slashes : `${slashes}\\`;
 }
 
+export function restoreSerializedTokens(
+  value: string,
+  tokenPattern: RegExp,
+  restore: (token: string, slashes: string, bang: "!" | undefined) => string | undefined,
+  onTokenPass?: () => void,
+): string {
+  const tokens: Array<{ readonly index: number; readonly value: string }> = [];
+  onTokenPass?.();
+  value.replace(tokenPattern, (token: string, offset: number): string => {
+    tokens.push({ index: offset, value: token });
+    return token;
+  });
+  if (tokens.length === 0) {
+    return value;
+  }
+
+  const parts: string[] = [];
+  let cursor = 0;
+  for (const token of tokens) {
+    let contextEnd = token.index;
+    let bang: "!" | undefined;
+    if (contextEnd > cursor && value[contextEnd - 1] === "!") {
+      bang = "!";
+      contextEnd -= 1;
+    }
+    let slashStart = contextEnd;
+    while (slashStart > cursor && value[slashStart - 1] === "\\") {
+      slashStart -= 1;
+    }
+    const replacement = restore(token.value, value.slice(slashStart, contextEnd), bang);
+    if (replacement === undefined) {
+      continue;
+    }
+    parts.push(value.slice(cursor, slashStart), replacement);
+    cursor = token.index + token.value.length;
+  }
+  if (cursor === 0) {
+    return value;
+  }
+  parts.push(value.slice(cursor));
+  return parts.join("");
+}
+
 export function createDecodedTokenPrefix(
   document: ParsedMarkdownDocument,
   stem: string,
@@ -328,9 +364,11 @@ export function maskObsidianSyntax(document: ParsedMarkdownDocument): MarkdownMa
   const edits: Array<{ readonly start: number; readonly end: number; readonly token: string }> = [];
   const replacements = new Map<string, MarkdownMaskReplacement>();
   const prefix = createDecodedTokenPrefix(document, "GRANDBOXWIKITOKEN");
+  const root = structuredClone(document.root);
+  let requiresReparse = false;
   let tokenIndex = 0;
 
-  visitTree(document.root, (node) => {
+  visitTree(root, (node) => {
     if (node.type !== "text") {
       return;
     }
@@ -340,6 +378,7 @@ export function maskObsidianSyntax(document: ParsedMarkdownDocument): MarkdownMa
     }
     const raw = document.source.slice(offsets.start, offsets.end);
     const scan = scanTextSource(raw, offsets.start);
+    const textEdits: Array<{ readonly start: number; readonly end: number; readonly token: string }> = [];
     if (scan.malformed) {
       if (tokenIndex >= MAX_CUSTOM_CONSTRUCTS) {
         throw invalidMarkdown();
@@ -348,25 +387,58 @@ export function maskObsidianSyntax(document: ParsedMarkdownDocument): MarkdownMa
       tokenIndex += 1;
       edits.push({ start: offsets.start, end: offsets.end, token });
       replacements.set(token, { kind: "malformed", raw });
+      textEdits.push({ start: 0, end: raw.length, token });
+    } else {
+      for (const construct of scan.constructs) {
+        if (tokenIndex >= MAX_CUSTOM_CONSTRUCTS) {
+          throw invalidMarkdown();
+        }
+        const token = `${prefix}${tokenIndex}END`;
+        tokenIndex += 1;
+        edits.push({ start: construct.start, end: construct.end, token });
+        replacements.set(token, construct);
+        textEdits.push({
+          start: construct.start - offsets.start,
+          end: construct.end - offsets.start,
+          token,
+        });
+      }
+    }
+
+    if (textEdits.length === 0 || requiresReparse) {
       return;
     }
-    for (const construct of scan.constructs) {
-      if (tokenIndex >= MAX_CUSTOM_CONSTRUCTS) {
+    if (decodeString(raw) !== node.value) {
+      requiresReparse = true;
+      return;
+    }
+    const parts: string[] = [];
+    let cursor = 0;
+    for (const edit of textEdits) {
+      if (edit.start < cursor || edit.end < edit.start) {
         throw invalidMarkdown();
       }
-      const token = `${prefix}${tokenIndex}END`;
-      tokenIndex += 1;
-      edits.push({ start: construct.start, end: construct.end, token });
-      replacements.set(token, construct);
+      parts.push(raw.slice(cursor, edit.start), edit.token);
+      cursor = edit.end;
     }
+    parts.push(raw.slice(cursor));
+    node.value = decodeString(parts.join(""));
   });
 
-  const sourceParts: string[] = [];
   let sourceCursor = 0;
   for (const edit of edits) {
     if (edit.start < sourceCursor || edit.end < edit.start) {
       throw invalidMarkdown();
     }
+    sourceCursor = edit.end;
+  }
+  if (!requiresReparse) {
+    return { source: document.source, root, prefix, replacements };
+  }
+
+  const sourceParts: string[] = [];
+  sourceCursor = 0;
+  for (const edit of edits) {
     sourceParts.push(document.source.slice(sourceCursor, edit.start), edit.token);
     sourceCursor = edit.end;
   }
@@ -376,32 +448,27 @@ export function maskObsidianSyntax(document: ParsedMarkdownDocument): MarkdownMa
   return { source, root: masked.root, prefix, replacements };
 }
 
-export function restoreMarkdownMask(value: string, mask: MarkdownMask): string {
+export function restoreMarkdownMask(
+  value: string,
+  mask: MarkdownMask,
+  onTokenPass?: () => void,
+): string {
   if (mask.replacements.size === 0) {
     return value;
   }
-  const tokenPattern = new RegExp(
-    `(\\\\*)(!)?(${escapeRegExp(mask.prefix)}[0-9]{1,7}END)`,
-    "gu",
-  );
-  return value.replace(
+  const tokenPattern = new RegExp(`${escapeRegExp(mask.prefix)}[0-9]{1,7}END`, "gu");
+  return restoreSerializedTokens(
+    value,
     tokenPattern,
-    (
-      matched: string,
-      slashes: string,
-      bang: string | undefined,
-      token: string,
-      offset: number,
-      source: string,
-    ) => {
+    (token, slashes, bang) => {
       const replacement = mask.replacements.get(token);
       if (replacement === undefined) {
-        return matched;
+        return undefined;
       }
       if (
         bang === "!" &&
         replacement.kind === "wikilink" &&
-        !isEscaped(source, offset + slashes.length)
+        slashes.length % 2 === 0
       ) {
         return `${slashes}\\!${replacement.raw}`;
       }
@@ -411,5 +478,6 @@ export function restoreMarkdownMask(value: string, mask: MarkdownMask): string {
           : slashes;
       return `${restoredSlashes}${bang ?? ""}${replacement.raw}`;
     },
+    onTokenPass,
   );
 }

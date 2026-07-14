@@ -79,12 +79,21 @@ export function stringifyMarkdown(root: Root): string {
     .stringify(root);
 }
 
+export interface NormalizeLocalOptions {
+  readonly onMaskRestorationPass?: () => void;
+}
+
 export function normalizeLocal(
   document: ParsedMarkdownDocument,
   tags: readonly string[] = [],
+  options: NormalizeLocalOptions = {},
 ): SemanticNote {
   const masked = maskObsidianSyntax(document);
-  const bodyMarkdown = restoreMarkdownMask(stringifyMarkdown(masked.root), masked);
+  const bodyMarkdown = restoreMarkdownMask(
+    stringifyMarkdown(masked.root),
+    masked,
+    options.onMaskRestorationPass,
+  );
   return {
     bodyMarkdown: normalizeLineEndings(bodyMarkdown),
     tags: normalizeTags(tags),
