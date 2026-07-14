@@ -1,0 +1,75 @@
+import { z } from "zod";
+
+const uuidSchema = z.uuid();
+const hashSchema = z.string().regex(/^[0-9a-f]{64}$/, "Expected a lowercase SHA-256 hash");
+const timestampSchema = z.string().max(64).datetime({ offset: true });
+
+const relativePathSchema = z
+  .string()
+  .min(1)
+  .max(1_024)
+  .superRefine((value, context) => {
+    const segments = value.split("/");
+    const unsafe =
+      value.startsWith("/") ||
+      value.includes("\\") ||
+      value.includes("\0") ||
+      /[\r\n]/.test(value) ||
+      segments.some((segment) => segment === "" || segment === "." || segment === "..");
+
+    if (unsafe) {
+      context.addIssue({ code: "custom", message: "Expected a normalized vault-relative path" });
+    }
+  });
+
+export const journalEffectKindSchema = z.enum([
+  "initialize-pair",
+  "create-notion-page",
+  "update-notion-body-exact",
+  "update-notion-properties",
+  "write-local",
+  "create-conflict",
+  "set-notion-status",
+]);
+
+export const journalIntentV1Schema = z
+  .object({
+    schemaVersion: z.literal(1),
+    id: uuidSchema,
+    installationId: uuidSchema,
+    effectKind: journalEffectKindSchema,
+    relativePath: relativePathSchema.nullable(),
+    remoteId: uuidSchema.nullable(),
+    allocationId: hashSchema.nullable(),
+    expectedByteHash: hashSchema.nullable(),
+    expectedSemanticHash: hashSchema.nullable(),
+    expectedRemoteEditedAt: timestampSchema.nullable(),
+    createdAt: timestampSchema,
+  })
+  .strict()
+  .readonly();
+
+export const journalCompletionV1Schema = z
+  .object({
+    schemaVersion: z.literal(1),
+    resultByteHash: hashSchema.nullable(),
+    resultSemanticHash: hashSchema.nullable(),
+    resultRemoteId: uuidSchema.nullable(),
+    allocatedBridgeId: uuidSchema.nullable(),
+    observedRemoteEditedAt: timestampSchema.nullable(),
+    completedAt: timestampSchema,
+  })
+  .strict()
+  .readonly();
+
+export type JournalEffectKind = z.infer<typeof journalEffectKindSchema>;
+export type JournalIntentV1 = z.infer<typeof journalIntentV1Schema>;
+export type JournalCompletionV1 = z.infer<typeof journalCompletionV1Schema>;
+
+export function parseJournalIntent(input: unknown): JournalIntentV1 {
+  return journalIntentV1Schema.parse(input);
+}
+
+export function parseJournalCompletion(input: unknown): JournalCompletionV1 {
+  return journalCompletionV1Schema.parse(input);
+}

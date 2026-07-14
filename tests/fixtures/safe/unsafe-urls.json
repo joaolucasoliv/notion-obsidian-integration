@@ -1,0 +1,4 @@
+{
+  "credentialBearingHttps": "https://username:password@relay.example.test/functions/v1/bridge",
+  "credentialBearingOrigin": "https://username:password@graph.example.test"
+}

@@ -1,6 +1,44 @@
 import { z } from "zod";
 
 const sha256Schema = z.string().regex(/^[0-9a-f]{64}$/, "Expected a lowercase SHA-256 hash");
+const loopbackHosts = new Set(["localhost", "127.0.0.1", "[::1]"]);
+
+function persistedWebUrlSchema(options: { bareOrigin: boolean }) {
+  return z.string().superRefine((value, context) => {
+    let url: URL;
+    try {
+      url = new URL(value);
+    } catch {
+      context.addIssue({ code: "custom", message: "Expected a valid web URL" });
+      return;
+    }
+
+    const schemeDelimiterIndex = value.indexOf("://");
+    const afterScheme = schemeDelimiterIndex < 0 ? "" : value.slice(schemeDelimiterIndex + 3);
+    const authorityEnd = afterScheme.search(/[/?#]/);
+    const authority = (authorityEnd < 0 ? afterScheme : afterScheme.slice(0, authorityEnd)).toLowerCase();
+    const remainder = authorityEnd < 0 ? "" : afterScheme.slice(authorityEnd);
+    const rawHost = authority.startsWith("[")
+      ? authority.slice(0, authority.indexOf("]") + 1)
+      : authority.split(":", 1)[0] ?? "";
+    const approvedProtocol =
+      schemeDelimiterIndex > 0 &&
+      (url.protocol === "https:" || (url.protocol === "http:" && loopbackHosts.has(rawHost)));
+    const hasForbiddenComponents =
+      authority.includes("@") ||
+      url.username !== "" ||
+      url.password !== "" ||
+      remainder.includes("?") ||
+      remainder.includes("#");
+    const hasNonCanonicalCharacters = value !== value.trim() || value.includes("\\");
+    const isCanonicalOrigin = value === url.origin || value === `${url.origin}/`;
+    const hasForbiddenPath = options.bareOrigin && !isCanonicalOrigin;
+
+    if (!approvedProtocol || hasForbiddenComponents || hasNonCanonicalCharacters || hasForbiddenPath) {
+      context.addIssue({ code: "custom", message: "Expected an approved credential-free web URL" });
+    }
+  });
+}
 
 const notionConfigSchema = z
   .object({
@@ -14,7 +52,7 @@ const notionConfigSchema = z
 
 const relayConfigSchema = z
   .object({
-    baseUrl: z.url(),
+    baseUrl: persistedWebUrlSchema({ bareOrigin: false }),
   })
   .strict()
   .readonly();
@@ -30,7 +68,7 @@ const graphDomainSchema = z
 const graphConfigSchema = z
   .object({
     graphId: z.string().min(1),
-    webOrigin: z.url().nullable(),
+    webOrigin: persistedWebUrlSchema({ bareOrigin: true }).nullable(),
     domains: z.array(graphDomainSchema).readonly(),
   })
   .strict()

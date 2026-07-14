@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import unsafeUrls from "../../../tests/fixtures/safe/unsafe-urls.json";
 import { parseBridgeConfig } from "./config";
 
 const ID = "5c343dbe-23b1-4e13-af1e-ffed61ecb290";
@@ -59,5 +60,56 @@ describe("parseBridgeConfig", () => {
     const malformedDomain = validConfig();
     malformedDomain.graph.domains[0].domain = "finance";
     expect(() => parseBridgeConfig(malformedDomain)).toThrow(/domain/i);
+  });
+
+  it.each([
+    ["https://relay.example.test/functions/v1/bridge", "https://graph.example.test"],
+    ["http://localhost:54321/functions/v1/bridge", "http://localhost:5173"],
+    ["http://127.0.0.1:54321/functions/v1/bridge", "http://127.0.0.1:5173/"],
+    ["http://[::1]:54321/functions/v1/bridge", "http://[::1]:5173"],
+  ])("accepts approved relay URL %s and graph origin %s", (baseUrl, webOrigin) => {
+    const config = validConfig();
+    config.relay.baseUrl = baseUrl;
+    config.graph.webOrigin = webOrigin;
+
+    expect(parseBridgeConfig(config)).toEqual(config);
+  });
+
+  it.each([
+    "http://relay.example.test/functions/v1/bridge",
+    "ftp://relay.example.test/functions/v1/bridge",
+    unsafeUrls.credentialBearingHttps,
+    "https://@relay.example.test/functions/v1/bridge",
+    "https:relay.example.test/functions/v1/bridge",
+    " https://relay.example.test/functions/v1/bridge ",
+    "https://relay.example.test\\functions/v1/bridge",
+    "https://relay.example.test/functions/v1/bridge?",
+    "https://relay.example.test/functions/v1/bridge?cursor=value",
+    "https://relay.example.test/functions/v1/bridge#",
+    "https://relay.example.test/functions/v1/bridge#fragment",
+  ])("rejects unsafe persisted relay URL %s", (baseUrl) => {
+    const config = validConfig();
+    config.relay.baseUrl = baseUrl;
+
+    expect(() => parseBridgeConfig(config)).toThrow(/baseUrl/i);
+  });
+
+  it.each([
+    "http://graph.example.test",
+    "file:///tmp/graph",
+    unsafeUrls.credentialBearingOrigin,
+    " https://graph.example.test ",
+    "https://graph.example.test\\path",
+    "https://graph.example.test/.",
+    "https://graph.example.test/path",
+    "https://graph.example.test?",
+    "https://graph.example.test?view=all",
+    "https://graph.example.test#",
+    "https://graph.example.test#fragment",
+  ])("rejects unsafe or non-origin persisted graph URL %s", (webOrigin) => {
+    const config = validConfig();
+    config.graph.webOrigin = webOrigin;
+
+    expect(() => parseBridgeConfig(config)).toThrow(/webOrigin/i);
   });
 });

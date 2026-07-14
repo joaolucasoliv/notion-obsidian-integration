@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { bridgeRunSummarySchema } from "./summary.js";
 
 const sha256Schema = z.string().regex(/^[0-9a-f]{64}$/, "Expected a lowercase SHA-256 hash");
 const timestampSchema = z.string().datetime({ offset: true });
@@ -35,23 +36,6 @@ export const graphPublishStateV1Schema = z
     keyId: z.string().min(1),
     sequence: z.number().int().nonnegative(),
     lastPublishedAt: timestampSchema.nullable(),
-  })
-  .strict()
-  .readonly();
-
-export const bridgeRunSummarySchema = z
-  .object({
-    mode: z.enum(["preview", "apply"]),
-    outcome: z.enum(["success", "noop", "partial", "conflict", "failed", "recovery-required"]),
-    planned: z.number().int().nonnegative(),
-    writes: z.number().int().nonnegative(),
-    pushed: z.number().int().nonnegative(),
-    pulled: z.number().int().nonnegative(),
-    conflicts: z.number().int().nonnegative(),
-    errors: z.number().int().nonnegative(),
-    graphUploads: z.number().int().nonnegative(),
-    startedAt: timestampSchema,
-    completedAt: timestampSchema,
   })
   .strict()
   .readonly();
