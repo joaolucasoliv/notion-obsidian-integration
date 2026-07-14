@@ -8,6 +8,7 @@ import {
   MarkdownParseError,
   maskObsidianSyntax,
   normalizeLineEndings,
+  restoreMarkdownMask,
   type ParsedMarkdownDocument,
 } from "./parse.js";
 
@@ -83,10 +84,7 @@ export function normalizeLocal(
   tags: readonly string[] = [],
 ): SemanticNote {
   const masked = maskObsidianSyntax(document);
-  let bodyMarkdown = stringifyMarkdown(masked.root);
-  for (const [token, replacement] of masked.replacements) {
-    bodyMarkdown = bodyMarkdown.replaceAll(token, replacement.raw);
-  }
+  const bodyMarkdown = restoreMarkdownMask(stringifyMarkdown(masked.root), masked);
   return {
     bodyMarkdown: normalizeLineEndings(bodyMarkdown),
     tags: normalizeTags(tags),

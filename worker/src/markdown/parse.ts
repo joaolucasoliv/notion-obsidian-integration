@@ -50,10 +50,15 @@ export interface TextScan {
   readonly malformed: boolean;
 }
 
+export type MarkdownMaskReplacement =
+  | ObsidianConstruct
+  | { readonly kind: "malformed"; readonly raw: string };
+
 export interface MarkdownMask {
   readonly root: Root;
   readonly source: string;
-  readonly replacements: ReadonlyMap<string, ObsidianConstruct | { readonly kind: "malformed"; readonly raw: string }>;
+  readonly prefix: string;
+  readonly replacements: ReadonlyMap<string, MarkdownMaskReplacement>;
 }
 
 export class MarkdownParseError extends Error {
@@ -87,12 +92,20 @@ function isEscaped(value: string, index: number): boolean {
   return slashCount % 2 === 1;
 }
 
-function findUnescaped(value: string, search: string, start: number): number {
-  let cursor = value.indexOf(search, start);
-  while (cursor !== -1 && isEscaped(value, cursor)) {
-    cursor = value.indexOf(search, cursor + search.length);
+function escapedAsciiPositions(value: string): Uint8Array {
+  const escaped = new Uint8Array(value.length);
+  let slashCount = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    if (value[index] === "\\") {
+      slashCount += 1;
+      continue;
+    }
+    if (slashCount % 2 === 1) {
+      escaped[index] = 1;
+    }
+    slashCount = 0;
   }
-  return cursor;
+  return escaped;
 }
 
 function isValidCustomPart(value: string): boolean {
@@ -106,12 +119,13 @@ function isValidCustomPart(value: string): boolean {
 
 function scanTextSource(raw: string, absoluteStart: number): TextScan {
   const constructs: ObsidianConstruct[] = [];
+  const escaped = escapedAsciiPositions(raw);
   let malformed = false;
   let cursor = 0;
 
   while (cursor < raw.length) {
-    const embed = raw.startsWith("![[", cursor) && !isEscaped(raw, cursor);
-    const wiki = !embed && raw.startsWith("[[", cursor) && !isEscaped(raw, cursor);
+    const embed = raw.startsWith("![[", cursor) && escaped[cursor] === 0;
+    const wiki = !embed && raw.startsWith("[[", cursor) && escaped[cursor] === 0;
     if (!embed && !wiki) {
       cursor += 1;
       continue;
@@ -119,24 +133,44 @@ function scanTextSource(raw: string, absoluteStart: number): TextScan {
 
     const openingLength = embed ? 3 : 2;
     const contentStart = cursor + openingLength;
-    const close = findUnescaped(raw, "]]", contentStart);
-    const nested = findUnescaped(raw, "[[", contentStart);
-    if (close === -1) {
-      malformed = true;
-      cursor = contentStart;
-      continue;
+    let close = -1;
+    let nested = -1;
+    let firstPipe = -1;
+    let secondPipe = -1;
+    let inner = contentStart;
+    while (inner < raw.length) {
+      if (escaped[inner] === 0 && raw.startsWith("[[", inner)) {
+        nested = inner;
+        break;
+      }
+      if (escaped[inner] === 0 && raw.startsWith("]]", inner)) {
+        close = inner;
+        break;
+      }
+      if (raw[inner] === "|" && escaped[inner] === 0) {
+        if (firstPipe === -1) {
+          firstPipe = inner;
+        } else if (secondPipe === -1) {
+          secondPipe = inner;
+        }
+      }
+      inner += 1;
     }
-    if (nested !== -1 && nested < close) {
+
+    if (nested !== -1) {
       malformed = true;
       cursor = nested;
       continue;
     }
+    if (close === -1) {
+      malformed = true;
+      break;
+    }
 
     const content = raw.slice(contentStart, close);
-    const firstPipe = findUnescaped(content, "|", 0);
-    const secondPipe = firstPipe === -1 ? -1 : findUnescaped(content, "|", firstPipe + 1);
-    const target = firstPipe === -1 ? content : content.slice(0, firstPipe);
-    const alias = firstPipe === -1 ? null : content.slice(firstPipe + 1);
+    const relativePipe = firstPipe === -1 ? -1 : firstPipe - contentStart;
+    const target = relativePipe === -1 ? content : content.slice(0, relativePipe);
+    const alias = relativePipe === -1 ? null : content.slice(relativePipe + 1);
     if (
       secondPipe !== -1 ||
       !isValidCustomPart(target) ||
@@ -288,10 +322,7 @@ export function createDecodedTokenPrefix(
 
 export function maskObsidianSyntax(document: ParsedMarkdownDocument): MarkdownMask {
   const edits: Array<{ readonly start: number; readonly end: number; readonly token: string }> = [];
-  const replacements = new Map<
-    string,
-    ObsidianConstruct | { readonly kind: "malformed"; readonly raw: string }
-  >();
+  const replacements = new Map<string, MarkdownMaskReplacement>();
   const prefix = createDecodedTokenPrefix(document, "GRANDBOXWIKITOKEN");
   let tokenIndex = 0;
 
@@ -326,10 +357,40 @@ export function maskObsidianSyntax(document: ParsedMarkdownDocument): MarkdownMa
     }
   });
 
-  let source = document.source;
-  for (const edit of edits.sort((left, right) => right.start - left.start)) {
-    source = `${source.slice(0, edit.start)}${edit.token}${source.slice(edit.end)}`;
+  const sourceParts: string[] = [];
+  let sourceCursor = 0;
+  for (const edit of edits) {
+    if (edit.start < sourceCursor || edit.end < edit.start) {
+      throw invalidMarkdown();
+    }
+    sourceParts.push(document.source.slice(sourceCursor, edit.start), edit.token);
+    sourceCursor = edit.end;
   }
+  sourceParts.push(document.source.slice(sourceCursor));
+  const source = sourceParts.join("");
   const masked = parseMarkdown(source);
-  return { source, root: masked.root, replacements };
+  return { source, root: masked.root, prefix, replacements };
+}
+
+export function restoreMarkdownMask(value: string, mask: MarkdownMask): string {
+  if (mask.replacements.size === 0) {
+    return value;
+  }
+  const tokenPattern = new RegExp(
+    `(!)?(${escapeRegExp(mask.prefix)}[0-9]{1,7}END)`,
+    "gu",
+  );
+  return value.replace(
+    tokenPattern,
+    (matched: string, bang: string | undefined, token: string, offset: number, source: string) => {
+      const replacement = mask.replacements.get(token);
+      if (replacement === undefined) {
+        return matched;
+      }
+      if (bang === "!" && replacement.kind === "wikilink" && !isEscaped(source, offset)) {
+        return `\\!${replacement.raw}`;
+      }
+      return `${bang ?? ""}${replacement.raw}`;
+    },
+  );
 }

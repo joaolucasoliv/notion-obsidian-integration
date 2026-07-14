@@ -1,4 +1,5 @@
 import type { SemanticNote } from "@grandbox-bridge/shared";
+import { decodeString } from "micromark-util-decode-string";
 import type { Link, Nodes, Parent, Root, Text } from "mdast";
 import { unified } from "unified";
 import remarkGfm from "remark-gfm";
@@ -14,6 +15,7 @@ import {
   createDecodedTokenPrefix,
   maskObsidianSyntax,
   parseMarkdown,
+  restoreMarkdownMask,
   scanObsidianText,
   type MarkdownMask,
   type ObsidianConstruct,
@@ -27,6 +29,21 @@ const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3
 const URI_SCHEME_PATTERN = /^([A-Za-z][A-Za-z0-9+.-]*):/u;
 const SAFE_SCHEMES = new Set(["http", "https", "mailto"]);
 const NOTION_LITERAL_SPECIALS = /[\\*~`$\[\]<>{}|^]/gu;
+const NOTION_LITERAL_SPECIAL_CHARACTERS = new Set([
+  "\\",
+  "*",
+  "~",
+  "`",
+  "$",
+  "[",
+  "]",
+  "<",
+  ">",
+  "{",
+  "}",
+  "|",
+  "^",
+]);
 const EMBED_LINK_TITLE = "grandbox-bridge:embed:v1";
 const LOCAL_LINK_TITLE = "grandbox-bridge:local-link:v1";
 
@@ -253,12 +270,8 @@ function nodeSource(source: string, node: Nodes): string {
   return source.slice(start, end);
 }
 
-function restoreMaskTokens(raw: string, replacements: ReadonlyMap<string, MaskReplacement>): string {
-  let restored = raw;
-  for (const [token, replacement] of replacements) {
-    restored = restored.replaceAll(token, replacement.raw);
-  }
-  return restored;
+function restoreMaskTokens(raw: string, mask: MarkdownMask): string {
+  return restoreMarkdownMask(raw, mask);
 }
 
 function text(value: string): Text {
@@ -276,43 +289,32 @@ function asLiteralForParent(value: string, parent: Parent): Nodes {
   return text(value);
 }
 
-function nextToken(
-  value: string,
-  replacements: ReadonlyMap<string, MaskReplacement>,
-  start: number,
-): { readonly token: string; readonly index: number } | null {
-  let found: { readonly token: string; readonly index: number } | null = null;
-  for (const token of replacements.keys()) {
-    const index = value.indexOf(token, start);
-    if (index !== -1 && (found === null || index < found.index)) {
-      found = { token, index };
-    }
-  }
-  return found;
-}
-
 function splitMaskedText(
   value: string,
-  replacements: ReadonlyMap<string, MaskReplacement>,
+  mask: MarkdownMask,
   convert: (replacement: MaskReplacement) => Nodes,
 ): Nodes[] {
   const nodes: Nodes[] = [];
   let cursor = 0;
-  while (cursor < value.length) {
-    const found = nextToken(value, replacements, cursor);
-    if (found === null) {
-      nodes.push(text(value.slice(cursor)));
-      break;
+  const tokenPattern = new RegExp(`${mask.prefix}[0-9]{1,7}END`, "gu");
+  for (const match of value.matchAll(tokenPattern)) {
+    const token = match[0];
+    const index = match.index;
+    if (index === undefined) {
+      throw invalidMapping();
     }
-    if (found.index > cursor) {
-      nodes.push(text(value.slice(cursor, found.index)));
+    if (index > cursor) {
+      nodes.push(text(value.slice(cursor, index)));
     }
-    const replacement = replacements.get(found.token);
+    const replacement = mask.replacements.get(token);
     if (replacement === undefined) {
       throw invalidMapping();
     }
     nodes.push(convert(replacement));
-    cursor = found.index + found.token.length;
+    cursor = index + token.length;
+  }
+  if (cursor < value.length) {
+    nodes.push(text(value.slice(cursor)));
   }
   return nodes.length === 0 ? [text("")] : nodes;
 }
@@ -323,8 +325,7 @@ function isSupportedNode(node: Nodes): boolean {
 
 function transformToNotion(
   parent: Parent,
-  source: string,
-  replacements: ReadonlyMap<string, MaskReplacement>,
+  mask: MarkdownMask,
   links: LinkIndex,
   unsupported: Set<string>,
 ): void {
@@ -332,7 +333,7 @@ function transformToNotion(
   for (const original of parent.children as Nodes[]) {
     if (original.type === "text") {
       transformed.push(
-        ...splitMaskedText(original.value, replacements, (replacement) => {
+        ...splitMaskedText(original.value, mask, (replacement) => {
           if (replacement.kind === "malformed") {
             unsupported.add("malformed-wikilink");
             return text(replacement.raw);
@@ -361,7 +362,7 @@ function transformToNotion(
     }
 
     if (!isSupportedNode(original)) {
-      const raw = restoreMaskTokens(nodeSource(source, original), replacements);
+      const raw = restoreMaskTokens(nodeSource(mask.source, original), mask);
       transformed.push(asLiteralForParent(raw, parent));
       continue;
     }
@@ -369,7 +370,7 @@ function transformToNotion(
     if (original.type === "link") {
       if (!safeLinkUrl(original.url)) {
         unsupported.add("unsafe-link-scheme");
-        const raw = restoreMaskTokens(nodeSource(source, original), replacements);
+        const raw = restoreMaskTokens(nodeSource(mask.source, original), mask);
         transformed.push(asLiteralForParent(raw, parent));
         continue;
       }
@@ -381,7 +382,7 @@ function transformToNotion(
     }
 
     if ("children" in original && Array.isArray(original.children)) {
-      transformToNotion(original as Parent, source, replacements, links, unsupported);
+      transformToNotion(original as Parent, mask, links, unsupported);
     }
     transformed.push(original);
   }
@@ -433,8 +434,18 @@ function escapeLiteral(value: string): string {
   return value.replace(NOTION_LITERAL_SPECIALS, "\\$&");
 }
 
+type LocalTokenKind = "embed" | "literal" | "wikilink";
+
+function isEscapedAt(value: string, index: number): boolean {
+  let slashCount = 0;
+  for (let cursor = index - 1; cursor >= 0 && value[cursor] === "\\"; cursor -= 1) {
+    slashCount += 1;
+  }
+  return slashCount % 2 === 1;
+}
+
 class LocalTokenRegistry {
-  readonly #replacements: string[] = [];
+  readonly #replacements: Array<{ readonly kind: LocalTokenKind; readonly value: string }> = [];
   readonly #prefix: string;
 
   public constructor(document: ParsedMarkdownDocument, additionalValues: Iterable<string>) {
@@ -445,13 +456,13 @@ class LocalTokenRegistry {
     );
   }
 
-  public token(value: string): Text {
+  public token(value: string, kind: LocalTokenKind = "literal"): Text {
     const index = this.#replacements.length;
     if (index > 9_999_999) {
       throw invalidMapping();
     }
     const token = `${this.#prefix}${index}END`;
-    this.#replacements.push(value);
+    this.#replacements.push({ kind, value });
     return text(token);
   }
 
@@ -459,10 +470,26 @@ class LocalTokenRegistry {
     if (this.#replacements.length === 0) {
       return markdown;
     }
-    const tokenPattern = new RegExp(`${this.#prefix}([0-9]{1,7})END`, "gu");
-    return markdown.replace(tokenPattern, (token, encodedIndex: string) => {
+    const tokenPattern = new RegExp(
+      `(!)?(${this.#prefix}([0-9]{1,7})END)`,
+      "gu",
+    );
+    return markdown.replace(tokenPattern, (
+      matched: string,
+      bang: string | undefined,
+      _token: string,
+      encodedIndex: string,
+      offset: number,
+      source: string,
+    ) => {
       const replacement = this.#replacements[Number(encodedIndex)];
-      return replacement ?? token;
+      if (replacement === undefined) {
+        return matched;
+      }
+      if (bang === "!" && replacement.kind === "wikilink" && !isEscapedAt(source, offset)) {
+        return `\\!${replacement.value}`;
+      }
+      return `${bang ?? ""}${replacement.value}`;
     });
   }
 }
@@ -508,6 +535,45 @@ function pairedEmbed(label: string, expectedTarget: string): ObsidianConstruct |
   return construct;
 }
 
+function validCustomEmission(
+  candidate: string,
+  expectedKind: "wikilink" | "embed",
+  cache: Map<string, boolean>,
+): boolean {
+  const key = `${expectedKind}\u0000${candidate}`;
+  const cached = cache.get(key);
+  if (cached !== undefined) {
+    return cached;
+  }
+
+  let valid = false;
+  try {
+    const document = parseMarkdown(candidate);
+    const block = document.root.children[0];
+    const child = block?.type === "paragraph" ? block.children[0] : undefined;
+    const scan = scanObsidianText(candidate);
+    const construct = scan.constructs[0];
+    valid =
+      document.unsupportedKinds.length === 0 &&
+      document.root.children.length === 1 &&
+      block?.type === "paragraph" &&
+      block.children.length === 1 &&
+      child?.type === "text" &&
+      nodeSource(document.source, child) === candidate &&
+      child.value === candidate &&
+      !scan.malformed &&
+      scan.constructs.length === 1 &&
+      construct !== undefined &&
+      construct.kind === expectedKind &&
+      construct.start === 0 &&
+      construct.end === candidate.length;
+  } catch {
+    valid = false;
+  }
+  cache.set(key, valid);
+  return valid;
+}
+
 function classifyNotionTag(value: string): string {
   if (/^\s*<!--/u.test(value)) {
     return "html-comment";
@@ -547,37 +613,127 @@ function isAsciiPunctuation(character: string): boolean {
   );
 }
 
+interface DecodedSourceSegment {
+  readonly decoded: string;
+  readonly kind: "escape" | "literal" | "reference";
+  readonly rawEnd: number;
+  readonly raw: string;
+}
+
+function nextDecodedSourceSegment(rawSource: string, rawCursor: number): DecodedSourceSegment {
+  const rawCharacter = String.fromCodePoint(rawSource.codePointAt(rawCursor) as number);
+  if (rawCharacter === "\\") {
+    const escapedCharacter = String.fromCodePoint(
+      rawSource.codePointAt(rawCursor + rawCharacter.length) ?? 0,
+    );
+    if (isAsciiPunctuation(escapedCharacter)) {
+      const rawEnd = rawCursor + rawCharacter.length + escapedCharacter.length;
+      return {
+        decoded: escapedCharacter,
+        kind: "escape",
+        raw: rawSource.slice(rawCursor, rawEnd),
+        rawEnd,
+      };
+    }
+  }
+
+  if (rawCharacter === "&") {
+    const referenceLimit = Math.min(rawSource.length, rawCursor + 33);
+    for (let end = rawCursor + 1; end < referenceLimit; end += 1) {
+      if (rawSource[end] !== ";") {
+        continue;
+      }
+      const candidate = rawSource.slice(rawCursor, end + 1);
+      const decoded = decodeString(candidate);
+      if (decoded !== candidate) {
+        return { decoded, kind: "reference", raw: candidate, rawEnd: end + 1 };
+      }
+      break;
+    }
+  }
+
+  return {
+    decoded: rawCharacter,
+    kind: "literal",
+    raw: rawCharacter,
+    rawEnd: rawCursor + rawCharacter.length,
+  };
+}
+
 function rawOffsetsForDecodedBoundaries(
   rawSource: string,
   decodedValue: string,
   boundaries: ReadonlySet<number>,
-): ReadonlyMap<number, number> {
+): ReadonlyMap<number, number> | null {
   let rawCursor = 0;
   let decodedCursor = 0;
   const offsets = new Map<number, number>();
 
-  while (rawCursor < rawSource.length) {
+  while (rawCursor < rawSource.length && decodedCursor < decodedValue.length) {
     if (boundaries.has(decodedCursor)) {
       offsets.set(decodedCursor, rawCursor);
     }
 
-    const rawCharacter = String.fromCodePoint(rawSource.codePointAt(rawCursor) as number);
-    const escapedCharacter = rawCharacter === "\\"
-      ? String.fromCodePoint(rawSource.codePointAt(rawCursor + rawCharacter.length) ?? 0)
-      : "";
-    const isEscape = rawCharacter === "\\" && isAsciiPunctuation(escapedCharacter);
-    const decodedCharacter = isEscape ? escapedCharacter : rawCharacter;
-    if (!decodedValue.startsWith(decodedCharacter, decodedCursor)) {
-      return offsets;
+    const segment = nextDecodedSourceSegment(rawSource, rawCursor);
+    if (!decodedValue.startsWith(segment.decoded, decodedCursor)) {
+      return null;
     }
-    rawCursor += rawCharacter.length + (isEscape ? escapedCharacter.length : 0);
-    decodedCursor += decodedCharacter.length;
+    rawCursor = segment.rawEnd;
+    decodedCursor += segment.decoded.length;
   }
 
-  if (boundaries.has(decodedCursor)) {
-    offsets.set(decodedCursor, rawCursor);
+  if (rawCursor !== rawSource.length || decodedCursor !== decodedValue.length) {
+    return null;
+  }
+  if (boundaries.has(decodedValue.length)) {
+    offsets.set(decodedValue.length, rawSource.length);
+  }
+  for (const boundary of boundaries) {
+    if (!offsets.has(boundary)) {
+      return null;
+    }
   }
   return offsets;
+}
+
+function isAuthorizedRawConstruct(
+  rawSource: string,
+  construct: ObsidianConstruct,
+): boolean {
+  let rawCursor = 0;
+  let decodedCursor = 0;
+  while (rawCursor < rawSource.length && decodedCursor < construct.raw.length) {
+    const segment = nextDecodedSourceSegment(rawSource, rawCursor);
+    if (!construct.raw.startsWith(segment.decoded, decodedCursor)) {
+      return false;
+    }
+
+    let segmentCursor = 0;
+    for (const character of segment.decoded) {
+      const characterLength = character.length;
+      const absoluteDecodedCursor = decodedCursor + segmentCursor;
+      if (NOTION_LITERAL_SPECIAL_CHARACTERS.has(character)) {
+        if (segment.kind !== "escape" || segment.raw !== `\\${character}`) {
+          return false;
+        }
+      } else if (segment.kind === "escape") {
+        return false;
+      }
+      if (
+        construct.kind === "embed" &&
+        absoluteDecodedCursor === 0 &&
+        character === "!" &&
+        (segment.kind !== "literal" || segment.raw !== "!")
+      ) {
+        return false;
+      }
+      segmentCursor += characterLength;
+    }
+
+    rawCursor = segment.rawEnd;
+    decodedCursor += segment.decoded.length;
+  }
+  return rawCursor === rawSource.length && decodedCursor === construct.raw.length;
 }
 
 function splitDecodedCustomText(
@@ -612,13 +768,19 @@ function splitDecodedCustomText(
       const before = value.slice(cursor, construct.start);
       nodes.push(scan.malformed ? registry.token(escapeLiteral(before)) : text(before));
     }
-    const rawStart = rawOffsets.get(construct.start);
-    const rawEnd = rawOffsets.get(construct.end);
+    const rawStart = rawOffsets?.get(construct.start);
+    const rawEnd = rawOffsets?.get(construct.end);
     const isAuthorized =
+      rawOffsets !== null &&
       rawStart !== undefined &&
       rawEnd !== undefined &&
-      rawSource.slice(rawStart, rawEnd) === escapeLiteral(construct.raw);
-    nodes.push(registry.token(isAuthorized ? construct.raw : escapeLiteral(construct.raw)));
+      isAuthorizedRawConstruct(rawSource.slice(rawStart, rawEnd), construct);
+    nodes.push(
+      registry.token(
+        isAuthorized ? construct.raw : escapeLiteral(construct.raw),
+        isAuthorized ? construct.kind : "literal",
+      ),
+    );
     cursor = construct.end;
   }
   if (cursor < value.length) {
@@ -634,9 +796,12 @@ function transformFromNotion(
   links: LinkIndex,
   unsupported: Set<string>,
   registry: LocalTokenRegistry,
+  customValidationCache: Map<string, boolean>,
 ): void {
   const transformed: Nodes[] = [];
-  for (const original of parent.children as Nodes[]) {
+  const originalChildren = parent.children as Nodes[];
+  for (let childIndex = 0; childIndex < originalChildren.length; childIndex += 1) {
+    const original = originalChildren[childIndex] as Nodes;
     if (original.type === "text") {
       transformed.push(
         ...splitDecodedCustomText(
@@ -673,7 +838,14 @@ function transformFromNotion(
         if (original.title === LOCAL_LINK_TITLE) {
           original.url = paired.localTarget;
           original.title = null;
-          transformFromNotion(original, document, links, unsupported, registry);
+          transformFromNotion(
+            original,
+            document,
+            links,
+            unsupported,
+            registry,
+            customValidationCache,
+          );
           transformed.push(original);
           continue;
         }
@@ -694,14 +866,27 @@ function transformFromNotion(
               ? `[[${paired.localTarget}]]`
               : `[[${paired.localTarget}|${label}]]`
             : `!${embed.raw}`;
-          transformed.push(registry.token(local));
-          continue;
+          if (!validCustomEmission(local, embed === null ? "wikilink" : "embed", customValidationCache)) {
+            unsupported.add("unsupported-paired-link-label");
+            transformed.push(original);
+            continue;
+          } else {
+            transformed.push(registry.token(local, embed === null ? "wikilink" : "embed"));
+            continue;
+          }
         }
       }
     }
 
     if ("children" in original && Array.isArray(original.children)) {
-      transformFromNotion(original as Parent, document, links, unsupported, registry);
+      transformFromNotion(
+        original as Parent,
+        document,
+        links,
+        unsupported,
+        registry,
+        customValidationCache,
+      );
     }
     transformed.push(original);
   }
@@ -715,7 +900,7 @@ export function toNotionMarkdown(note: SemanticNote, links: LinkMapping): Mappin
   const masked = maskObsidianSyntax(document);
   const root = structuredClone(masked.root);
   const unsupported = new Set(document.unsupportedKinds);
-  transformToNotion(root, masked.source, masked.replacements, index, unsupported);
+  transformToNotion(root, masked, index, unsupported);
   return {
     semantic,
     markdown: stringifyNotion(root),
@@ -735,7 +920,7 @@ export function fromNotionMarkdown(
     document.unsupportedKinds.filter((kind) => kind !== "raw-html" && kind !== "html-comment"),
   );
   const registry = new LocalTokenRegistry(document, index.byTarget.keys());
-  transformFromNotion(root, document, index, unsupported, registry);
+  transformFromNotion(root, document, index, unsupported, registry, new Map());
   const bodyMarkdown = registry.restore(stringifyMarkdown(root));
   const semantic = { bodyMarkdown, tags: normalizeTags(tags) };
   return {

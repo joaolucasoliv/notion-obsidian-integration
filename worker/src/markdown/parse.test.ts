@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { MarkdownParseError, maskObsidianSyntax, parseMarkdown } from "./parse.js";
+import {
+  MarkdownParseError,
+  maskObsidianSyntax,
+  parseMarkdown,
+  scanObsidianText,
+} from "./parse.js";
 
 describe("parseMarkdown", () => {
   it("normalizes CRLF and returns a bounded mdast wrapper", () => {
@@ -36,5 +41,70 @@ describe("parseMarkdown", () => {
     const parsed = parseMarkdown("[[x]] ".repeat(4_097));
 
     expect(() => maskObsidianSyntax(parsed)).toThrow(MarkdownParseError);
+  });
+
+  it("scans near-limit repeated unmatched openings with bounded suffix work", () => {
+    const source = "[[".repeat(524_000);
+    const originalIndexOf = String.prototype.indexOf;
+    let requestedSuffixBytes = 0;
+
+    String.prototype.indexOf = function boundedIndexOf(
+      this: string,
+      searchString: string,
+      position?: number,
+    ): number {
+      if (String(this) === source && searchString === "]]") {
+        requestedSuffixBytes += this.length - (position ?? 0);
+        if (requestedSuffixBytes > source.length * 2) {
+          throw new Error("unbounded malformed wiki suffix scans");
+        }
+      }
+      return originalIndexOf.call(this, searchString, position);
+    };
+
+    try {
+      const scan = scanObsidianText(source);
+
+      expect(scan).toEqual({ constructs: [], malformed: true });
+      expect(requestedSuffixBytes).toBeLessThanOrEqual(source.length * 2);
+    } finally {
+      String.prototype.indexOf = originalIndexOf;
+    }
+  });
+
+  it("masks 4,096 custom constructs without repeatedly slicing masked output", () => {
+    const source = "[[x]]".repeat(4_096);
+    const parsed = parseMarkdown(source);
+    const originalIndexOf = String.prototype.indexOf;
+    const originalSlice = String.prototype.slice;
+    const originalStartsWith = String.prototype.startsWith;
+    let maskedSliceBytes = 0;
+
+    String.prototype.slice = function boundedSlice(
+      this: string,
+      start?: number,
+      end?: number,
+    ): string {
+      const result = originalSlice.call(this, start, end);
+      if (
+        originalStartsWith.call(this, "[[x]]") &&
+        originalIndexOf.call(this, "GRANDBOXWIKITOKEN") !== -1
+      ) {
+        maskedSliceBytes += result.length;
+        if (maskedSliceBytes > source.length * 4) {
+          throw new Error("unbounded forward mask slicing");
+        }
+      }
+      return result;
+    };
+
+    try {
+      const masked = maskObsidianSyntax(parsed);
+
+      expect(masked.replacements.size).toBe(4_096);
+      expect(maskedSliceBytes).toBeLessThanOrEqual(source.length * 4);
+    } finally {
+      String.prototype.slice = originalSlice;
+    }
   });
 });

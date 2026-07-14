@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@grandbox-bridge/shared": "0.1.0",
+    "micromark-util-decode-string": "2.0.1",
     "remark-gfm": "4.0.1",
     "remark-parse": "11.0.0",
     "remark-stringify": "11.0.0",

@@ -154,6 +154,31 @@ describe("Notion Markdown mapping", () => {
     expect(reversed.unsupportedKinds).toEqual(["unsupported-paired-link-label"]);
   });
 
+  it.each([
+    ["escaped bang", `\\![paired](${PAGE_URL})\n`],
+    ["entity bang", `&#33;[paired](${PAGE_URL})\n`],
+  ])("keeps an ordinary paired link after an %s from becoming an embed", (_case, source) => {
+    const reversed = fromNotionMarkdown(source, FIXTURE_LINKS);
+
+    expect(reversed.markdown).toBe(
+      "\\![[Research/Paired Note.md|paired]]\n",
+    );
+    expect(reversed.unsupportedKinds).toEqual([]);
+  });
+
+  it.each([
+    ["Markdown delimiter", "\\*alias\\*", "\\*alias\\*"],
+    ["HTML delimiter", "\\<tag\\>", "\\<tag>"],
+  ])("preserves a paired alias containing an escaped %s", (_case, label, expectedLabel) => {
+    const source = `[${label}](${PAGE_URL})\n`;
+    const reversed = fromNotionMarkdown(source, FIXTURE_LINKS);
+
+    expect(reversed.markdown).toBe(`[${expectedLabel}](${PAGE_URL})\n`);
+    expect(reversed.markdown).not.toContain("[[");
+    expect(reversed.unsupportedKinds).toEqual(["unsupported-paired-link-label"]);
+    expect(parseMarkdown(reversed.markdown).unsupportedKinds).toEqual([]);
+  });
+
   it("does not infer bridge syntax from unescaped wiki-looking Notion text", () => {
     const reversed = fromNotionMarkdown("Ordinary [[Missing|alias]] text.\n", FIXTURE_LINKS);
 
@@ -173,6 +198,26 @@ describe("Notion Markdown mapping", () => {
       "Ordinary !\\[\\[Injected\\]\\] and ![[Missing Embed|safe]].\n",
     ],
   ])("authorizes each escaped %s construct by its exact source range", (_kind, source, expected) => {
+    const reversed = fromNotionMarkdown(source, FIXTURE_LINKS);
+
+    expect(reversed.markdown).toBe(expected);
+    expect(reversed.unsupportedKinds).toEqual([]);
+  });
+
+  it.each([
+    [
+      "wiki after an entity",
+      "Prefix &amp; \\[\\[Authorized\\]\\].\n",
+      "Prefix & [[Authorized]].\n",
+    ],
+    [
+      "embed after an entity",
+      "Prefix &amp; !\\[\\[Authorized\\]\\].\n",
+      "Prefix & ![[Authorized]].\n",
+    ],
+    ["wiki containing an entity", "\\[\\[A&amp;B\\]\\]\n", "[[A&B]]\n"],
+    ["embed containing an entity", "!\\[\\[A&amp;B\\]\\]\n", "![[A&B]]\n"],
+  ])("aligns CommonMark character references for an escaped %s", (_case, source, expected) => {
     const reversed = fromNotionMarkdown(source, FIXTURE_LINKS);
 
     expect(reversed.markdown).toBe(expected);
@@ -226,6 +271,37 @@ describe("Notion Markdown mapping", () => {
     } finally {
       String.prototype.includes = originalIncludes;
       String.prototype.replaceAll = originalReplaceAll;
+    }
+  });
+
+  it("resolves 4,096 forward custom tokens with bounded lookup operations", () => {
+    const constructCount = 4_096;
+    const source = "[[x]]".repeat(constructCount);
+    const originalIndexOf = String.prototype.indexOf;
+    let tokenLookups = 0;
+
+    String.prototype.indexOf = function boundedIndexOf(
+      this: string,
+      searchString: string,
+      position?: number,
+    ): number {
+      if (searchString.startsWith("GRANDBOXWIKITOKEN")) {
+        tokenLookups += 1;
+        if (tokenLookups > constructCount) {
+          throw new Error("unbounded forward token lookups");
+        }
+      }
+      return originalIndexOf.call(this, searchString, position);
+    };
+
+    try {
+      const mapped = toNotionMarkdown({ bodyMarkdown: source, tags: [] }, FIXTURE_LINKS);
+
+      expect(mapped.markdown).toBe(`${"\\[\\[x\\]\\]".repeat(constructCount)}\n`);
+      expect(mapped.unsupportedKinds).toEqual([]);
+      expect(tokenLookups).toBeLessThanOrEqual(constructCount);
+    } finally {
+      String.prototype.indexOf = originalIndexOf;
     }
   });
 
