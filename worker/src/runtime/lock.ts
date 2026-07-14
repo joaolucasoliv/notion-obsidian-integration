@@ -314,8 +314,10 @@ async function createLock(
     await handle.close();
     handle = undefined;
     await options.afterLockCreateWrite?.(lockPath);
-    await assertCanonicalRuntimePath(lockPath);
     await fsyncDirectory(parent);
+    if (!(await matchesLockExpectation(lockPath, identity, metadata.ownerToken))) {
+      throw lockOperationError();
+    }
     return identity;
   } catch (caught) {
     if (handle !== undefined) {

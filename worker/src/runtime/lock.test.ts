@@ -264,6 +264,45 @@ describe("withInstallationLock", () => {
     expect(JSON.parse(await readFile(lockPath, "utf8"))).toEqual(replacement);
   });
 
+  it("rejects a different-inode lock replacement installed after the create write", async () => {
+    const lockPath = await temporaryLockPath();
+    await mkdir(dirname(lockPath), { recursive: true, mode: 0o700 });
+    const replacementSource = join(dirname(lockPath), "create-replacement.json");
+    const replacement = {
+      schemaVersion: 1,
+      pid: 775,
+      startedAt: "2026-07-14T12:00:00.000Z",
+      ownerToken: REPLACEMENT_OWNER_TOKEN,
+    };
+    await writeFile(replacementSource, JSON.stringify(replacement), { mode: 0o600 });
+    const replacementIdentity = await stat(replacementSource);
+    let createdIdentity: Awaited<ReturnType<typeof stat>> | undefined;
+    let actionCalls = 0;
+
+    await expect(
+      withInstallationLock(
+        lockPath,
+        options(async () => null, {
+          afterLockCreateWrite: async (observedLockPath) => {
+            createdIdentity = await stat(observedLockPath);
+            await rename(replacementSource, observedLockPath);
+          },
+        }),
+        async () => {
+          actionCalls += 1;
+        },
+      ),
+    ).rejects.toThrow(/installation lock operation failed/i);
+
+    expect(createdIdentity).toBeDefined();
+    expect(`${createdIdentity?.dev}:${createdIdentity?.ino}`).not.toBe(
+      `${replacementIdentity.dev}:${replacementIdentity.ino}`,
+    );
+    expect(actionCalls).toBe(0);
+    expect((await stat(lockPath)).mode & 0o777).toBe(0o600);
+    expect(JSON.parse(await readFile(lockPath, "utf8"))).toEqual(replacement);
+  });
+
   it("does not remove an in-place replacement lock with a different owner token", async () => {
     const lockPath = await temporaryLockPath();
     const replacement = {
