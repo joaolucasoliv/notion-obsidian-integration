@@ -10,6 +10,10 @@
   },
   "dependencies": {
     "@grandbox-bridge/shared": "0.1.0",
+    "remark-gfm": "4.0.1",
+    "remark-parse": "11.0.0",
+    "remark-stringify": "11.0.0",
+    "unified": "11.0.5",
     "yaml": "2.9.0",
     "zod": "4.4.3"
   }
