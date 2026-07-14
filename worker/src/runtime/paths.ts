@@ -1,6 +1,6 @@
 import { lstatSync } from "node:fs";
 import { lstat } from "node:fs/promises";
-import { isAbsolute, join, normalize, parse, sep } from "node:path";
+import { isAbsolute, join, normalize, parse, resolve, sep } from "node:path";
 
 const INSTALLATION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
@@ -72,7 +72,12 @@ export function assertCanonicalRuntimePathSync(filePath: string): void {
 
 export function deriveRuntimePaths(homeDirectory: string, installationId: string): RuntimePaths {
   assertValidInstallationId(installationId);
-  if (!isAbsolute(homeDirectory) || homeDirectory.includes("\0")) {
+  if (
+    !isAbsolute(homeDirectory) ||
+    homeDirectory.includes("\0") ||
+    normalize(homeDirectory) !== homeDirectory ||
+    resolve(homeDirectory) !== homeDirectory
+  ) {
     throw new Error("Invalid home directory");
   }
 

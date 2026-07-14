@@ -1,6 +1,7 @@
+import { randomUUID as createRandomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { chmod, lstat, mkdir, open, unlink } from "node:fs/promises";
-import { dirname } from "node:path";
+import { chmod, link, lstat, mkdir, open, rename, unlink } from "node:fs/promises";
+import { basename, dirname, join } from "node:path";
 import { z } from "zod";
 import { readStrictJson } from "./atomic-json.js";
 import { assertCanonicalRuntimePath } from "./paths.js";
@@ -27,11 +28,20 @@ interface FileIdentity {
 }
 
 export interface InstallationLockOptions {
+  readonly afterLockQuarantineRename?: (context: LockQuarantineContext) => Promise<void>;
+  readonly afterLockCreateWrite?: (lockPath: string) => Promise<void>;
+  readonly beforeLockQuarantine?: (context: LockQuarantineContext) => Promise<void>;
   readonly processId: number;
   readonly now: () => Date;
   readonly staleAfterMs: number;
   readonly isProcessAlive: (pid: number, startedAt: string) => Promise<boolean | null>;
   readonly randomUUID: () => string;
+}
+
+export interface LockQuarantineContext {
+  readonly lockPath: string;
+  readonly quarantinePath: string;
+  readonly reason: "create-failure" | "release" | "stale";
 }
 
 function activeLockError(): Error {
@@ -76,45 +86,200 @@ async function ensurePrivateParent(lockPath: string): Promise<string> {
   return parent;
 }
 
-async function removeIfSame(lockPath: string, identity: FileIdentity, parent: string): Promise<boolean> {
-  await assertCanonicalRuntimePath(lockPath);
-  let current;
+async function matchesLockExpectation(
+  filePath: string,
+  identity: FileIdentity,
+  ownerToken: string | undefined,
+): Promise<boolean> {
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
   try {
-    current = await lstat(lockPath);
-  } catch (caught) {
-    if ((caught as NodeJS.ErrnoException).code === "ENOENT") {
+    await assertCanonicalRuntimePath(filePath);
+    const before = await lstat(filePath);
+    if (
+      before.isSymbolicLink() ||
+      !before.isFile() ||
+      (before.mode & 0o777) !== PRIVATE_FILE_MODE ||
+      !sameIdentity(identity, asIdentity(before))
+    ) {
       return false;
     }
-    throw caught;
-  }
-  if (!sameIdentity(identity, asIdentity(current))) {
+
+    handle = await open(filePath, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const opened = await handle.stat();
+    if (!opened.isFile() || !sameIdentity(identity, asIdentity(opened))) {
+      return false;
+    }
+
+    if (ownerToken !== undefined) {
+      const metadata = await readStrictJson(filePath, (input) => lockMetadataSchema.parse(input), {
+        maxBytes: MAX_LOCK_BYTES,
+      });
+      if (metadata.ownerToken !== ownerToken) {
+        return false;
+      }
+    }
+
+    const after = await lstat(filePath);
+    if (after.isSymbolicLink() || !after.isFile() || !sameIdentity(identity, asIdentity(after))) {
+      return false;
+    }
+    return true;
+  } catch {
     return false;
+  } finally {
+    if (handle !== undefined) {
+      await handle.close().catch(() => undefined);
+    }
   }
-  await unlink(lockPath);
-  await fsyncDirectory(parent);
-  return true;
 }
 
-async function removeIfOwned(
-  lockPath: string,
+async function chooseQuarantinePath(lockPath: string, parent: string): Promise<string> {
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const candidate = join(parent, `.${basename(lockPath)}.${createRandomUUID()}.quarantine`);
+    try {
+      await lstat(candidate);
+    } catch (caught) {
+      if ((caught as NodeJS.ErrnoException).code === "ENOENT") {
+        return candidate;
+      }
+      throw caught;
+    }
+  }
+  throw lockOperationError();
+}
+
+async function unlinkMatchingQuarantine(
+  quarantinePath: string,
   identity: FileIdentity,
-  ownerToken: string,
   parent: string,
 ): Promise<boolean> {
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
   try {
-    await assertCanonicalRuntimePath(lockPath);
-    const metadata = await readStrictJson(lockPath, (input) => lockMetadataSchema.parse(input), {
-      maxBytes: MAX_LOCK_BYTES,
-    });
-    const current = await lstat(lockPath);
-    if (!sameIdentity(identity, asIdentity(current)) || metadata.ownerToken !== ownerToken) {
+    await assertCanonicalRuntimePath(quarantinePath);
+    const before = await lstat(quarantinePath);
+    if (
+      before.isSymbolicLink() ||
+      !before.isFile() ||
+      (before.mode & 0o777) !== PRIVATE_FILE_MODE ||
+      !sameIdentity(identity, asIdentity(before))
+    ) {
       return false;
     }
-    await assertCanonicalRuntimePath(lockPath);
-    await unlink(lockPath);
+
+    handle = await open(quarantinePath, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const opened = await handle.stat();
+    if (!opened.isFile() || !sameIdentity(identity, asIdentity(opened))) {
+      return false;
+    }
+    await handle.close();
+    handle = undefined;
+
+    const afterClose = await lstat(quarantinePath);
+    if (afterClose.isSymbolicLink() || !afterClose.isFile() || !sameIdentity(identity, asIdentity(afterClose))) {
+      return false;
+    }
+    await unlink(quarantinePath);
     await fsyncDirectory(parent);
     return true;
   } catch {
+    return false;
+  } finally {
+    if (handle !== undefined) {
+      await handle.close().catch(() => undefined);
+    }
+  }
+}
+
+async function restoreQuarantineWithoutOverwrite(
+  quarantinePath: string,
+  lockPath: string,
+  parent: string,
+): Promise<void> {
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    await assertCanonicalRuntimePath(quarantinePath);
+    const before = await lstat(quarantinePath);
+    if (before.isSymbolicLink() || !before.isFile() || (before.mode & 0o777) !== PRIVATE_FILE_MODE) {
+      return;
+    }
+    const identity = asIdentity(before);
+
+    handle = await open(quarantinePath, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const opened = await handle.stat();
+    if (!opened.isFile() || !sameIdentity(identity, asIdentity(opened))) {
+      return;
+    }
+
+    await link(quarantinePath, lockPath);
+    const quarantined = await lstat(quarantinePath);
+    const restored = await lstat(lockPath);
+    if (
+      quarantined.isSymbolicLink() ||
+      restored.isSymbolicLink() ||
+      !quarantined.isFile() ||
+      !restored.isFile() ||
+      !sameIdentity(identity, asIdentity(quarantined)) ||
+      !sameIdentity(identity, asIdentity(restored))
+    ) {
+      return;
+    }
+
+    await handle.close();
+    handle = undefined;
+    const afterClose = await lstat(quarantinePath);
+    const canonicalAfterClose = await lstat(lockPath);
+    if (
+      afterClose.isSymbolicLink() ||
+      canonicalAfterClose.isSymbolicLink() ||
+      !sameIdentity(identity, asIdentity(afterClose)) ||
+      !sameIdentity(identity, asIdentity(canonicalAfterClose))
+    ) {
+      return;
+    }
+    await unlink(quarantinePath);
+    await fsyncDirectory(parent);
+  } catch {
+    // A competing canonical lock or ambiguous quarantine is deliberately retained.
+  } finally {
+    if (handle !== undefined) {
+      await handle.close().catch(() => undefined);
+    }
+  }
+}
+
+async function removeThroughQuarantine(
+  lockPath: string,
+  identity: FileIdentity,
+  ownerToken: string | undefined,
+  parent: string,
+  reason: LockQuarantineContext["reason"],
+  options: InstallationLockOptions,
+): Promise<boolean> {
+  let quarantinePath = "";
+  let quarantined = false;
+  try {
+    if (!(await matchesLockExpectation(lockPath, identity, ownerToken))) {
+      return false;
+    }
+    quarantinePath = await chooseQuarantinePath(lockPath, parent);
+    const context: LockQuarantineContext = { lockPath, quarantinePath, reason };
+    await options.beforeLockQuarantine?.(context);
+    await rename(lockPath, quarantinePath);
+    quarantined = true;
+    await options.afterLockQuarantineRename?.(context);
+
+    if (
+      (await matchesLockExpectation(quarantinePath, identity, ownerToken)) &&
+      (await unlinkMatchingQuarantine(quarantinePath, identity, parent))
+    ) {
+      return true;
+    }
+    await restoreQuarantineWithoutOverwrite(quarantinePath, lockPath, parent);
+    return false;
+  } catch {
+    if (quarantined) {
+      await restoreQuarantineWithoutOverwrite(quarantinePath, lockPath, parent);
+    }
     return false;
   }
 }
@@ -123,6 +288,7 @@ async function createLock(
   lockPath: string,
   parent: string,
   metadata: LockMetadata,
+  options: InstallationLockOptions,
 ): Promise<FileIdentity | null> {
   let handle: Awaited<ReturnType<typeof open>> | undefined;
   let identity: FileIdentity | undefined;
@@ -147,6 +313,7 @@ async function createLock(
     await handle.sync();
     await handle.close();
     handle = undefined;
+    await options.afterLockCreateWrite?.(lockPath);
     await assertCanonicalRuntimePath(lockPath);
     await fsyncDirectory(parent);
     return identity;
@@ -155,7 +322,14 @@ async function createLock(
       await handle.close().catch(() => undefined);
     }
     if (identity !== undefined) {
-      await removeIfSame(lockPath, identity, parent).catch(() => undefined);
+      await removeThroughQuarantine(
+        lockPath,
+        identity,
+        metadata.ownerToken,
+        parent,
+        "create-failure",
+        options,
+      ).catch(() => undefined);
     }
     if ((caught as NodeJS.ErrnoException).code === "EEXIST") {
       return null;
@@ -222,7 +396,7 @@ export async function withInstallationLock<T>(
   }
   const parent = await ensurePrivateParent(lockPath);
 
-  let identity = await createLock(lockPath, parent, ownMetadata);
+  let identity = await createLock(lockPath, parent, ownMetadata, options);
   if (identity === null) {
     const existing = await inspectExistingLock(lockPath);
     const currentTime = new Date(ownMetadata.startedAt).getTime();
@@ -242,16 +416,18 @@ export async function withInstallationLock<T>(
       throw activeLockError();
     }
 
-    const removed = await removeIfOwned(
+    const removed = await removeThroughQuarantine(
       lockPath,
       existing.identity,
       existing.metadata.ownerToken,
       parent,
+      "stale",
+      options,
     );
     if (!removed) {
       throw activeLockError();
     }
-    identity = await createLock(lockPath, parent, ownMetadata);
+    identity = await createLock(lockPath, parent, ownMetadata, options);
     if (identity === null) {
       throw activeLockError();
     }
@@ -260,6 +436,13 @@ export async function withInstallationLock<T>(
   try {
     return await operation();
   } finally {
-    await removeIfOwned(lockPath, identity, ownMetadata.ownerToken, parent);
+    await removeThroughQuarantine(
+      lockPath,
+      identity,
+      ownMetadata.ownerToken,
+      parent,
+      "release",
+      options,
+    );
   }
 }

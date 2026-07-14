@@ -1,4 +1,4 @@
-import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rename, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -235,6 +235,35 @@ describe("withInstallationLock", () => {
     await expect(lstat(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
+  it("retains a same-inode token replacement when lock creation fails", async () => {
+    const lockPath = await temporaryLockPath();
+    const replacement = {
+      schemaVersion: 1,
+      pid: 776,
+      startedAt: "2026-07-14T12:00:00.000Z",
+      ownerToken: REPLACEMENT_OWNER_TOKEN,
+    };
+    let actionCalls = 0;
+
+    await expect(
+      withInstallationLock(
+        lockPath,
+        options(async () => null, {
+          afterLockCreateWrite: async (observedLockPath: string) => {
+            await writeFile(observedLockPath, JSON.stringify(replacement), { mode: 0o600 });
+            throw new Error("injected create failure");
+          },
+        }),
+        async () => {
+          actionCalls += 1;
+        },
+      ),
+    ).rejects.toThrow(/installation lock operation failed/i);
+
+    expect(actionCalls).toBe(0);
+    expect(JSON.parse(await readFile(lockPath, "utf8"))).toEqual(replacement);
+  });
+
   it("does not remove an in-place replacement lock with a different owner token", async () => {
     const lockPath = await temporaryLockPath();
     const replacement = {
@@ -249,6 +278,108 @@ describe("withInstallationLock", () => {
     });
 
     expect(JSON.parse(await readFile(lockPath, "utf8"))).toEqual(replacement);
+  });
+
+  it("restores a replacement installed between release validation and quarantine", async () => {
+    const lockPath = await temporaryLockPath();
+    await mkdir(dirname(lockPath), { recursive: true, mode: 0o700 });
+    const replacementSource = join(dirname(lockPath), "release-replacement.json");
+    const replacement = {
+      schemaVersion: 1,
+      pid: 778,
+      startedAt: "2026-07-14T12:00:00.000Z",
+      ownerToken: REPLACEMENT_OWNER_TOKEN,
+    };
+    await writeFile(replacementSource, JSON.stringify(replacement), { mode: 0o600 });
+    let hookCalls = 0;
+
+    await expect(
+      withInstallationLock(
+        lockPath,
+        options(async () => null, {
+          beforeLockQuarantine: async ({ reason, lockPath: observedLockPath }) => {
+            expect(reason).toBe("release");
+            hookCalls += 1;
+            await rename(replacementSource, observedLockPath);
+          },
+        }),
+        async () => "complete",
+      ),
+    ).resolves.toBe("complete");
+
+    expect(hookCalls).toBe(1);
+    expect(JSON.parse(await readFile(lockPath, "utf8"))).toEqual(replacement);
+  });
+
+  it("restores a replacement installed between stale-lock validation and quarantine", async () => {
+    const lockPath = await temporaryLockPath();
+    await seedLock(lockPath, { schemaVersion: 1, pid: 99, startedAt: "2026-07-14T10:00:00.000Z" });
+    const replacementSource = join(dirname(lockPath), "stale-replacement.json");
+    const replacement = {
+      schemaVersion: 1,
+      pid: 779,
+      startedAt: "2026-07-14T12:00:00.000Z",
+      ownerToken: REPLACEMENT_OWNER_TOKEN,
+    };
+    await writeFile(replacementSource, JSON.stringify(replacement), { mode: 0o600 });
+    let actionCalls = 0;
+
+    await expect(
+      withInstallationLock(
+        lockPath,
+        options(async () => false, {
+          beforeLockQuarantine: async ({ reason, lockPath: observedLockPath }) => {
+            expect(reason).toBe("stale");
+            await rename(replacementSource, observedLockPath);
+          },
+        }),
+        async () => {
+          actionCalls += 1;
+        },
+      ),
+    ).rejects.toThrow(/active installation lock/i);
+
+    expect(actionCalls).toBe(0);
+    expect(JSON.parse(await readFile(lockPath, "utf8"))).toEqual(replacement);
+  });
+
+  it("never overwrites a competitor that appears while a mismatched lock is quarantined", async () => {
+    const lockPath = await temporaryLockPath();
+    await seedLock(lockPath, { schemaVersion: 1, pid: 100, startedAt: "2026-07-14T10:00:00.000Z" });
+    const replacementSource = join(dirname(lockPath), "quarantined-replacement.json");
+    const replacement = {
+      schemaVersion: 1,
+      pid: 780,
+      startedAt: "2026-07-14T12:00:00.000Z",
+      ownerToken: REPLACEMENT_OWNER_TOKEN,
+    };
+    const competitor = {
+      schemaVersion: 1,
+      pid: 781,
+      startedAt: "2026-07-14T12:00:00.000Z",
+      ownerToken: "44444444-4444-4444-8444-444444444444",
+    };
+    await writeFile(replacementSource, JSON.stringify(replacement), { mode: 0o600 });
+    let quarantinePath = "";
+
+    await expect(
+      withInstallationLock(
+        lockPath,
+        options(async () => false, {
+          beforeLockQuarantine: async ({ lockPath: observedLockPath }) => {
+            await rename(replacementSource, observedLockPath);
+          },
+          afterLockQuarantineRename: async (context) => {
+            quarantinePath = context.quarantinePath;
+            await writeFile(lockPath, JSON.stringify(competitor), { mode: 0o600 });
+          },
+        }),
+        async () => undefined,
+      ),
+    ).rejects.toThrow(/active installation lock/i);
+
+    expect(JSON.parse(await readFile(lockPath, "utf8"))).toEqual(competitor);
+    expect(JSON.parse(await readFile(quarantinePath, "utf8"))).toEqual(replacement);
   });
 
   it("allows only one real concurrent owner", async () => {

@@ -1,3 +1,4 @@
+import { writeSync } from "node:fs";
 import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
@@ -53,6 +54,41 @@ describe("SafeFileLogger", () => {
     expect(Buffer.byteLength(rawLine)).toBeLessThanOrEqual(8 * 1_024);
     expect((await stat(logPath)).mode & 0o777).toBe(0o600);
     expect((await stat(dirname(logPath))).mode & 0o777).toBe(0o700);
+  });
+
+  it("retries short buffer writes until the complete UTF-8 line is durable", async () => {
+    const logPath = await temporaryLogPath();
+    const injectedTimestamp = new Date(NOW);
+    const expectedTimestamp = `${NOW.toISOString()}-é`;
+    Object.defineProperty(injectedTimestamp, "toISOString", { value: () => expectedTimestamp });
+    let writeCalls = 0;
+
+    new SafeFileLogger(logPath, {
+      now: () => injectedTimestamp,
+      write: (descriptor: number, buffer: Buffer, offset: number, length: number) => {
+        writeCalls += 1;
+        return writeSync(descriptor, buffer, offset, Math.min(3, length), null);
+      },
+    }).write({ level: "info", event: "run-started" });
+
+    expect(writeCalls).toBeGreaterThan(1);
+    const raw = await readFile(logPath, "utf8");
+    expect(raw.endsWith("\n")).toBe(true);
+    expect(JSON.parse(raw)).toMatchObject({ timestamp: expectedTimestamp, event: "run-started" });
+  });
+
+  it.each([
+    ["zero progress", () => 0],
+    ["negative progress", () => -1],
+    ["writer failure", () => { throw new Error("injected writer failure"); }],
+  ])("fails safely on %s from the write boundary", async (_label, injectedWrite) => {
+    const logPath = await temporaryLogPath();
+    const safeLogger = new SafeFileLogger(logPath, {
+      now: () => NOW,
+      write: injectedWrite,
+    });
+
+    expect(() => safeLogger.write({ level: "info", event: "run-started" })).toThrow(/unsafe log file/i);
   });
 
   it("calls the event-specific parser and rejects a field allowed only on another event", async () => {

@@ -1,4 +1,4 @@
-import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rename, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, relative } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -57,6 +57,51 @@ describe("writeAtomicPrivateJson", () => {
 
     await expect(readFile(join(parent, ".state.json.owned.tmp"), "utf8")).rejects.toThrow();
     expect((await stat(filePath)).isDirectory()).toBe(true);
+  });
+
+  it("never renames a replacement installed over its temporary file", async () => {
+    const filePath = await temporaryPath();
+    await mkdir(dirname(filePath), { recursive: true, mode: 0o700 });
+    await writeFile(filePath, "canonical-old", { mode: 0o600 });
+    const replacementSource = join(dirname(filePath), "pre-rename-other-writer");
+    await writeFile(replacementSource, "other-writer", { mode: 0o600 });
+    let replacementPath = "";
+
+    await expect(
+      writeAtomicPrivateJson(filePath, { version: "new" }, {
+        uniqueSuffix: () => "pre-rename-replacement",
+        beforeRename: async (temporaryPath: string) => {
+          replacementPath = temporaryPath;
+          await rename(replacementSource, temporaryPath);
+        },
+      }),
+    ).rejects.toThrow(/atomic json/i);
+
+    expect(await readFile(filePath, "utf8")).toBe("canonical-old");
+    expect(await readFile(replacementPath, "utf8")).toBe("other-writer");
+  });
+
+  it("never cleans up a replacement installed over its temporary file on failure", async () => {
+    const filePath = await temporaryPath();
+    await mkdir(dirname(filePath), { recursive: true, mode: 0o700 });
+    await writeFile(filePath, "canonical-old", { mode: 0o600 });
+    const replacementSource = join(dirname(filePath), "cleanup-other-writer");
+    await writeFile(replacementSource, "other-writer", { mode: 0o600 });
+    let replacementPath = "";
+
+    await expect(
+      writeAtomicPrivateJson(filePath, { version: "new" }, {
+        uniqueSuffix: () => "cleanup-replacement",
+        beforeRename: async (temporaryPath: string) => {
+          replacementPath = temporaryPath;
+          await rename(replacementSource, temporaryPath);
+          throw new Error("injected rename failure");
+        },
+      }),
+    ).rejects.toThrow(/atomic json/i);
+
+    expect(await readFile(filePath, "utf8")).toBe("canonical-old");
+    expect(await readFile(replacementPath, "utf8")).toBe("other-writer");
   });
 
   it("rejects a symlinked write destination without replacing it or touching its target", async () => {
@@ -146,6 +191,77 @@ describe("writeAtomicPrivateJson", () => {
     }
     expect(accessorCalls).toBe(0);
     expect(serializationHookCalls).toBe(0);
+  });
+
+  it("rejects proxies before invoking any trap or serializing the caller object", async () => {
+    const filePath = await temporaryPath();
+    let trapCalls = 0;
+    const target = { safe: true };
+    const proxy = new Proxy(target, {
+      getPrototypeOf: () => {
+        trapCalls += 1;
+        return Object.prototype;
+      },
+      ownKeys: () => {
+        trapCalls += 1;
+        return ["safe"];
+      },
+      getOwnPropertyDescriptor: (_value, key) => {
+        trapCalls += 1;
+        return Object.getOwnPropertyDescriptor(target, key);
+      },
+      get: (value, key, receiver) => {
+        trapCalls += 1;
+        if (key === "toJSON") {
+          return () => ({ injected: true });
+        }
+        return Reflect.get(value, key, receiver);
+      },
+    });
+
+    await expect(writeAtomicPrivateJson(filePath, proxy as never)).rejects.toThrow(/atomic json/i);
+
+    expect(trapCalls).toBe(0);
+    await expect(lstat(filePath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("serializes snapshots without invoking inherited serialization hooks", async () => {
+    const filePath = await temporaryPath();
+    const originalObjectHook = Object.getOwnPropertyDescriptor(Object.prototype, "toJSON");
+    const originalArrayHook = Object.getOwnPropertyDescriptor(Array.prototype, "toJSON");
+    let serializationHookCalls = 0;
+    Object.defineProperty(Object.prototype, "toJSON", {
+      configurable: true,
+      value: () => {
+        serializationHookCalls += 1;
+        return { injected: true };
+      },
+    });
+    Object.defineProperty(Array.prototype, "toJSON", {
+      configurable: true,
+      value: () => {
+        serializationHookCalls += 1;
+        return ["injected"];
+      },
+    });
+
+    try {
+      await writeAtomicPrivateJson(filePath, { nested: [true, { value: "kept" }] });
+    } finally {
+      if (originalObjectHook === undefined) {
+        delete (Object.prototype as { toJSON?: unknown }).toJSON;
+      } else {
+        Object.defineProperty(Object.prototype, "toJSON", originalObjectHook);
+      }
+      if (originalArrayHook === undefined) {
+        delete (Array.prototype as unknown as { toJSON?: unknown }).toJSON;
+      } else {
+        Object.defineProperty(Array.prototype, "toJSON", originalArrayHook);
+      }
+    }
+
+    expect(serializationHookCalls).toBe(0);
+    expect(await readFile(filePath, "utf8")).toBe('{"nested":[true,{"value":"kept"}]}\n');
   });
 
   it("rejects serialized JSON beyond the fixed UTF-8 byte bound and preserves the canonical file", async () => {

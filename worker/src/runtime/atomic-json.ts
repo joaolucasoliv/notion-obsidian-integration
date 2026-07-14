@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { chmod, lstat, mkdir, open, rename, unlink } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join } from "node:path";
+import { types } from "node:util";
 import { assertCanonicalRuntimePath } from "./paths.js";
 
 const DEFAULT_MAX_JSON_BYTES = 1024 * 1024;
@@ -14,6 +15,7 @@ export interface ReadStrictJsonOptions {
 }
 
 export interface AtomicJsonOptions {
+  readonly beforeRename?: (temporaryPath: string) => Promise<void>;
   readonly uniqueSuffix?: () => string;
 }
 
@@ -198,26 +200,39 @@ interface JsonValidationBudget {
   nodes: number;
 }
 
-function assertJsonValue(
+interface FileIdentity {
+  readonly dev: number;
+  readonly ino: number;
+}
+
+function fileIdentity(entry: FileIdentity): FileIdentity {
+  return { dev: entry.dev, ino: entry.ino };
+}
+
+function hasFileIdentity(entry: FileIdentity, expected: FileIdentity): boolean {
+  return entry.dev === expected.dev && entry.ino === expected.ino;
+}
+
+function cloneJsonValue(
   value: unknown,
   ancestors = new WeakSet<object>(),
   depth = 0,
   budget: JsonValidationBudget = { nodes: 0 },
-): asserts value is JsonValue {
+): JsonValue {
   budget.nodes += 1;
   if (depth > 100 || budget.nodes > 100_000) {
     throw atomicJsonError();
   }
   if (value === null || typeof value === "boolean" || typeof value === "string") {
-    return;
+    return value;
   }
   if (typeof value === "number") {
     if (!Number.isFinite(value)) {
       throw atomicJsonError();
     }
-    return;
+    return value;
   }
-  if (typeof value !== "object" || ancestors.has(value)) {
+  if (typeof value !== "object" || types.isProxy(value) || ancestors.has(value)) {
     throw atomicJsonError();
   }
 
@@ -232,6 +247,7 @@ function assertJsonValue(
     }
     ancestors.add(value);
     try {
+      const snapshot: JsonValue[] = [];
       for (let index = 0; index < value.length; index += 1) {
         if (!Object.hasOwn(value, index)) {
           throw atomicJsonError();
@@ -240,12 +256,13 @@ function assertJsonValue(
         if (descriptor === undefined || !("value" in descriptor) || !descriptor.enumerable) {
           throw atomicJsonError();
         }
-        assertJsonValue(descriptor.value, ancestors, depth + 1, budget);
+        snapshot.push(cloneJsonValue(descriptor.value, ancestors, depth + 1, budget));
       }
+      Object.setPrototypeOf(snapshot, null);
+      return snapshot;
     } finally {
       ancestors.delete(value);
     }
-    return;
   }
 
   if (prototype !== Object.prototype && prototype !== null) {
@@ -253,6 +270,7 @@ function assertJsonValue(
   }
   ancestors.add(value);
   try {
+    const snapshot: Record<string, JsonValue> = Object.create(null);
     for (const key of Reflect.ownKeys(value)) {
       if (typeof key !== "string") {
         throw atomicJsonError();
@@ -261,8 +279,14 @@ function assertJsonValue(
       if (descriptor === undefined || !("value" in descriptor) || !descriptor.enumerable) {
         throw atomicJsonError();
       }
-      assertJsonValue(descriptor.value, ancestors, depth + 1, budget);
+      Object.defineProperty(snapshot, key, {
+        configurable: true,
+        enumerable: true,
+        value: cloneJsonValue(descriptor.value, ancestors, depth + 1, budget),
+        writable: true,
+      });
     }
+    return snapshot;
   } finally {
     ancestors.delete(value);
   }
@@ -287,6 +311,38 @@ async function ensurePrivateDirectory(directoryPath: string): Promise<void> {
   if (!after.isDirectory() || after.isSymbolicLink() || (after.mode & 0o777) !== PRIVATE_DIRECTORY_MODE) {
     throw atomicJsonError();
   }
+}
+
+async function assertOwnedTemporary(filePath: string, expected: FileIdentity): Promise<void> {
+  await assertCanonicalRuntimePath(filePath);
+  const entry = await lstat(filePath);
+  if (entry.isSymbolicLink() || !entry.isFile() || !hasFileIdentity(entry, expected)) {
+    throw atomicJsonError();
+  }
+}
+
+async function removeOwnedTemporary(filePath: string, expected: FileIdentity): Promise<void> {
+  await assertCanonicalRuntimePath(filePath);
+  const beforeOpen = await lstat(filePath);
+  if (beforeOpen.isSymbolicLink() || !beforeOpen.isFile() || !hasFileIdentity(beforeOpen, expected)) {
+    return;
+  }
+
+  const verificationHandle = await open(filePath, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const opened = await verificationHandle.stat();
+    if (!opened.isFile() || !hasFileIdentity(opened, expected)) {
+      return;
+    }
+  } finally {
+    await verificationHandle.close();
+  }
+
+  const afterClose = await lstat(filePath);
+  if (afterClose.isSymbolicLink() || !afterClose.isFile() || !hasFileIdentity(afterClose, expected)) {
+    return;
+  }
+  await unlink(filePath);
 }
 
 export async function readStrictJson<T>(
@@ -346,8 +402,8 @@ export async function writeAtomicPrivateJson(
 ): Promise<void> {
   let serialized: string;
   try {
-    assertJsonValue(value);
-    const encoded = JSON.stringify(value);
+    const snapshot = cloneJsonValue(value);
+    const encoded = JSON.stringify(snapshot);
     if (encoded === undefined) {
       throw atomicJsonError();
     }
@@ -365,7 +421,7 @@ export async function writeAtomicPrivateJson(
 
   const parent = dirname(filePath);
   let handle: Awaited<ReturnType<typeof open>> | undefined;
-  let ownsTemporary = false;
+  let temporaryIdentity: FileIdentity | undefined;
   let temporaryPath = "";
 
   try {
@@ -393,20 +449,28 @@ export async function writeAtomicPrivateJson(
       constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW,
       PRIVATE_FILE_MODE,
     );
-    ownsTemporary = true;
     const opened = await handle.stat();
+    temporaryIdentity = fileIdentity(opened);
     if (!opened.isFile() || (opened.mode & 0o777) !== PRIVATE_FILE_MODE) {
       throw atomicJsonError();
     }
     await handle.writeFile(serialized, { encoding: "utf8" });
     await handle.sync();
+    const afterSync = await handle.stat();
+    if (!afterSync.isFile() || !hasFileIdentity(afterSync, temporaryIdentity)) {
+      throw atomicJsonError();
+    }
+    await assertOwnedTemporary(temporaryPath, temporaryIdentity);
     await handle.close();
     handle = undefined;
+    await assertOwnedTemporary(temporaryPath, temporaryIdentity);
+
+    await options.beforeRename?.(temporaryPath);
 
     await assertCanonicalRuntimePath(filePath);
-    await assertCanonicalRuntimePath(temporaryPath);
+    await assertOwnedTemporary(temporaryPath, temporaryIdentity);
     await rename(temporaryPath, filePath);
-    ownsTemporary = false;
+    temporaryIdentity = undefined;
 
     const directoryHandle = await open(parent, constants.O_RDONLY | constants.O_NOFOLLOW);
     try {
@@ -418,8 +482,8 @@ export async function writeAtomicPrivateJson(
     if (handle !== undefined) {
       await handle.close().catch(() => undefined);
     }
-    if (ownsTemporary) {
-      await unlink(temporaryPath).catch(() => undefined);
+    if (temporaryIdentity !== undefined) {
+      await removeOwnedTemporary(temporaryPath, temporaryIdentity).catch(() => undefined);
     }
     throw atomicJsonError();
   }

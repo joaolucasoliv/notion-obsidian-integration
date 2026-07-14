@@ -51,6 +51,15 @@ describe("deriveRuntimePaths", () => {
   it("requires an absolute home directory", () => {
     expect(() => deriveRuntimePaths("relative-home", INSTALLATION_ID)).toThrow(/home directory/i);
   });
+
+  it.each([
+    "/Users/jo/../redirected",
+    "/Users/jo/./vault",
+    "/Users//jo",
+    "/Users/jo/",
+  ])("rejects a non-normalized or redirected home directory before joining: %s", (homeDirectory) => {
+    expect(() => deriveRuntimePaths(homeDirectory, INSTALLATION_ID)).toThrow(/home directory/i);
+  });
 });
 
 describe("readStrictJson", () => {

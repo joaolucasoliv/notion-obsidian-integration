@@ -22,6 +22,7 @@ const MAX_LOG_FILE_BYTES = 5 * 1_024 * 1_024;
 
 export interface SafeFileLoggerOptions {
   readonly now?: () => Date;
+  readonly write?: (descriptor: number, buffer: Buffer, offset: number, length: number) => number;
 }
 
 function unsafeEntryError(): Error {
@@ -115,12 +116,15 @@ function serializeSafeLogEntry(input: unknown, timestamp = new Date()): string {
 
 export class SafeFileLogger implements SafeLogger {
   private readonly now: () => Date;
+  private readonly writeBuffer: NonNullable<SafeFileLoggerOptions["write"]>;
 
   constructor(
     private readonly logPath: string,
     options: SafeFileLoggerOptions = {},
   ) {
     this.now = options.now ?? (() => new Date());
+    this.writeBuffer = options.write ?? ((descriptor, buffer, offset, length) =>
+      writeSync(descriptor, buffer, offset, length, null));
   }
 
   write(entry: SafeLogEntry): void {
@@ -151,7 +155,16 @@ export class SafeFileLogger implements SafeLogger {
         if (!opened.isFile() || (opened.mode & 0o777) !== PRIVATE_FILE_MODE) {
           throw unsafeFileError();
         }
-        writeSync(descriptor, line, undefined, "utf8");
+        const buffer = Buffer.from(line, "utf8");
+        let offset = 0;
+        while (offset < buffer.byteLength) {
+          const remaining = buffer.byteLength - offset;
+          const written = this.writeBuffer(descriptor, buffer, offset, remaining);
+          if (!Number.isInteger(written) || written <= 0 || written > remaining) {
+            throw unsafeFileError();
+          }
+          offset += written;
+        }
         fsyncSync(descriptor);
       } finally {
         closeSync(descriptor);
