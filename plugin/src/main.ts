@@ -1,6 +1,6 @@
 import { Notice, Plugin, TFile, type TAbstractFile } from "obsidian";
 import type { BridgeRunSummary } from "@grandbox-bridge/shared";
-import { changeNoteOptIn, isManageableMarkdownPath } from "./commands.js";
+import { changeNoteOptIn, isGeneratedGithubNote, isManageableMarkdownPath } from "./commands.js";
 import {
   LocalWorkerController,
   NodeWorkerProcessRunner,
@@ -128,8 +128,15 @@ export class GrandboxBridgePlugin extends Plugin {
     this.registerEvent(this.app.vault.on("rename", (file) => this.scheduleVaultEvent(file)));
   }
 
-  private scheduleVaultEvent(file: TAbstractFile): void {
+  private async scheduleVaultEvent(file: TAbstractFile): Promise<void> {
     if (this.scheduler === null || !(file instanceof TFile) || !isManageableMarkdownPath(file.path)) return;
+    let bytes: string;
+    try {
+      bytes = await this.app.vault.read(file);
+    } catch {
+      return;
+    }
+    if (isGeneratedGithubNote(bytes)) return;
     if (this.debounceHandle !== null) this.scheduler.clear(this.debounceHandle);
     this.debounceHandle = this.scheduler.set(() => {
       this.debounceHandle = null;

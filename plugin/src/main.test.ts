@@ -1,3 +1,4 @@
+import { readFile } from "node:fs/promises";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { BridgeRunSummary } from "@grandbox-bridge/shared";
 import { App, Notice, TFile } from "../../tests/fakes/obsidian.js";
@@ -100,6 +101,41 @@ describe("GrandboxBridgePlugin", () => {
     expect(controller.calls).toEqual([{ mode: "apply", reason: "obsidian-event" }]);
   });
 
+  it("never queues generated GitHub fixture events while allowing a manual repository note", async () => {
+    const { GrandboxBridgePlugin } = await import("./main.js");
+    const app = new App();
+    const controller = new RecordingController();
+    const scheduler = new ManualScheduler();
+    class TestPlugin extends GrandboxBridgePlugin {
+      protected override createWorkerController(_locator: ExternalLocator): WorkerController { return controller; }
+      protected override createDebounceScheduler(): ManualScheduler { return scheduler; }
+    }
+    const plugin = new TestPlugin(app, { id: "grandbox-bridge" });
+    const generated = app.vault.addFile(
+      "Repositories/generated.md",
+      await readFile(new URL("../../tests/fixtures/vault/Repositories/generated.md", import.meta.url), "utf8"),
+    );
+    const manual = app.vault.addFile(
+      "Repositories/manual.md",
+      await readFile(new URL("../../tests/fixtures/vault/Repositories/manual.md", import.meta.url), "utf8"),
+    );
+
+    await plugin.onload();
+    app.workspace.triggerLayoutReady();
+    await app.vault.emit("modify", generated);
+    await app.vault.emit("rename", generated);
+
+    expect(scheduler.pending).toHaveLength(0);
+    expect(controller.calls).toEqual([]);
+
+    await app.vault.emit("modify", manual);
+    expect(scheduler.pending).toHaveLength(1);
+    scheduler.flush();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(controller.calls).toEqual([{ mode: "apply", reason: "obsidian-event" }]);
+  });
+
   it("reuses one installation ID and never persists the injected controller state", async () => {
     const { GrandboxBridgePlugin } = await import("./main.js");
     const app = new App();
@@ -154,5 +190,26 @@ describe("GrandboxBridgePlugin", () => {
     expect(await app.vault.read(note)).toBe("---\ncustom: retained\nnotion_sync: true\n---\nBody\n");
     await runCommand(plugin, "opt-out");
     expect(await app.vault.read(note)).toBe("---\ncustom: retained\nnotion_sync: false\n---\nBody\n");
+  });
+
+  it("leaves a quoted tag-only GitHub generated note unchanged when changing opt-in", async () => {
+    const { GrandboxBridgePlugin } = await import("./main.js");
+    const app = new App();
+    const controller = new RecordingController();
+    class TestPlugin extends GrandboxBridgePlugin {
+      protected override createWorkerController(_locator: ExternalLocator): WorkerController { return controller; }
+    }
+    const plugin = new TestPlugin(app, { id: "grandbox-bridge" });
+    const before = "---\nnotion_sync: false\ntags: [\"dual-scribe/github/repository\"]\n---\nGenerated body\n";
+    const note = app.vault.addFile("Repositories/tag-only.md", before);
+    app.workspace.setActiveFile(note);
+    await plugin.onload();
+
+    await runCommand(plugin, "opt-in");
+    await runCommand(plugin, "opt-out");
+
+    expect(await app.vault.read(note)).toBe(before);
+    expect(app.vault.modified).toEqual([]);
+    expect(Notice.messages.every((message) => message.includes("note action unavailable"))).toBe(true);
   });
 });

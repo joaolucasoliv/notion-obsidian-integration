@@ -3,6 +3,7 @@ export * from "./contracts/planning.js";
 export * from "./contracts/ports.js";
 export * from "./crypto/hash.js";
 export * from "./errors.js";
+export * from "./github-managed.js";
 export * from "./schemas/config.js";
 export * from "./schemas/journal.js";
 export * from "./schemas/state.js";

@@ -28,4 +28,22 @@ describe("note opt-in commands", () => {
   ])("rejects an excluded target: %s", (path, bytes) => {
     expect(() => changeNoteOptIn({ path, bytes, optedIn: true })).toThrow(NoteCommandError);
   });
+
+  it("rejects a generated GitHub note identified only by a quoted YAML tag", () => {
+    const before = "---\nnotion_sync: false\ntags: [\"dual-scribe/github/repository\"]\n---\nGenerated body\n";
+
+    expect(() => changeNoteOptIn({ path: "Repositories/tag-only.md", bytes: before, optedIn: true })).toThrow(NoteCommandError);
+    expect(before).toBe("---\nnotion_sync: false\ntags: [\"dual-scribe/github/repository\"]\n---\nGenerated body\n");
+  });
+
+  it.each([
+    ["a nested owned key", "---\nmetadata:\n  notion_sync: false\n---\nBody\n"],
+    ["a quoted root owned key", "---\n\"notion_sync\": false\n---\nBody\n"],
+    ["quoted and plain duplicate owned keys", "---\n\"notion_sync\": false\nnotion_sync: false\n---\nBody\n"],
+    ["an explicit-key mapping", "---\n? notion_sync\n: false\n---\nBody\n"],
+    ["otherwise malformed YAML", "---\ntags: [unterminated\nnotion_sync: false\n---\nBody\n"],
+  ])("fails closed without changing source for %s", (_description, before) => {
+    expect(() => changeNoteOptIn({ path: "Notes/Unsafe.md", bytes: before, optedIn: true })).toThrow(NoteCommandError);
+    expect(before).toBe(before);
+  });
 });
