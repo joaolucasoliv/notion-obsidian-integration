@@ -30,7 +30,17 @@ function bindingName(declaration: ts.VariableDeclaration): string | undefined {
 }
 
 function propertyName(name: ts.PropertyName): string | undefined {
-  if (ts.isIdentifier(name) || ts.isStringLiteral(name) || ts.isNumericLiteral(name)) return name.text;
+  if (ts.isIdentifier(name) || ts.isStringLiteral(name) || ts.isNoSubstitutionTemplateLiteral(name) || ts.isNumericLiteral(name)) {
+    return name.text;
+  }
+  if (
+    ts.isComputedPropertyName(name) &&
+    (ts.isStringLiteral(name.expression) ||
+      ts.isNoSubstitutionTemplateLiteral(name.expression) ||
+      ts.isNumericLiteral(name.expression))
+  ) {
+    return name.expression.text;
+  }
   return undefined;
 }
 
@@ -58,7 +68,11 @@ interface ScopeAnalysis {
 
 function bindingIdentifier(declaration: ts.Declaration): ts.Identifier | undefined {
   if (
-    (ts.isVariableDeclaration(declaration) || ts.isParameter(declaration) || ts.isImportSpecifier(declaration)) &&
+    (ts.isVariableDeclaration(declaration) ||
+      ts.isParameter(declaration) ||
+      ts.isImportSpecifier(declaration) ||
+      ts.isFunctionDeclaration(declaration) ||
+      ts.isClassDeclaration(declaration)) &&
     ts.isIdentifier(declaration.name)
   ) {
     return declaration.name;
@@ -72,6 +86,11 @@ function scopeAnalysis(sourceFile: ts.SourceFile): ScopeAnalysis {
   const bindingForDeclaration = new Map<ts.Declaration, Binding>();
 
   const bind = (declaration: ts.Declaration, scope: Scope, source: BindingSource): void => {
+    const existing = bindingForDeclaration.get(declaration);
+    if (existing !== undefined) {
+      scope.bindings.set(existing.name, existing);
+      return;
+    }
     const name = bindingIdentifier(declaration);
     if (name === undefined) return;
     const binding: Binding = { declaration, name: name.text, source };
@@ -79,10 +98,17 @@ function scopeAnalysis(sourceFile: ts.SourceFile): ScopeAnalysis {
     bindingForDeclaration.set(declaration, binding);
   };
 
+  const visitStatements = (statements: readonly ts.Statement[], scope: Scope): void => {
+    for (const statement of statements) {
+      if (ts.isFunctionDeclaration(statement) || ts.isClassDeclaration(statement)) bind(statement, scope, "local");
+    }
+    for (const statement of statements) visit(statement, scope);
+  };
+
   const visit = (node: ts.Node, scope: Scope): void => {
     scopes.set(node, scope);
     if (ts.isSourceFile(node)) {
-      for (const statement of node.statements) visit(statement, scope);
+      visitStatements(node.statements, scope);
       return;
     }
     if (ts.isImportDeclaration(node)) {
@@ -97,6 +123,7 @@ function scopeAnalysis(sourceFile: ts.SourceFile): ScopeAnalysis {
       return;
     }
     if (ts.isFunctionLike(node)) {
+      if (ts.isFunctionDeclaration(node)) bind(node, scope, "local");
       const functionScope: Scope = { parent: scope, bindings: new Map() };
       scopes.set(node, functionScope);
       for (const parameter of node.parameters) {
@@ -109,7 +136,7 @@ function scopeAnalysis(sourceFile: ts.SourceFile): ScopeAnalysis {
     if (ts.isBlock(node)) {
       const blockScope: Scope = { parent: scope, bindings: new Map() };
       scopes.set(node, blockScope);
-      for (const statement of node.statements) visit(statement, blockScope);
+      visitStatements(node.statements, blockScope);
       return;
     }
     if (ts.isCatchClause(node)) {
@@ -145,7 +172,12 @@ function scopeAnalysis(sourceFile: ts.SourceFile): ScopeAnalysis {
 function isBindingDeclarationName(identifier: ts.Identifier): boolean {
   const parent = identifier.parent;
   return (
-    (ts.isVariableDeclaration(parent) || ts.isParameter(parent) || ts.isImportSpecifier(parent)) && parent.name === identifier
+    (ts.isVariableDeclaration(parent) ||
+      ts.isParameter(parent) ||
+      ts.isImportSpecifier(parent) ||
+      ts.isFunctionDeclaration(parent) ||
+      ts.isClassDeclaration(parent)) &&
+    parent.name === identifier
   );
 }
 
@@ -350,8 +382,23 @@ function unwrapTransparentExpression(node: ts.Expression): ts.Expression {
 }
 
 function isDiscardedAccess(node: ts.Expression): boolean {
-  const current = unwrapTransparentExpression(node);
-  return ts.isExpressionStatement(current.parent) || ts.isVoidExpression(current.parent);
+  let current = unwrapTransparentExpression(node);
+  while (true) {
+    if (ts.isExpressionStatement(current.parent) || ts.isVoidExpression(current.parent)) return true;
+    const parent = current.parent;
+    if (ts.isBinaryExpression(parent) && parent.operatorToken.kind === ts.SyntaxKind.CommaToken && parent.right === current) {
+      current = unwrapTransparentExpression(parent);
+      continue;
+    }
+    if (
+      ts.isCommaListExpression(parent) &&
+      parent.elements[parent.elements.length - 1] === current
+    ) {
+      current = unwrapTransparentExpression(parent);
+      continue;
+    }
+    return false;
+  }
 }
 
 function rootBinding(node: ts.PropertyAccessExpression | ts.ElementAccessExpression, analysis: ScopeAnalysis): Binding | undefined {
@@ -481,6 +528,10 @@ describe("credential fixture hygiene", () => {
     ["replacement call", "const token = loaded.replace(\"x\", \"y\");"],
     ["timestamp assembly", "Object.defineProperty(date, \"toISOString\", { value: () => `${loaded}-${suffix}` });"],
     ["indirected header construction", "const value = prefix + suffix; const headers = { Authorization: value };"],
+    [
+      "indirected computed Authorization construction",
+      'use(loaded); const value = prefix + suffix; const headers = { ["Authorization"]: value };',
+    ],
     ["indirected error context construction", "const value = prefix + suffix; throw new Error(value);"],
     [
       "indirected timestamp override construction",
@@ -526,6 +577,22 @@ describe("credential fixture hygiene", () => {
     expect(policyViolations(shadowedReader)).toContain("missing safe fixture read");
   });
 
+  it("rejects a fixture read through a function declaration shadow", () => {
+    const functionShadowedReader = [
+      'import { readFileSync } from "node:fs";',
+      "function load() {",
+      "  function readFileSync(): string { return \"{}\"; }",
+      "  const fixture = JSON.parse(readFileSync(",
+      '    new URL("tests/fixtures/safe/canary.json", import.meta.url),',
+      '    "utf8",',
+      "  ));",
+      "  return fixture.token;",
+      "}",
+    ].join("\n");
+
+    expect(policyViolations(functionShadowedReader)).toContain("missing safe fixture read");
+  });
+
   it("rejects a fixture value whose alias chain ends in a discarded use", () => {
     const deadAliasChain = [
       'import { readFileSync } from "node:fs";',
@@ -539,5 +606,20 @@ describe("credential fixture hygiene", () => {
     ].join("\n");
 
     expect(policyViolations(deadAliasChain)).toContain("safe fixture read is unused");
+  });
+
+  it("rejects a fixture value whose alias chain ends in a comma-wrapped discard", () => {
+    const commaDiscardedAliasChain = [
+      'import { readFileSync } from "node:fs";',
+      "const fixture = JSON.parse(readFileSync(",
+      '  new URL("tests/fixtures/safe/canary.json", import.meta.url),',
+      '  "utf8",',
+      "));",
+      "const first = fixture.token;",
+      "const second = first;",
+      "void (0, second);",
+    ].join("\n");
+
+    expect(policyViolations(commaDiscardedAliasChain)).toContain("safe fixture read is unused");
   });
 });
