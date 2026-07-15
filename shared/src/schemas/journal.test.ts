@@ -19,6 +19,8 @@ function validIntent() {
     allocationId: HASH,
     expectedByteHash: HASH,
     expectedSemanticHash: HASH,
+    resultByteHash: HASH,
+    resultSemanticHash: HASH,
     expectedRemoteEditedAt: TIMESTAMP,
     createdAt: TIMESTAMP,
   };
@@ -47,7 +49,17 @@ describe("journal schemas", () => {
     expect(Object.isFrozen(completion)).toBe(true);
   });
 
-  it.each(["content", "markdown", "bodyMarkdown", "credential", "headers"])(
+  it.each([
+    "content",
+    "noteBytes",
+    "markdown",
+    "bodyMarkdown",
+    "credential",
+    "secret",
+    "headers",
+    "requestHeaders",
+    "providerBody",
+  ])(
     "rejects journal payload field %s",
     (field) => {
       expect(() => parseJournalIntent({ ...validIntent(), [field]: "redacted" })).toThrow(/unrecognized/i);
@@ -96,6 +108,8 @@ describe("journal schemas", () => {
       allocationId: null,
       expectedByteHash: null,
       expectedSemanticHash: null,
+      resultByteHash: null,
+      resultSemanticHash: null,
       expectedRemoteEditedAt: null,
     };
     const completion = {
@@ -109,5 +123,15 @@ describe("journal schemas", () => {
 
     expect(parseJournalIntent(intent)).toEqual(intent);
     expect(parseJournalCompletion(completion)).toEqual(completion);
+  });
+
+  it("requires nullable planned local postcondition hashes on every intent", () => {
+    const missingByteHash = validIntent();
+    const missingSemanticHash = validIntent();
+    delete (missingByteHash as { resultByteHash?: string | null }).resultByteHash;
+    delete (missingSemanticHash as { resultSemanticHash?: string | null }).resultSemanticHash;
+
+    expect(() => parseJournalIntent(missingByteHash)).toThrow(/resultByteHash/i);
+    expect(() => parseJournalIntent(missingSemanticHash)).toThrow(/resultSemanticHash/i);
   });
 });

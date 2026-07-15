@@ -44,6 +44,8 @@ export const journalIntentV1Schema = z
     allocationId: hashSchema.nullable(),
     expectedByteHash: hashSchema.nullable(),
     expectedSemanticHash: hashSchema.nullable(),
+    resultByteHash: hashSchema.nullable(),
+    resultSemanticHash: hashSchema.nullable(),
     expectedRemoteEditedAt: timestampSchema.nullable(),
     createdAt: timestampSchema,
   })
