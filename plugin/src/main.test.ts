@@ -1,0 +1,158 @@
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { BridgeRunSummary } from "@grandbox-bridge/shared";
+import { App, Notice, TFile } from "../../tests/fakes/obsidian.js";
+import type { ExternalLocator } from "./locator.js";
+import type { BridgeStatus, ServiceStatus, WorkerController } from "./controller.js";
+
+vi.mock("obsidian", async () => import("../../tests/fakes/obsidian.js"));
+
+const INSTALLATION_ID = "11111111-1111-4111-8111-111111111111";
+
+function summary(mode: "preview" | "apply" = "preview"): BridgeRunSummary {
+  return {
+    mode,
+    outcome: "success",
+    planned: 0,
+    writes: 0,
+    pushed: 0,
+    pulled: 0,
+    conflicts: 0,
+    errors: 0,
+    graphUploads: 0,
+    startedAt: "2026-07-15T12:00:00.000Z",
+    completedAt: "2026-07-15T12:00:01.000Z",
+  };
+}
+
+async function runCommand(plugin: unknown, id: string): Promise<void> {
+  const commands = (plugin as { commands: Map<string, { callback?: () => unknown }> }).commands;
+  await commands.get(id)?.callback?.();
+}
+
+class ManualScheduler {
+  public readonly pending: Array<() => void> = [];
+
+  public set(callback: () => void): number {
+    this.pending.splice(0, this.pending.length, callback);
+    return 1;
+  }
+
+  public clear(_handle: number): void {
+    this.pending.length = 0;
+  }
+
+  public flush(): void {
+    this.pending.shift()?.();
+  }
+}
+
+class RecordingController implements WorkerController {
+  public readonly calls: Array<{ readonly mode: "preview" | "apply"; readonly reason: "manual" | "obsidian-event" }> = [];
+  public statusValue: BridgeStatus = { configuration: "ready", service: "disabled" };
+
+  public async preview(): Promise<BridgeRunSummary> {
+    this.calls.push({ mode: "preview", reason: "manual" });
+    return summary("preview");
+  }
+
+  public async syncNow(): Promise<BridgeRunSummary> {
+    this.calls.push({ mode: "apply", reason: "manual" });
+    return summary("apply");
+  }
+
+  public async syncFromVaultEvent(): Promise<BridgeRunSummary> {
+    this.calls.push({ mode: "apply", reason: "obsidian-event" });
+    return summary("apply");
+  }
+
+  public async installService(): Promise<ServiceStatus> { return { enabled: true }; }
+  public async disableService(): Promise<ServiceStatus> { return { enabled: false }; }
+  public async status(): Promise<BridgeStatus> { return this.statusValue; }
+}
+
+describe("GrandboxBridgePlugin", () => {
+  beforeEach(() => Notice.clear());
+
+  it("waits for layout-ready before registering debounced vault listeners", async () => {
+    const { GrandboxBridgePlugin } = await import("./main.js");
+    const app = new App();
+    const controller = new RecordingController();
+    const scheduler = new ManualScheduler();
+    class TestPlugin extends GrandboxBridgePlugin {
+      protected override createWorkerController(_locator: ExternalLocator): WorkerController { return controller; }
+      protected override createDebounceScheduler(): ManualScheduler { return scheduler; }
+    }
+    const plugin = new TestPlugin(app, { id: "grandbox-bridge" });
+    const note = app.vault.addFile("Notes/Changed.md", "---\nnotion_sync: true\n---\nBody\n");
+
+    await plugin.onload();
+    expect(app.workspace.layoutReadyCallbackCount).toBe(1);
+    expect(app.vault.listenerCount("modify")).toBe(0);
+    app.workspace.triggerLayoutReady();
+    expect(app.vault.listenerCount("modify")).toBe(1);
+    expect(app.vault.listenerCount("rename")).toBe(1);
+    await app.vault.emit("modify", note);
+    await app.vault.emit("rename", note);
+    expect(controller.calls).toEqual([]);
+    scheduler.flush();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(controller.calls).toEqual([{ mode: "apply", reason: "obsidian-event" }]);
+  });
+
+  it("reuses one installation ID and never persists the injected controller state", async () => {
+    const { GrandboxBridgePlugin } = await import("./main.js");
+    const app = new App();
+    const controller = new RecordingController();
+    class TestPlugin extends GrandboxBridgePlugin {
+      protected override createWorkerController(_locator: ExternalLocator): WorkerController { return controller; }
+    }
+    const first = new TestPlugin(app, { id: "grandbox-bridge" });
+    await first.onload();
+    const generated = first.savedPluginData;
+    expect(generated).toEqual({ installationId: expect.stringMatching(/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u) });
+
+    const second = new TestPlugin(app, { id: "grandbox-bridge" });
+    second.initialData = generated;
+    await second.onload();
+    expect(second.savedPluginData).toBeNull();
+    expect(JSON.stringify(first.savedPluginData)).not.toMatch(/token|pageId|graphKey|vaultPath/i);
+  });
+
+  it("uses safe notices instead of raw controller failure text", async () => {
+    const { GrandboxBridgePlugin } = await import("./main.js");
+    const app = new App();
+    class FailingController extends RecordingController {
+      public override async preview(): Promise<BridgeRunSummary> { throw new Error("synthetic-provider-token /Users/private/note.md"); }
+    }
+    const controller = new FailingController();
+    class TestPlugin extends GrandboxBridgePlugin {
+      protected override createWorkerController(_locator: ExternalLocator): WorkerController { return controller; }
+    }
+    const plugin = new TestPlugin(app, { id: "grandbox-bridge" });
+    await plugin.onload();
+
+    await runCommand(plugin, "preview-sync");
+
+    expect(Notice.messages.join("\n")).toContain("unavailable");
+    expect(Notice.messages.join("\n")).not.toMatch(/synthetic-provider-token|Users\/private|note\.md/i);
+  });
+
+  it("runs opt-in and opt-out commands only against the active Markdown note", async () => {
+    const { GrandboxBridgePlugin } = await import("./main.js");
+    const app = new App();
+    const controller = new RecordingController();
+    class TestPlugin extends GrandboxBridgePlugin {
+      protected override createWorkerController(_locator: ExternalLocator): WorkerController { return controller; }
+    }
+    const plugin = new TestPlugin(app, { id: "grandbox-bridge" });
+    const note = app.vault.addFile("Notes/Active.md", "---\ncustom: retained\nnotion_sync: false\n---\nBody\n");
+    app.workspace.setActiveFile(note);
+    await plugin.onload();
+
+    await runCommand(plugin, "opt-in");
+    expect(await app.vault.read(note)).toBe("---\ncustom: retained\nnotion_sync: true\n---\nBody\n");
+    await runCommand(plugin, "opt-out");
+    expect(await app.vault.read(note)).toBe("---\ncustom: retained\nnotion_sync: false\n---\nBody\n");
+  });
+});

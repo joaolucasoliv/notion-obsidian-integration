@@ -7,13 +7,13 @@
   "license": "MIT",
   "type": "module",
   "engines": { "node": ">=22.12.0" },
-  "workspaces": ["shared", "worker"],
+  "workspaces": ["shared", "worker", "plugin"],
   "scripts": {
     "test": "vitest run",
     "test:integration": "vitest run --config vitest.integration.config.ts",
     "test:coverage": "vitest run --coverage",
-    "typecheck": "tsc -b shared worker",
-    "build": "npm run build -w @grandbox-bridge/shared && npm run build -w @grandbox-bridge/worker",
+    "typecheck": "tsc -b shared worker plugin",
+    "build": "npm run build -w @grandbox-bridge/shared && npm run build -w @grandbox-bridge/worker && npm run build -w @grandbox-bridge/plugin",
     "check": "npm test && npm run typecheck && npm run build"
   },
   "devDependencies": {
