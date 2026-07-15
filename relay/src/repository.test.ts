@@ -103,6 +103,32 @@ class MemoryRelayStore implements EventRepositoryStore, SnapshotRepositoryStore 
     return true;
   }
 
+  async acknowledgeEventsAtomically(input: {
+    readonly installationId: string;
+    readonly eventIds: readonly string[];
+    readonly expectedLeaseOwner: string;
+    readonly consumedAt: string;
+  }): Promise<boolean> {
+    const entries = input.eventIds.map((eventId) => [eventKey(input.installationId, eventId), this.events.get(eventKey(input.installationId, eventId))] as const);
+    if (
+      entries.some(
+        ([, event]) =>
+          event === undefined ||
+          event.consumedAt !== null ||
+          event.leaseOwner !== input.expectedLeaseOwner ||
+          event.leaseExpiresAt === null ||
+          event.leaseExpiresAt <= input.consumedAt,
+      )
+    ) {
+      return false;
+    }
+    for (const [key, event] of entries) {
+      if (event === undefined) return false;
+      this.events.set(key, { ...event, consumedAt: input.consumedAt, leaseOwner: null, leaseExpiresAt: null });
+    }
+    return true;
+  }
+
   async deleteConsumedBefore(installationId: string, cutoff: string): Promise<number> {
     let deleted = 0;
     for (const [key, event] of this.events) {
@@ -127,6 +153,20 @@ class MemoryRelayStore implements EventRepositoryStore, SnapshotRepositoryStore 
     }
     this.pages.set(pageKey, { installationId: input.installationId, bridgeId: input.bridgeId });
     this.bridgePages.set(eventKey(input.installationId, input.bridgeId), input.notionPageId);
+  }
+
+  async deletePageRegistration(input: {
+    readonly installationId: string;
+    readonly notionPageId: string;
+    readonly bridgeId: string;
+  }): Promise<void> {
+    const pageKey = eventKey(input.installationId, input.notionPageId);
+    const current = this.pages.get(pageKey);
+    if (!current || current.bridgeId !== input.bridgeId) {
+      return;
+    }
+    this.pages.delete(pageKey);
+    this.bridgePages.delete(eventKey(input.installationId, input.bridgeId));
   }
 
   async findBridgeId(installationId: string, notionPageId: string): Promise<string | null> {
@@ -250,6 +290,17 @@ describe("relay repository contracts", () => {
     await expect(repo.events.routePage(INSTALLATION_ID, NOTION_PAGE_ID)).resolves.toBe(BRIDGE_ID);
     await expect(repo.events.routePage(OTHER_INSTALLATION_ID, NOTION_PAGE_ID)).resolves.toBeNull();
     await expect(repo.events.routePage(INSTALLATION_ID, "77777777-7777-4777-8777-777777777777")).resolves.toBeNull();
+  });
+
+  it("unregisters only the exact technical page-to-bridge mapping idempotently", async () => {
+    const repo = repositoryHarness();
+    await repo.events.registerPage(INSTALLATION_ID, NOTION_PAGE_ID, BRIDGE_ID);
+
+    await repo.events.unregisterPage(INSTALLATION_ID, NOTION_PAGE_ID, "77777777-7777-4777-8777-777777777777");
+    await expect(repo.events.routePage(INSTALLATION_ID, NOTION_PAGE_ID)).resolves.toBe(BRIDGE_ID);
+    await repo.events.unregisterPage(INSTALLATION_ID, NOTION_PAGE_ID, BRIDGE_ID);
+    await repo.events.unregisterPage(INSTALLATION_ID, NOTION_PAGE_ID, BRIDGE_ID);
+    await expect(repo.events.routePage(INSTALLATION_ID, NOTION_PAGE_ID)).resolves.toBeNull();
   });
 
   it("removes only consumed events older than the fixed 30-day retention period", async () => {

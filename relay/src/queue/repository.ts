@@ -50,8 +50,24 @@ export interface EventRepositoryStore {
     readonly expectedLeaseOwner: string;
     readonly consumedAt: string;
   }): Promise<boolean>;
+  /**
+   * Atomically consumes every supplied still-leased event or none of them.
+   * Already-consumed event IDs are treated as an idempotent success by the
+   * repository before this primitive is invoked.
+   */
+  acknowledgeEventsAtomically(input: {
+    readonly installationId: string;
+    readonly eventIds: readonly string[];
+    readonly expectedLeaseOwner: string;
+    readonly consumedAt: string;
+  }): Promise<boolean>;
   deleteConsumedBefore(installationId: string, cutoff: string): Promise<number>;
   putPageRegistration(input: {
+    readonly installationId: string;
+    readonly notionPageId: string;
+    readonly bridgeId: string;
+  }): Promise<void>;
+  deletePageRegistration(input: {
     readonly installationId: string;
     readonly notionPageId: string;
     readonly bridgeId: string;
@@ -77,6 +93,13 @@ function timestamp(value: Date): string {
     throw new Error("Invalid timestamp");
   }
   return value.toISOString();
+}
+
+function assertEventIds(eventIds: readonly string[]): void {
+  if (!Array.isArray(eventIds) || eventIds.length < 1 || eventIds.length > 50 || new Set(eventIds).size !== eventIds.length) {
+    throw new Error("Invalid webhook event IDs");
+  }
+  for (const eventId of eventIds) assertText(eventId, "event ID");
 }
 
 function compareEvents(left: StoredWebhookEvent, right: StoredWebhookEvent): number {
@@ -140,25 +163,33 @@ export class EventRepository {
   }
 
   async acknowledge(installationId: string, eventId: string, worker: string, consumedAt: Date): Promise<void> {
+    await this.acknowledgeMany(installationId, [eventId], worker, consumedAt);
+  }
+
+  async acknowledgeMany(installationId: string, eventIds: readonly string[], worker: string, consumedAt: Date): Promise<void> {
     assertText(installationId, "installation ID");
-    assertText(eventId, "event ID");
+    assertEventIds(eventIds);
     assertText(worker, "worker");
     const consumedAtText = timestamp(consumedAt);
 
     for (let attempt = 0; attempt < MAX_COMPARE_AND_SET_RETRIES; attempt += 1) {
-      const current = (await this.store.listEvents(installationId)).find((event) => event.id === eventId);
-      if (!current) {
-        throw new Error("Webhook event was not found for this installation");
+      const eventsById = new Map((await this.store.listEvents(installationId)).map((event) => [event.id, event]));
+      const toConsume: string[] = [];
+      for (const eventId of eventIds) {
+        const current = eventsById.get(eventId);
+        if (!current) {
+          throw new Error("Webhook event was not found for this installation");
+        }
+        if (current.consumedAt !== null) continue;
+        if (current.leaseOwner !== worker || current.leaseExpiresAt === null || current.leaseExpiresAt <= consumedAtText) {
+          throw new Error("Webhook event lease is not owned by this worker");
+        }
+        toConsume.push(eventId);
       }
-      if (current.consumedAt !== null) {
-        return;
-      }
-      if (current.leaseOwner !== worker) {
-        throw new Error("Webhook event lease is not owned by this worker");
-      }
-      if (await this.store.compareAndSetConsumed({
+      if (toConsume.length === 0) return;
+      if (await this.store.acknowledgeEventsAtomically({
         installationId,
-        eventId,
+        eventIds: toConsume,
         expectedLeaseOwner: worker,
         consumedAt: consumedAtText,
       })) {
@@ -179,6 +210,13 @@ export class EventRepository {
     assertText(notionPageId, "Notion page ID");
     assertText(bridgeId, "bridge ID");
     await this.store.putPageRegistration({ installationId, notionPageId, bridgeId });
+  }
+
+  async unregisterPage(installationId: string, notionPageId: string, bridgeId: string): Promise<void> {
+    assertText(installationId, "installation ID");
+    assertText(notionPageId, "Notion page ID");
+    assertText(bridgeId, "bridge ID");
+    await this.store.deletePageRegistration({ installationId, notionPageId, bridgeId });
   }
 
   async routePage(installationId: string, notionPageId: string): Promise<string | null> {

@@ -14,8 +14,8 @@ export function unauthorized(): Response {
   return empty(401);
 }
 
-export function methodNotAllowed(): Response {
-  return empty(405, { allow: "POST" });
+export function methodNotAllowed(allow = "POST"): Response {
+  return empty(405, { allow });
 }
 
 export function unsupportedMediaType(): Response {
@@ -28,6 +28,22 @@ export function payloadTooLarge(): Response {
 
 export function tooManyRequests(retryAfterSeconds: number): Response {
   return empty(429, { "retry-after": String(retryAfterSeconds) });
+}
+
+export function forbidden(): Response {
+  return empty(403);
+}
+
+export function notFound(): Response {
+  return empty(404);
+}
+
+export function conflict(): Response {
+  return empty(409);
+}
+
+export function jsonResponse(value: unknown): Response {
+  return new Response(JSON.stringify(value), { status: 200, headers: { "content-type": "application/json; charset=utf-8" } });
 }
 
 export function internalServerError(): Response {
