@@ -82,6 +82,37 @@ PRIVATE BODY SENTINEL
   ];
 }
 
+export function repositoryOnlyFixture(): SyntheticGraphSourceNote[] {
+  return [note("Repositories/only.md", ["dual-scribe/github/repository"], "# Repository-only fixture\n")];
+}
+
+export function technicalBasenameAmbiguityFixture(): SyntheticGraphSourceNote[] {
+  return [
+    note("Implicit.md", [], "[[Plan]]\n"),
+    note("Explicit.md", [], "[[A/Plan]]\n"),
+    note("A/Plan.md", [], "# Projected plan\n"),
+    note("Templates/Plan.md", [], "# Technical plan\n"),
+  ];
+}
+
+export function percentEncodedLinkFixture(): SyntheticGraphSourceNote[] {
+  return [
+    note(
+      "Nested/Home.md",
+      [],
+      "[[javascript%3Aevil]]\n[[Research%2FIndex]]\n[[%2e%2e/Secret]]\n[[Safe%20Note]]\n",
+    ),
+    note("javascript:evil.md", [], "# Not a graph link target\n"),
+    note("Research/Index.md", [], "# Research\n"),
+    note("Secret.md", [], "# Secret\n"),
+    note("Safe Note.md", [], "# Safe\n"),
+  ];
+}
+
+export function obsidianCommentFixtureMarkdown(): string {
+  return "%% [[Secret]] %%\n[[Visible]]\n";
+}
+
 export function idFor(path: string): string {
   return createHash("sha256").update(`note\0${path}`, "utf8").digest("hex");
 }

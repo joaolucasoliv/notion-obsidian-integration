@@ -5,6 +5,9 @@ import {
   PAIR_MAP,
   graphVaultFixture,
   idFor,
+  percentEncodedLinkFixture,
+  repositoryOnlyFixture,
+  technicalBasenameAmbiguityFixture,
 } from "../../../tests/fixtures/graph/graph-vault.js";
 import { buildGraphProjection } from "./projection.js";
 
@@ -132,5 +135,52 @@ describe("buildGraphProjection", () => {
         DOMAIN_RULES,
       ),
     ).toThrow(/duplicate normalized path/i);
+  });
+
+  it("validates invalid domain rules even when every source is in Repositories", () => {
+    expect(() =>
+      buildGraphProjection(repositoryOnlyFixture(), new Map(), INSTALLATION_ID, [
+        { pathPrefix: "Research", domain: "research" },
+        { pathPrefix: "Research/", domain: "project" },
+      ]),
+    ).toThrow(/equal-specificity/i);
+  });
+
+  it("keeps excluded technical paths in basename ambiguity while resolving an explicit path", () => {
+    const projection = buildGraphProjection(
+      technicalBasenameAmbiguityFixture(),
+      new Map(),
+      INSTALLATION_ID,
+    );
+    const planId = idFor("A/Plan.md");
+
+    expect(
+      projection.edges.some(
+        (edge) => edge.kind === "wikilink" && edge.source === idFor("Implicit.md") && edge.target === planId,
+      ),
+    ).toBe(false);
+    expect(projection.edges).toContainEqual(
+      expect.objectContaining({
+        kind: "wikilink",
+        source: idFor("Explicit.md"),
+        target: planId,
+      }),
+    );
+  });
+
+  it("never emits graph edges for percent-encoded hostile targets", () => {
+    const projection = buildGraphProjection(percentEncodedLinkFixture(), new Map(), INSTALLATION_ID);
+    const source = idFor("Nested/Home.md");
+
+    expect(projection.edges).toContainEqual(
+      expect.objectContaining({ kind: "wikilink", source, target: idFor("Safe Note.md") }),
+    );
+    for (const target of ["javascript:evil.md", "Research/Index.md", "Secret.md"]) {
+      expect(
+        projection.edges.some(
+          (edge) => edge.kind === "wikilink" && edge.source === source && edge.target === idFor(target),
+        ),
+      ).toBe(false);
+    }
   });
 });

@@ -95,11 +95,12 @@ function normalizedRules(rules: readonly GraphDomainRule[]): NormalizedRule[] {
 
 export function classifyDomain(path: string, rules: readonly GraphDomainRule[] = []): GraphDomain {
   const normalizedPath = normalizeGraphPath(path);
+  const normalized = normalizedRules(rules);
   if (hasPathPrefix(normalizedPath, "Repositories")) {
     return "github";
   }
 
-  const matches = normalizedRules(rules).filter((rule) => hasPathPrefix(normalizedPath, rule.pathPrefix));
+  const matches = normalized.filter((rule) => hasPathPrefix(normalizedPath, rule.pathPrefix));
   if (matches.length > 0) {
     matches.sort((left, right) => right.specificity - left.specificity || (left.pathPrefix < right.pathPrefix ? -1 : 1));
     return (matches[0] as NormalizedRule).domain;

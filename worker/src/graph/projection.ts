@@ -150,14 +150,19 @@ function obsidianUrl(path: string): string {
   return `obsidian://open?vault=${encodeURIComponent(VAULT_LABEL)}&file=${encodeURIComponent(path)}`;
 }
 
-function decodedTarget(rawTarget: string): string | null {
-  try {
-    const decoded = decodeURIComponent(rawTarget);
-    if (decoded.includes("\\") || decoded.includes("\0") || /[\r\n]/u.test(decoded)) return null;
-    return decoded;
-  } catch {
+function safeDecodedTarget(target: string): string | null {
+  if (
+    target.startsWith("/") ||
+    target.startsWith("//") ||
+    /^[A-Za-z][A-Za-z0-9+.-]*:/u.test(target) ||
+    /%(?:2e|2f|5c)/iu.test(target) ||
+    target.includes("\\") ||
+    target.includes("\0") ||
+    /[\r\n]/u.test(target)
+  ) {
     return null;
   }
+  return target;
 }
 
 function resolveRelativePath(baseSegments: readonly string[], target: string): string | null {
@@ -182,7 +187,7 @@ function markdownStem(path: string): string {
 }
 
 function targetCandidates(sourcePath: string, link: GraphLink): string[] {
-  const decoded = decodedTarget(link.target);
+  const decoded = safeDecodedTarget(link.target);
   if (decoded === null || decoded.includes("?")) return [];
   if (decoded.length === 0) return [sourcePath];
 
@@ -194,9 +199,15 @@ function targetCandidates(sourcePath: string, link: GraphLink): string[] {
   return /\.md$/iu.test(resolved) ? [resolved] : [`${resolved}.md`];
 }
 
-function uniqueBasenameTarget(target: string, byBasename: ReadonlyMap<string, readonly NormalizedNote[]>): NormalizedNote | null {
+function uniqueBasenameTarget(
+  target: string,
+  byBasename: ReadonlyMap<string, readonly NormalizedNote[]>,
+  basenameMultiplicity: ReadonlyMap<string, number>,
+): NormalizedNote | null {
   if (target.length === 0 || target.includes("/") || target.includes("?")) return null;
-  const matches = byBasename.get(markdownStem(target));
+  const basename = markdownStem(target);
+  if (basenameMultiplicity.get(basename) !== 1) return null;
+  const matches = byBasename.get(basename);
   return matches?.length === 1 ? (matches[0] as NormalizedNote) : null;
 }
 
@@ -205,13 +216,14 @@ function resolveLink(
   link: GraphLink,
   byPath: ReadonlyMap<string, NormalizedNote>,
   byBasename: ReadonlyMap<string, readonly NormalizedNote[]>,
+  basenameMultiplicity: ReadonlyMap<string, number>,
 ): NormalizedNote | null {
   for (const candidate of targetCandidates(source.path, link)) {
     const exact = byPath.get(candidate);
     if (exact !== undefined) return exact;
   }
-  const decoded = decodedTarget(link.target);
-  return decoded === null ? null : uniqueBasenameTarget(decoded, byBasename);
+  const decoded = safeDecodedTarget(link.target);
+  return decoded === null ? null : uniqueBasenameTarget(decoded, byBasename, basenameMultiplicity);
 }
 
 function addEdge(edges: Map<string, GraphEdgeV1>, kind: GraphEdgeV1["kind"], source: string, target: string): void {
@@ -228,11 +240,14 @@ export function buildGraphProjection(
   if (!Array.isArray(notes)) throw new Error("Graph notes must be an array");
   const normalizedNotes: NormalizedNote[] = [];
   const seenPaths = new Set<string>();
+  const basenameMultiplicity = new Map<string, number>();
   for (const source of notes) {
     if (source === null || typeof source !== "object") throw new Error("Invalid graph source note");
     const normalizedPath = normalizeGraphPath(source.path);
     if (seenPaths.has(normalizedPath)) throw new Error("Duplicate normalized path in graph projection");
     seenPaths.add(normalizedPath);
+    const basename = markdownStem(normalizedPath.split("/").at(-1) as string);
+    basenameMultiplicity.set(basename, (basenameMultiplicity.get(basename) ?? 0) + 1);
     const note = normalizeSourceNote(source, domainRules);
     if (note === null) continue;
     normalizedNotes.push(note);
@@ -307,7 +322,7 @@ export function buildGraphProjection(
 
   for (const source of normalizedNotes) {
     for (const link of extractGraphLinks(source.markdown)) {
-      const target = resolveLink(source, link, byPath, byBasename);
+      const target = resolveLink(source, link, byPath, byBasename, basenameMultiplicity);
       if (target !== null) addEdge(edges, link.kind, source.id, target.id);
     }
   }

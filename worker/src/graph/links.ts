@@ -33,17 +33,55 @@ function isExternalTarget(target: string): boolean {
   );
 }
 
+function decodedLocalTarget(target: string): string | null {
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(target);
+  } catch {
+    return null;
+  }
+  if (
+    /%(?:2e|2f|5c)/iu.test(target) ||
+    isExternalTarget(decoded) ||
+    decoded.includes("\\") ||
+    decoded.includes("\0") ||
+    /[\r\n]/u.test(decoded)
+  ) {
+    return null;
+  }
+  return decoded;
+}
+
 function localMarkdownTarget(target: string): string | null {
-  if (isExternalTarget(target)) return null;
-  const path = stripHeadingFragment(target);
+  const decoded = decodedLocalTarget(target);
+  if (decoded === null) return null;
+  const path = stripHeadingFragment(decoded);
   if (path.length === 0 || /\.md$/iu.test(path)) return path;
   return null;
 }
 
 function localWikiTarget(target: string): string | null {
-  if (isExternalTarget(target)) return null;
-  const path = stripHeadingFragment(target);
+  const decoded = decodedLocalTarget(target);
+  if (decoded === null) return null;
+  const path = stripHeadingFragment(decoded);
   return path.includes("?") ? null : path;
+}
+
+function maskObsidianComments(markdown: string): string {
+  let output = "";
+  let inComment = false;
+  for (let index = 0; index < markdown.length;) {
+    if (markdown.startsWith("%%", index)) {
+      output += "  ";
+      inComment = !inComment;
+      index += 2;
+      continue;
+    }
+    const character = markdown[index] as string;
+    output += inComment && character !== "\r" && character !== "\n" ? " " : character;
+    index += 1;
+  }
+  return output;
 }
 
 function sourceRange(documentSource: string, node: Nodes): string | null {
@@ -68,7 +106,7 @@ export function extractGraphLinks(markdown: string): GraphLink[] {
     throw new Error("Graph markdown must be a string");
   }
 
-  const document = parseMarkdown(bodyWithoutFrontmatter(markdown));
+  const document = parseMarkdown(maskObsidianComments(bodyWithoutFrontmatter(markdown)));
   const links = new Map<string, GraphLink>();
   const add = (link: GraphLink): void => {
     links.set(`${link.kind}\0${link.target}`, link);
