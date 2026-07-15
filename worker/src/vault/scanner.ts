@@ -92,7 +92,9 @@ async function collectMarkdownCandidates(
   directory: string,
   parentSegments: readonly string[],
   candidates: string[],
+  maximumCandidates: number,
 ): Promise<void> {
+  if (candidates.length >= maximumCandidates) return;
   let entries;
   try {
     entries = await readdir(directory, { withFileTypes: true });
@@ -102,6 +104,7 @@ async function collectMarkdownCandidates(
   entries.sort((left, right) => compareNames(left.name, right.name));
 
   for (const entry of entries) {
+    if (candidates.length >= maximumCandidates) return;
     const segments = [...parentSegments, entry.name];
     const fullPath = join(root.canonicalRealPath, ...segments);
 
@@ -121,7 +124,7 @@ async function collectMarkdownCandidates(
       } catch {
         continue;
       }
-      await collectMarkdownCandidates(root, fullPath, segments, candidates);
+      await collectMarkdownCandidates(root, fullPath, segments, candidates, maximumCandidates);
       continue;
     }
     if (entry.isFile() && /\.md$/i.test(entry.name)) {
@@ -241,56 +244,92 @@ function invalidFrontmatterEntry(path: string): ScannedVaultNote {
   return freezeEntry({ path, eligibility: { eligible: false, reason: "invalid-frontmatter" } });
 }
 
+export interface VaultScanOptions {
+  /** Caps discovered Markdown candidates; explicit paths remain independently bounded by their caller. */
+  readonly maximumCandidates?: number;
+  /** Known state paths that must be observed even when discovery is capped. */
+  readonly includePaths?: readonly string[];
+}
+
+function maximumCandidates(options: Readonly<VaultScanOptions> | undefined): number {
+  const value = options?.maximumCandidates;
+  if (value === undefined) return Number.MAX_SAFE_INTEGER;
+  if (!Number.isSafeInteger(value) || value < 0 || value > 100_000) throw invalidCandidate();
+  return value;
+}
+
+function includedPaths(options: Readonly<VaultScanOptions> | undefined): readonly string[] {
+  const values = options?.includePaths;
+  if (values === undefined) return [];
+  if (!Array.isArray(values) || values.length > 1_000) throw invalidCandidate();
+  const paths = new Set<string>();
+  for (const value of values) {
+    if (typeof value !== "string") throw invalidCandidate();
+    const segments = safeRelativeSegments(value);
+    if (!/\.md$/iu.test(segments.at(-1) ?? "")) throw invalidCandidate();
+    paths.add(segments.join("/"));
+  }
+  return [...paths].sort(compareNames);
+}
+
+async function explicitPathExists(root: CanonicalVaultRoot, path: string): Promise<boolean> {
+  try {
+    return (await observeSafeVaultNoteBytes(root, path)).kind === "present";
+  } catch {
+    // Keep an unsafe existing target in the candidate set so it is reported as
+    // invalid instead of being silently reclassified as a missing local note.
+    return true;
+  }
+}
+
+async function scanCandidate(root: CanonicalVaultRoot, path: string): Promise<ScannedVaultNote> {
+  const pathExclusion = classifyPathExclusion(path);
+  if (pathExclusion !== null) {
+    return freezeEntry({ path, eligibility: pathExclusion });
+  }
+
+  let bytes: string;
+  try {
+    bytes = await readBoundedNote(root, path);
+  } catch {
+    return invalidFrontmatterEntry(path);
+  }
+
+  const managedState = inspectGithubManagedBytes(bytes);
+  if (managedState === "generated") {
+    return freezeEntry({ path, eligibility: { eligible: false, reason: "generated-github" } });
+  }
+  if (managedState === "invalid") {
+    return invalidFrontmatterEntry(path);
+  }
+
+  try {
+    const note = parseLocalNote(path, bytes);
+    const eligibility = classifyEligibility(note);
+    if (eligibility.eligible) return freezeEntry({ path, eligibility, note });
+    return freezeEntry({ path, eligibility, note });
+  } catch (caught) {
+    if (!(caught instanceof LocalNoteParseError)) throw caught;
+    return invalidFrontmatterEntry(path);
+  }
+}
+
 export async function scanVaultNotes(
   root: CanonicalVaultRoot,
+  options?: Readonly<VaultScanOptions>,
 ): Promise<readonly ScannedVaultNote[]> {
   await assertCanonicalRoot(root);
+  const explicit = includedPaths(options);
   const candidates: string[] = [];
-  await collectMarkdownCandidates(root, root.canonicalRealPath, [], candidates);
-  candidates.sort(compareNames);
+  await collectMarkdownCandidates(root, root.canonicalRealPath, [], candidates, maximumCandidates(options));
+  const paths = new Set(candidates);
+  for (const path of explicit) {
+    if (await explicitPathExists(root, path)) paths.add(path);
+  }
 
   const scanned: ScannedVaultNote[] = [];
-  for (const path of candidates) {
-    const pathExclusion = classifyPathExclusion(path);
-    if (pathExclusion !== null) {
-      scanned.push(freezeEntry({ path, eligibility: pathExclusion }));
-      continue;
-    }
-
-    let bytes: string;
-    try {
-      bytes = await readBoundedNote(root, path);
-    } catch {
-      scanned.push(invalidFrontmatterEntry(path));
-      continue;
-    }
-
-    const managedState = inspectGithubManagedBytes(bytes);
-    if (managedState === "generated") {
-      scanned.push(
-        freezeEntry({ path, eligibility: { eligible: false, reason: "generated-github" } }),
-      );
-      continue;
-    }
-    if (managedState === "invalid") {
-      scanned.push(invalidFrontmatterEntry(path));
-      continue;
-    }
-
-    try {
-      const note = parseLocalNote(path, bytes);
-      const eligibility = classifyEligibility(note);
-      if (eligibility.eligible) {
-        scanned.push(freezeEntry({ path, eligibility, note }));
-      } else {
-        scanned.push(freezeEntry({ path, eligibility, note }));
-      }
-    } catch (caught) {
-      if (!(caught instanceof LocalNoteParseError)) {
-        throw caught;
-      }
-      scanned.push(invalidFrontmatterEntry(path));
-    }
+  for (const path of [...paths].sort(compareNames)) {
+    scanned.push(await scanCandidate(root, path));
   }
 
   return Object.freeze(scanned);

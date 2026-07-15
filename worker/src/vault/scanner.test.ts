@@ -113,6 +113,18 @@ describe("scanVaultNotes", () => {
     expect(scanned[0]?.note?.body).toBe("Safe");
   });
 
+  it("bounds discovery while still observing explicitly scoped state paths", async () => {
+    const vault = await temporaryVault();
+    await put(vault, "A.md", "---\nnotion_sync: true\n---\nA");
+    await put(vault, "B.md", "---\nnotion_sync: true\n---\nB");
+    await put(vault, "Z.md", "---\nnotion_sync: true\n---\nZ");
+    const root = await canonicalVaultRoot(vault, INSTALLATION_ID, { mode: "bootstrap" });
+
+    const scanned = await scanVaultNotes(root, { maximumCandidates: 1, includePaths: ["Z.md"] });
+
+    expect(scanned.map((entry) => entry.path)).toEqual(["A.md", "Z.md"]);
+  });
+
   it("reads a conflict artifact through the same bounded no-follow vault path checks used by scanning", async () => {
     const vault = await temporaryVault();
     await put(vault, "Bridge Conflicts/safe.bridge-conflict.md", "synthetic conflict artifact\n");

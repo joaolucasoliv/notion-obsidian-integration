@@ -138,16 +138,22 @@ function contentLength(response: Response): number | null {
   return parsed;
 }
 
-async function boundedBytes(response: Response, maximum: number): Promise<Uint8Array> {
+async function boundedBytes(response: Response, maximum: number, signal: AbortSignal): Promise<Uint8Array> {
   const declared = contentLength(response);
   if (declared !== null && declared > maximum) throw clientError("response-too-large");
+  if (signal.aborted) throw clientError("timeout", true);
   if (response.body === null) return new Uint8Array();
   const reader = response.body.getReader();
   const chunks: Uint8Array[] = [];
   let length = 0;
+  const cancelReader = (): void => {
+    void reader.cancel().catch(() => undefined);
+  };
+  signal.addEventListener("abort", cancelReader, { once: true });
   try {
     for (;;) {
       const next = await reader.read();
+      if (signal.aborted) throw clientError("timeout", true);
       if (next.done) break;
       if (!(next.value instanceof Uint8Array)) throw clientError("invalid-response");
       length += next.value.byteLength;
@@ -159,8 +165,10 @@ async function boundedBytes(response: Response, maximum: number): Promise<Uint8A
     }
   } catch (caught) {
     if (caught instanceof RelayClientError) throw caught;
+    if (signal.aborted) throw clientError("timeout", true);
     throw clientError("network", true);
   } finally {
+    signal.removeEventListener("abort", cancelReader);
     reader.releaseLock();
   }
   const result = new Uint8Array(length);
@@ -341,9 +349,10 @@ export class RelayClient implements RelayClientPort {
     maxResponseBytes: number,
     acceptedStatuses: readonly number[],
   ): Promise<unknown> {
-    const response = await this.request(method, path, body, acceptedStatuses, MAX_EVENT_RESPONSE_BYTES);
-    if (!JSON_CONTENT_TYPE.test(response.headers.get("content-type") ?? "")) throw clientError("invalid-response");
-    return parseJson(await boundedBytes(response, maxResponseBytes));
+    return this.request(method, path, body, acceptedStatuses, MAX_EVENT_RESPONSE_BYTES, async (response, signal) => {
+      if (!JSON_CONTENT_TYPE.test(response.headers.get("content-type") ?? "")) throw clientError("invalid-response");
+      return parseJson(await boundedBytes(response, maxResponseBytes, signal));
+    });
   }
 
   private async requestEmpty(
@@ -353,13 +362,14 @@ export class RelayClient implements RelayClientPort {
     acceptedStatuses: readonly number[],
     maxRequestBytes = MAX_EVENT_RESPONSE_BYTES,
   ): Promise<void> {
-    const response = await this.request(method, path, body, acceptedStatuses, maxRequestBytes);
-    const length = contentLength(response);
-    if (length !== null && length !== 0) throw clientError("invalid-response");
-    if (response.body !== null) {
-      const bytes = await boundedBytes(response, 1);
-      if (bytes.byteLength !== 0) throw clientError("invalid-response");
-    }
+    await this.request(method, path, body, acceptedStatuses, maxRequestBytes, async (response, signal) => {
+      const length = contentLength(response);
+      if (length !== null && length !== 0) throw clientError("invalid-response");
+      if (response.body !== null) {
+        const bytes = await boundedBytes(response, 1, signal);
+        if (bytes.byteLength !== 0) throw clientError("invalid-response");
+      }
+    });
   }
 
   private async requestStatus(
@@ -368,52 +378,26 @@ export class RelayClient implements RelayClientPort {
     body: unknown,
     acceptedStatuses: readonly number[],
   ): Promise<number> {
-    const response = await this.request(method, path, body, acceptedStatuses, MAX_EVENT_RESPONSE_BYTES);
-    const length = contentLength(response);
-    if (length !== null && length !== 0) throw clientError("invalid-response");
-    if (response.body !== null) {
-      const bytes = await boundedBytes(response, 1);
-      if (bytes.byteLength !== 0) throw clientError("invalid-response");
-    }
-    return response.status;
+    return this.request(method, path, body, acceptedStatuses, MAX_EVENT_RESPONSE_BYTES, async (response, signal) => {
+      const length = contentLength(response);
+      if (length !== null && length !== 0) throw clientError("invalid-response");
+      if (response.body !== null) {
+        const bytes = await boundedBytes(response, 1, signal);
+        if (bytes.byteLength !== 0) throw clientError("invalid-response");
+      }
+      return response.status;
+    });
   }
 
-  private async request(
+  private async request<T>(
     method: "POST" | "PUT",
     path: string,
     body: unknown,
     acceptedStatuses: readonly number[],
     maxRequestBytes: number,
-  ): Promise<Response> {
+    consume: (response: Response, signal: AbortSignal) => Promise<T>,
+  ): Promise<T> {
     const serialized = jsonBytes(body, maxRequestBytes);
-    for (let attempt = 0;; attempt += 1) {
-      let response: Response;
-      try {
-        response = await this.fetchWithDeadline(method, path, serialized);
-      } catch (caught) {
-        const failure = caught instanceof RelayClientError ? caught : clientError("network", true);
-        if (!failure.retryable || attempt >= MAX_RETRY_ATTEMPTS) throw failure;
-        await this.delay(attempt + 1, null);
-        continue;
-      }
-      if (
-        response.redirected ||
-        response.type === "opaqueredirect" ||
-        !Number.isInteger(response.status) ||
-        response.status < 100 ||
-        response.status > 599 ||
-        (response.status >= 300 && response.status < 400)
-      ) {
-        throw clientError("invalid-response");
-      }
-      if (acceptedStatuses.includes(response.status)) return response;
-      const failure = statusError(response.status);
-      if (!retryableStatus(response.status) || attempt >= MAX_RETRY_ATTEMPTS) throw failure;
-      await this.delay(attempt + 1, retryAfterMilliseconds(response));
-    }
-  }
-
-  private async fetchWithDeadline(method: "POST" | "PUT", path: string, body: string): Promise<Response> {
     const controller = new AbortController();
     let rejectDeadline: (reason: unknown) => void = () => undefined;
     const deadline = new Promise<never>((_resolve, reject) => { rejectDeadline = reject; });
@@ -422,20 +406,51 @@ export class RelayClient implements RelayClientPort {
       rejectDeadline(clientError("timeout", true));
     }, REQUEST_TIMEOUT_MS);
     try {
-      return await Promise.race([
-        this.fetchImpl(this.endpoint(path), {
-          method,
-          headers: Object.freeze({
-            authorization: `Bearer ${this.token}`,
-            accept: "application/json",
-            "content-type": "application/json",
-          }),
-          body,
-          redirect: "error",
-          signal: controller.signal,
-        }),
-        deadline,
-      ]);
+      for (let attempt = 0;; attempt += 1) {
+        let failure = clientError("network", true);
+        let retryAfter: number | null = null;
+        try {
+          const response = await Promise.race([
+            this.fetchImpl(this.endpoint(path), {
+              method,
+              headers: Object.freeze({
+                authorization: `Bearer ${this.token}`,
+                accept: "application/json",
+                "content-type": "application/json",
+              }),
+              body: serialized,
+              redirect: "error",
+              signal: controller.signal,
+            }),
+            deadline,
+          ]);
+          if (
+            response.redirected ||
+            response.type === "opaqueredirect" ||
+            !Number.isInteger(response.status) ||
+            response.status < 100 ||
+            response.status > 599 ||
+            (response.status >= 300 && response.status < 400)
+          ) {
+            throw clientError("invalid-response");
+          }
+          if (acceptedStatuses.includes(response.status)) {
+            return await Promise.race([consume(response, controller.signal), deadline]);
+          }
+          retryAfter = retryAfterMilliseconds(response);
+          failure = statusError(response.status);
+          void response.body?.cancel().catch(() => undefined);
+        } catch (caught) {
+          failure = caught instanceof RelayClientError
+            ? caught
+            : controller.signal.aborted
+              ? clientError("timeout", true)
+              : clientError("network", true);
+        }
+        if (controller.signal.aborted) throw clientError("timeout", true);
+        if (!failure.retryable || attempt >= MAX_RETRY_ATTEMPTS) throw failure;
+        await Promise.race([this.delay(attempt + 1, retryAfter), deadline]);
+      }
     } catch (caught) {
       if (caught instanceof RelayClientError) throw caught;
       if (controller.signal.aborted) throw clientError("timeout", true);

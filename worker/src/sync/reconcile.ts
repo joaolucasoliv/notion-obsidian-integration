@@ -15,7 +15,12 @@ import { fromNotionMarkdown, toNotionMarkdown, type LinkMapping } from "../markd
 import { normalizeLocal, semanticHash } from "../markdown/normalize.js";
 import { parseMarkdown } from "../markdown/parse.js";
 import { renderLocalNote } from "../markdown/render.js";
-import { observeSafeVaultNoteBytes, scanVaultNotes, type ScannedVaultNote } from "../vault/scanner.js";
+import {
+  observeSafeVaultNoteBytes,
+  scanVaultNotes,
+  type ScannedVaultNote,
+  type VaultScanOptions,
+} from "../vault/scanner.js";
 import type { CanonicalVaultRoot } from "../vault/safety.js";
 import { deriveAllocationId } from "./planner.js";
 
@@ -32,7 +37,16 @@ export interface ReconciliationDependencies {
   readonly root: CanonicalVaultRoot;
   readonly notion: NotionApi;
   readonly clock: Clock;
-  readonly scan?: (root: CanonicalVaultRoot) => Promise<readonly ScannedVaultNote[]>;
+  /** Limits persisted pair observations during a partial reconciliation. */
+  readonly maximumPairs?: number;
+  /** Limits newly discovered vault candidates during a partial reconciliation. */
+  readonly maximumCandidates?: number;
+  /** Claimed relay pages are selected first, without exceeding maximumPairs. */
+  readonly priorityPageIds?: ReadonlySet<string>;
+  readonly scan?: (
+    root: CanonicalVaultRoot,
+    options?: Readonly<VaultScanOptions>,
+  ) => Promise<readonly ScannedVaultNote[]>;
 }
 
 export class ReconciliationError extends Error {
@@ -273,6 +287,24 @@ function assertStateIdentity(state: Readonly<Record<string, Readonly<PairStateV1
   }
 }
 
+function reconciliationPriors(
+  state: Readonly<Record<string, Readonly<PairStateV1>>>,
+  maximumPairs: number | undefined,
+  priorityPageIds: ReadonlySet<string> | undefined,
+): readonly Readonly<PairStateV1>[] {
+  const sorted = Object.values(state).sort((left, right) => {
+    const byPath = compareStrings(left.localPath, right.localPath);
+    return byPath === 0 ? compareStrings(left.bridgeId, right.bridgeId) : byPath;
+  });
+  if (maximumPairs === undefined) return sorted;
+  if (!Number.isSafeInteger(maximumPairs) || maximumPairs < 1 || maximumPairs > 1_000) {
+    throw new ReconciliationError(fixedError("invalid-config"));
+  }
+  const prioritized = sorted.filter((pair) => priorityPageIds?.has(pair.notionPageId) === true);
+  const remaining = sorted.filter((pair) => priorityPageIds?.has(pair.notionPageId) !== true);
+  return [...prioritized, ...remaining].slice(0, maximumPairs);
+}
+
 /**
  * Turns scanner and exact-ID Notion observations into deterministic planning inputs.
  * It intentionally reports pair-local failures without retaining source content.
@@ -283,7 +315,18 @@ export async function reconcilePairs(
 ): Promise<ReconciliationResult> {
   try {
     assertStateIdentity(state.pairs);
-    const scanned = await (dependencies.scan ?? scanVaultNotes)(dependencies.root);
+    const allPriors = Object.values(state.pairs).sort((left, right) => {
+      const byPath = compareStrings(left.localPath, right.localPath);
+      return byPath === 0 ? compareStrings(left.bridgeId, right.bridgeId) : byPath;
+    });
+    const priors = reconciliationPriors(state.pairs, dependencies.maximumPairs, dependencies.priorityPageIds);
+    const scopedScan = dependencies.maximumPairs === undefined && dependencies.maximumCandidates === undefined
+      ? undefined
+      : Object.freeze({
+          ...(dependencies.maximumCandidates === undefined ? {} : { maximumCandidates: dependencies.maximumCandidates }),
+          includePaths: priors.map((pair) => pair.localPath),
+        });
+    const scanned = await (dependencies.scan ?? scanVaultNotes)(dependencies.root, scopedScan);
     const byPath = new Map<string, ScannedVaultNote>();
     const byBridgeId = new Map<string, ScannedVaultNote>();
     for (const entry of scanned) {
@@ -300,10 +343,6 @@ export async function reconcilePairs(
       }
     }
 
-    const priors = Object.values(state.pairs).sort((left, right) => {
-      const byPath = compareStrings(left.localPath, right.localPath);
-      return byPath === 0 ? compareStrings(left.bridgeId, right.bridgeId) : byPath;
-    });
     const stateCandidates: StateCandidate[] = [];
     const failures: ReconciliationFailure[] = [];
     const pairedPaths = new Set<string>();
@@ -318,7 +357,18 @@ export async function reconcilePairs(
       }
     }
 
-    const links = linkMapping(stateCandidates);
+    const selectedBridgeIds = new Set(priors.map((pair) => pair.bridgeId));
+    const links = linkMapping([
+      ...stateCandidates,
+      ...allPriors
+        .filter((pair) => !selectedBridgeIds.has(pair.bridgeId))
+        .map((prior) => Object.freeze({
+          prior,
+          local: Object.freeze({ kind: "missing" as const, path: prior.localPath }),
+          localNote: null,
+          notion: Object.freeze({ kind: "missing" as const, pageId: prior.notionPageId }),
+        })),
+    ]);
     const inputs: PairPlanningInput[] = [];
     for (const candidate of stateCandidates) {
       let local = candidate.local;
@@ -331,9 +381,14 @@ export async function reconcilePairs(
       inputs.push(Object.freeze({ local, notion: candidate.notion, prior: candidate.prior, prepared }));
     }
 
+    const persistedPaths = new Set(allPriors.map((pair) => pair.localPath));
+    const persistedBridgeIds = new Set(allPriors.map((pair) => pair.bridgeId));
+    const belongsToPersistedPair = (entry: ScannedVaultNote): boolean =>
+      persistedPaths.has(entry.path) || (entry.note?.bridgeId !== undefined && entry.note.bridgeId !== null && persistedBridgeIds.has(entry.note.bridgeId));
     for (const entry of scanned) {
       if (
         !pairedPaths.has(entry.path) &&
+        !belongsToPersistedPair(entry) &&
         !entry.eligibility.eligible &&
         entry.eligibility.reason === "invalid-frontmatter"
       ) {
@@ -343,7 +398,7 @@ export async function reconcilePairs(
       }
     }
     const fresh = [...scanned]
-      .filter((entry) => entry.eligibility.eligible && !pairedPaths.has(entry.path))
+      .filter((entry) => entry.eligibility.eligible && !pairedPaths.has(entry.path) && !belongsToPersistedPair(entry))
       .sort((left, right) => compareStrings(left.path, right.path));
     for (const entry of fresh) {
       try {

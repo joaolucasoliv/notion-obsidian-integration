@@ -29,7 +29,7 @@ import type { StateStore } from "./persistence/state-store.js";
 import { safeErrorFrom, localRecoveryObservation, reconcilePairs, type ReconciliationResult } from "./sync/reconcile.js";
 import { executePlans, type PlannedPair } from "./sync/executor.js";
 import { planPair, validatePlanningBatch } from "./sync/planner.js";
-import { scanVaultNotes } from "./vault/scanner.js";
+import { observeSafeVaultNoteBytes, scanVaultNotes } from "./vault/scanner.js";
 import { type CanonicalVaultRoot } from "./vault/safety.js";
 import { AtomicVaultWriter, type VaultWriter } from "./vault/writer.js";
 import { semanticHash } from "./markdown/normalize.js";
@@ -246,6 +246,8 @@ function validateCredential(value: string | null): string {
 
 const GRAPH_KEY_BYTES = 32;
 const FULL_RECONCILIATION_INTERVAL_MS = 24 * 60 * 60 * 1_000;
+const PARTIAL_RECONCILIATION_PAIR_LIMIT = 3;
+const PARTIAL_RECONCILIATION_CANDIDATE_LIMIT = 3;
 
 function validateRelayToken(value: string | null): string {
   const token = validateCredential(value);
@@ -325,8 +327,12 @@ function relayRegistryCompletion(clock: Clock, pageId: string, bridgeId: string)
   });
 }
 
-function isRegistryPair(pair: Readonly<ParsedBridgeStateV1["pairs"][string]>): boolean {
+function isSynchronizedPair(pair: Readonly<ParsedBridgeStateV1["pairs"][string]>): boolean {
   return pair.status === "synced";
+}
+
+function isRetainedRelayPair(pair: Readonly<ParsedBridgeStateV1["pairs"][string]>): boolean {
+  return pair.status !== "detached";
 }
 
 function outcomeFor(
@@ -412,9 +418,8 @@ function asRemoteRecoveryObserver(
 
 async function readCurrentLocal(root: CanonicalVaultRoot, relativePath: string): Promise<string | null> {
   try {
-    const scanned = await scanVaultNotes(root);
-    const entry = scanned.find((candidate) => candidate.path === relativePath);
-    return entry !== undefined && "note" in entry && entry.note !== undefined ? entry.note.bytes : null;
+    const observed = await observeSafeVaultNoteBytes(root, relativePath);
+    return observed.kind === "present" ? observed.bytes : null;
   } catch {
     return null;
   }
@@ -484,28 +489,43 @@ export class GrandboxBridgeWorker implements BridgeWorker {
     notion: NotionApi,
     state: Readonly<ParsedBridgeStateV1>,
     events: readonly RelayEvent[],
-  ): Promise<void> {
+  ): Promise<ReadonlySet<string>> {
     const registeredPages = new Set(
       Object.values(state.pairs)
-        .filter(isRegistryPair)
+        .filter(isRetainedRelayPair)
         .map((pair) => pair.notionPageId),
     );
+    const prioritizedPages = new Set<string>();
     for (const event of events) {
-      if (registeredPages.has(event.entityId)) continue;
+      if (registeredPages.has(event.entityId)) {
+        prioritizedPages.add(event.entityId);
+        continue;
+      }
       const pageId = await notion.resolveEventPage(event.entityId, 16);
       // Unknown pages are deliberately acknowledged only after the complete
       // reconciliation succeeds; they never authorize a local mutation.
-      if (pageId !== null && !registeredPages.has(pageId)) continue;
+      if (pageId !== null && registeredPages.has(pageId)) prioritizedPages.add(pageId);
     }
+    return prioritizedPages;
   }
 
   private async graphProjection(
     root: CanonicalVaultRoot,
     config: Readonly<ParsedBridgeConfigV1>,
     state: Readonly<BridgeStateV1>,
+    maximumCandidates: number | undefined,
   ) {
     if (config.graph === null) throw new WorkerFailure(fixedError("invalid-config"));
-    const notes: GraphSourceNote[] = (await scanVaultNotes(root)).flatMap((entry) => entry.note === undefined
+    const scanned = await scanVaultNotes(
+      root,
+      maximumCandidates === undefined
+        ? undefined
+        : { maximumCandidates: maximumCandidates + 1 },
+    );
+    // A partial run never publishes a truncated graph. It defers graph work to
+    // the next full reconciliation when the bounded discovery probe overflows.
+    if (maximumCandidates !== undefined && scanned.length > maximumCandidates) return null;
+    const notes: GraphSourceNote[] = scanned.flatMap((entry) => entry.note === undefined
       ? []
       : [{
           path: entry.note.path,
@@ -515,7 +535,7 @@ export class GrandboxBridgeWorker implements BridgeWorker {
         }]);
     const pairs = new Map(
       Object.values(state.pairs)
-        .filter(isRegistryPair)
+        .filter(isSynchronizedPair)
         .map((pair) => [pair.localPath, { notionUrl: `https://www.notion.so/${pair.notionPageId.replaceAll("-", "")}` }] as const),
     );
     return buildGraphProjection(notes, pairs, config.installationId, config.graph.domains);
@@ -529,12 +549,12 @@ export class GrandboxBridgeWorker implements BridgeWorker {
     if (relay === null) return;
     const before = new Map(
       Object.values(context.state.pairs)
-        .filter(isRegistryPair)
+        .filter(isRetainedRelayPair)
         .map((pair) => [pair.bridgeId, pair] as const),
     );
     const after = new Map(
       Object.values(nextState.pairs)
-        .filter(isRegistryPair)
+        .filter(isSynchronizedPair)
         .map((pair) => [pair.bridgeId, pair] as const),
     );
 
@@ -554,8 +574,8 @@ export class GrandboxBridgeWorker implements BridgeWorker {
     }
 
     for (const [bridgeId, pair] of before) {
-      const current = after.get(bridgeId);
-      if (current !== undefined && current.notionPageId === pair.notionPageId) continue;
+      const current = nextState.pairs[bridgeId];
+      if (current === undefined || current.status !== "detached") continue;
       const intent = relayRegistryIntent(
         context.config.installationId,
         "unregister-relay-page",
@@ -585,6 +605,8 @@ export class GrandboxBridgeWorker implements BridgeWorker {
 
       let relay: RelayRunContext | null = null;
       let claimedEvents: readonly RelayEvent[] = [];
+      let prioritizedEventPages: ReadonlySet<string> = new Set();
+      const fullReconciliation = fullReconciliationDue(context.state.lastFullReconciliationAt, this.dependencies.clock);
       if (input.mode === "apply" && context.relay !== null) {
         const rotationRecovery = await recoverPendingRelayTokenRotation({
           credentials: this.dependencies.credentials,
@@ -605,7 +627,7 @@ export class GrandboxBridgeWorker implements BridgeWorker {
         const source = new RelayEventSource(client);
         const claim = await source.claim(context.config.installationId, 50);
         claimedEvents = claim.events;
-        await this.validateClaimedEvents(notion, context.state, claimedEvents);
+        prioritizedEventPages = await this.validateClaimedEvents(notion, context.state, claimedEvents);
         relay = Object.freeze({ client, source, graphKey: context.relay.graphKey });
       }
 
@@ -628,12 +650,20 @@ export class GrandboxBridgeWorker implements BridgeWorker {
         }
       }
 
+      const reconciliationScope = fullReconciliation
+        ? {}
+        : {
+            maximumPairs: PARTIAL_RECONCILIATION_PAIR_LIMIT,
+            maximumCandidates: PARTIAL_RECONCILIATION_CANDIDATE_LIMIT,
+          };
       const reconciled = await reconcilePairs(context.state, {
         root: context.root,
         notion,
         clock: this.dependencies.clock,
+        priorityPageIds: prioritizedEventPages,
+        ...reconciliationScope,
       });
-      return this.finishReconciliation(input, startedAt, context, notion, reconciled, relay, claimedEvents);
+      return this.finishReconciliation(input, startedAt, context, notion, reconciled, relay, claimedEvents, fullReconciliation);
     } catch (caught) {
       const error = caught instanceof WorkerFailure ? caught.error : safeRelayError(caught) ?? safeErrorFrom(caught);
       safeLog(this.dependencies.logger, {
@@ -662,6 +692,7 @@ export class GrandboxBridgeWorker implements BridgeWorker {
     reconciled: ReconciliationResult,
     relay: RelayRunContext | null,
     claimedEvents: readonly RelayEvent[],
+    fullReconciliation: boolean,
   ): Promise<BridgeRunSummary> {
     const validation = validatePlanningBatch(reconciled.inputs);
     if (!validation.ok) {
@@ -712,19 +743,26 @@ export class GrandboxBridgeWorker implements BridgeWorker {
     if (relay !== null) {
       try {
         if (context.config.graph === null) throw new WorkerFailure(fixedError("invalid-config"));
-        const projection = await this.graphProjection(context.root, context.config, executed.state);
-        const sink = new RelaySnapshotSink(relay.client);
-        const publisher = this.dependencies.nonceSource === undefined
-          ? new GraphPublisher({ sink })
-          : new GraphPublisher({ sink, nonceSource: this.dependencies.nonceSource });
-        const published = await publisher.publishIfChanged({
-          projection,
-          state: executed.state.graph ?? initialGraphState(context.config.graph),
-          key: relay.graphKey,
-          now: safeTimestamp(this.dependencies.clock),
-        });
-        stateAfterGraph = { ...executed.state, graph: published.state };
-        graphUploads = published.uploaded ? 1 : 0;
+        const projection = await this.graphProjection(
+          context.root,
+          context.config,
+          executed.state,
+          fullReconciliation ? undefined : PARTIAL_RECONCILIATION_CANDIDATE_LIMIT,
+        );
+        if (projection !== null) {
+          const sink = new RelaySnapshotSink(relay.client);
+          const publisher = this.dependencies.nonceSource === undefined
+            ? new GraphPublisher({ sink })
+            : new GraphPublisher({ sink, nonceSource: this.dependencies.nonceSource });
+          const published = await publisher.publishIfChanged({
+            projection,
+            state: executed.state.graph ?? initialGraphState(context.config.graph),
+            key: relay.graphKey,
+            now: safeTimestamp(this.dependencies.clock),
+          });
+          stateAfterGraph = { ...executed.state, graph: published.state };
+          graphUploads = published.uploaded ? 1 : 0;
+        }
       } catch {
         // The graph state is intentionally retained. A later run recomputes
         // the same projection and encrypts it with a fresh nonce.
@@ -743,7 +781,7 @@ export class GrandboxBridgeWorker implements BridgeWorker {
     );
     const stateWithoutRun: BridgeStateV1 = {
       ...stateAfterGraph,
-      lastFullReconciliationAt: fullReconciliationDue(context.state.lastFullReconciliationAt, this.dependencies.clock) && counts.errors === 0
+      lastFullReconciliationAt: input.mode === "apply" && fullReconciliation && counts.errors === 0
         ? runSummary.completedAt
         : stateAfterGraph.lastFullReconciliationAt,
     };

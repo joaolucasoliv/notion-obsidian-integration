@@ -5,6 +5,7 @@ import {
   mkdtemp,
   readFile,
   realpath,
+  unlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -21,7 +22,7 @@ import {
   type GraphProjectionV1,
   type GraphPublishStateV1,
 } from "@grandbox-bridge/shared";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   GraphPublisher,
   type GraphNonceSource,
@@ -528,6 +529,29 @@ describe("encrypted graph publisher and local relay client", () => {
     expect(() => new RelayClient({ baseUrl: `https://relay.example.test/?token=${ACTIVE_TOKEN}`, token: ACTIVE_TOKEN })).toThrow();
   });
 
+  it("enforces the five-second deadline while a relay response body is still pending", async () => {
+    vi.useFakeTimers();
+    try {
+      const neverEndingBody = new ReadableStream<Uint8Array>({ pull: () => new Promise<void>(() => undefined) });
+      const client = new RelayClient({
+        baseUrl: "https://relay.example.test",
+        token: ACTIVE_TOKEN,
+        fetch: async () => new Response(neverEndingBody, { status: 200, headers: { "content-type": "application/json" } }),
+      });
+      let failure: unknown = null;
+      void client.claimEvents("worker-1", 1).then(
+        () => { failure = new Error("claim unexpectedly resolved"); },
+        (caught: unknown) => { failure = caught; },
+      );
+
+      await vi.advanceTimersByTimeAsync(5_001);
+
+      expect(failure).toMatchObject({ code: "timeout", retryable: true });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("registers and unregisters pages without passing note bodies through the relay", async () => {
     const clock = new TestClock();
     const relay = new MemoryRelay(clock);
@@ -645,6 +669,63 @@ describe("worker graph relay orchestration", () => {
     expect(harness.relay.registrations.has(PAGE_ID)).toBe(false);
     expect(harness.journal.begun.some((intent) => intent.effectKind === "unregister-relay-page")).toBe(true);
     await expect(harness.read("Private.md")).resolves.toContain("still local and never deleted");
+  });
+
+  it("keeps an already registered page through a non-detached missing-local state", async () => {
+    const harness = await WorkerGraphHarness.create();
+    await harness.write("Private.md", optedIn("paired\n"));
+    await harness.run();
+    expect(harness.relay.registrations.has(PAGE_ID)).toBe(true);
+
+    await unlink(join(harness.root.canonicalRealPath, "Private.md"));
+    await harness.run();
+
+    expect(Object.values(harness.state.value.pairs)).toContainEqual(expect.objectContaining({ status: "missing-local" }));
+    expect(harness.relay.registrations.has(PAGE_ID)).toBe(true);
+    expect(harness.journal.begun.some((intent) => intent.effectKind === "unregister-relay-page")).toBe(false);
+  });
+
+  it("bounds partial reconciliation while the daily pass still observes every persisted pair", async () => {
+    const harness = await WorkerGraphHarness.create();
+    await Promise.all([
+      harness.write("A.md", optedIn("A\n")),
+      harness.write("B.md", optedIn("B\n")),
+      harness.write("C.md", optedIn("C\n")),
+      harness.write("D.md", optedIn("D\n")),
+    ]);
+    await harness.run();
+
+    const retrieve = vi.spyOn(harness.notion, "retrievePage");
+    await harness.run();
+    expect(retrieve).toHaveBeenCalledTimes(3);
+
+    retrieve.mockClear();
+    harness.clock.advance(24 * 60 * 60 * 1_000 + 1);
+    await harness.run();
+    expect(retrieve).toHaveBeenCalledTimes(4);
+  });
+
+  it("defers graph publication rather than uploading a truncated partial discovery", async () => {
+    const harness = await WorkerGraphHarness.create();
+    await Promise.all([
+      harness.write("A.md", optedIn("A\n")),
+      harness.write("B.md", optedIn("B\n")),
+      harness.write("C.md", optedIn("C\n")),
+      harness.write("D.md", optedIn("D\n")),
+    ]);
+    await harness.run();
+    const before = structuredClone(harness.state.value.graph);
+    const paired = await harness.read("A.md");
+    const bridgeId = /^bridge_id:\s*([^\r\n]+)$/mu.exec(paired)?.[1];
+    expect(bridgeId).toMatch(/^[0-9a-f-]{36}$/u);
+    await harness.write("A.md", `---\nnotion_sync: true\nbridge_id: ${bridgeId}\ntags: [changed]\n---\nA revised\n`);
+
+    const partial = await harness.run();
+
+    expect(partial.graphUploads).toBe(0);
+    expect(harness.state.value.graph).toEqual(before);
+    harness.clock.advance(24 * 60 * 60 * 1_000 + 1);
+    expect((await harness.run()).graphUploads).toBe(1);
   });
 
   it("advances daily full-reconciliation state only after complete success and keeps preview mutation-free", async () => {
