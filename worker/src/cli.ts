@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
-import { dirname, isAbsolute, join, normalize, resolve } from "node:path";
+import { dirname, isAbsolute, normalize, resolve } from "node:path";
 import {
   parseBridgeConfig,
   parseBridgeRunSummary,
@@ -12,6 +12,7 @@ import { FileStateStore } from "./persistence/state-store.js";
 import { readStrictJson } from "./runtime/atomic-json.js";
 import { MacOSKeychainCredentialStore, type ProcessRunner } from "./runtime/keychain.js";
 import { withInstallationLock } from "./runtime/lock.js";
+import { deriveRuntimePaths, type RuntimePaths } from "./runtime/paths.js";
 import { redactSensitiveOutput, SafeFileLogger } from "./runtime/safe-log.js";
 import { fromNotionMarkdown } from "./markdown/notion-mapping.js";
 import { semanticHash } from "./markdown/normalize.js";
@@ -173,6 +174,23 @@ export async function runCli(argv: readonly string[], dependencies: CliDependenc
   }
 }
 
+/** Derives the only supported private runtime tree, including the user-scoped rotating log path. */
+export function deriveProductionRuntimePaths(configPath: string, installationId: string): RuntimePaths {
+  if (!validConfigPath(configPath)) {
+    throw new Error("Invalid bridge runtime configuration path");
+  }
+  const installationRoot = dirname(configPath);
+  const bridgeRoot = dirname(installationRoot);
+  const supportRoot = dirname(bridgeRoot);
+  const libraryRoot = dirname(supportRoot);
+  const homeDirectory = dirname(libraryRoot);
+  const paths = deriveRuntimePaths(homeDirectory, installationId);
+  if (paths.configPath !== configPath) {
+    throw new Error("Invalid bridge runtime configuration path");
+  }
+  return paths;
+}
+
 function processRunner(): ProcessRunner {
   return {
     run: async (input) => new Promise((resolveResult, reject) => {
@@ -269,18 +287,15 @@ function decoderFor(state: Parameters<typeof persistedLinkMapping>[0]): NotionOb
 /** Composes real local adapters only after argument validation; it never makes a request during construction. */
 export async function createProductionWorker(configPath: string): Promise<BridgeWorker> {
   const bootstrap = await readStrictJson(configPath, parseBridgeConfig);
-  const runtimeRoot = dirname(configPath);
-  const statePath = join(runtimeRoot, "state.json");
-  const lockPath = join(runtimeRoot, "sync.lock");
-  const journalDir = join(runtimeRoot, "journal");
-  const logger = new SafeFileLogger(join(runtimeRoot, "bridge.log"));
+  const runtimePaths = deriveProductionRuntimePaths(configPath, bootstrap.installationId);
+  const logger = new SafeFileLogger(runtimePaths.logPath);
   const credentials = new MacOSKeychainCredentialStore(bootstrap.installationId, processRunner());
   return new GrandboxBridgeWorker({
     config: new FileConfigStore(configPath, bootstrap.installationId),
-    state: new FileStateStore(statePath, bootstrap.installationId),
-    journal: new FileJournalStore(journalDir, bootstrap.installationId),
+    state: new FileStateStore(runtimePaths.statePath, bootstrap.installationId),
+    journal: new FileJournalStore(runtimePaths.journalDir, bootstrap.installationId),
     credentials,
-    lock: runtimeLock(lockPath),
+    lock: runtimeLock(runtimePaths.lockPath),
     clock: { now: () => new Date(), sleep: async (milliseconds) => new Promise((resolveSleep) => setTimeout(resolveSleep, milliseconds)) },
     uuid: { randomUUID },
     logger,

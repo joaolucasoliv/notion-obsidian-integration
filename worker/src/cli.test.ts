@@ -1,9 +1,21 @@
 import { describe, expect, it } from "vitest";
-import { parseCliArguments, runCli } from "./cli.js";
+import { deriveProductionRuntimePaths, parseCliArguments, runCli } from "./cli.js";
 
 const CONFIG = "/private/tmp/grandbox/config.json";
 
 describe("worker CLI", () => {
+  it("derives the production logger path from the external runtime root", () => {
+    const paths = deriveProductionRuntimePaths(
+      "/Users/jo/Library/Application Support/Grandbox Bridge/11111111-1111-4111-8111-111111111111/config.json",
+      "11111111-1111-4111-8111-111111111111",
+    );
+
+    expect(paths.logPath).toBe("/Users/jo/Library/Logs/GrandboxBridge/bridge.log");
+    expect(paths.statePath).toBe(
+      "/Users/jo/Library/Application Support/Grandbox Bridge/11111111-1111-4111-8111-111111111111/state.json",
+    );
+  });
+
   it("accepts only the exact JSON apply invocation", () => {
     expect(parseCliArguments(["--config", CONFIG, "--reason", "manual", "--json"])).toEqual({
       kind: "run",
