@@ -12,8 +12,22 @@ describe("two-sided conflicts", () => {
 
     const result = await harness.apply();
 
-    expect(harness.journal.begun.map((intent) => intent.effectKind)).toEqual(["initialize-pair", "create-notion-page", "create-conflict", "set-notion-status"]);
-    expect(harness.journal.completed.map((entry) => entry.id)).toEqual(harness.journal.begun.map((intent) => intent.id));
+    expect(harness.journal.begun.map((intent) => intent.effectKind)).toEqual([
+      "commit-state",
+      "initialize-pair",
+      "create-notion-page",
+      "commit-state",
+      "create-conflict",
+      "set-notion-status",
+    ]);
+    expect(harness.journal.completed.map((entry) => entry.id)).toEqual([
+      harness.journal.begun[1]?.id,
+      harness.journal.begun[2]?.id,
+      harness.journal.begun[0]?.id,
+      harness.journal.begun[4]?.id,
+      harness.journal.begun[5]?.id,
+      harness.journal.begun[3]?.id,
+    ]);
     expect(result).toMatchObject({ outcome: "conflict", conflicts: 1, errors: 0 });
     await expect(harness.note("Conflict.md")).resolves.toContain("local change");
     await expect(readdir(`${harness.root.canonicalRealPath}/Bridge Conflicts`)).resolves.toHaveLength(1);

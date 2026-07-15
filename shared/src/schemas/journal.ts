@@ -24,6 +24,7 @@ const relativePathSchema = z
   });
 
 export const journalEffectKindSchema = z.enum([
+  "commit-state",
   "initialize-pair",
   "create-notion-page",
   "update-notion-body-exact",
@@ -50,6 +51,27 @@ export const journalIntentV1Schema = z
     createdAt: timestampSchema,
   })
   .strict()
+  .superRefine((value, context) => {
+    if (value.effectKind !== "commit-state") return;
+    for (const field of [
+      "relativePath",
+      "remoteId",
+      "allocationId",
+      "expectedByteHash",
+      "expectedSemanticHash",
+      "resultByteHash",
+      "resultSemanticHash",
+      "expectedRemoteEditedAt",
+    ] as const) {
+      if (value[field] !== null) {
+        context.addIssue({
+          code: "custom",
+          path: [field],
+          message: "commit-state must not include effect material",
+        });
+      }
+    }
+  })
   .readonly();
 
 export const journalCompletionV1Schema = z

@@ -8,6 +8,7 @@ import type { JournalStore } from "./journal-store.js";
 
 const MAX_RECOVERY_OPERATIONS = 1_024;
 const HASH_PATTERN = /^[0-9a-f]{64}$/;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 
 export interface RemoteRecoveryObserver {
   classify(intent: JournalIntentV1): Promise<
@@ -20,7 +21,12 @@ export interface RemoteRecoveryObserver {
 export interface LocalRecoveryObserver {
   observe(intent: JournalIntentV1): Promise<
     | { readonly kind: "missing" }
-    | { readonly kind: "present"; readonly byteHash: string; readonly semanticHash: string | null }
+    | {
+      readonly kind: "present";
+      readonly byteHash: string;
+      readonly semanticHash: string | null;
+      readonly bridgeId?: string | null;
+    }
   >;
 }
 
@@ -81,21 +87,29 @@ function validHashOrNull(value: unknown): value is string | null {
 
 function parseLocalObservation(input: unknown):
   | { readonly kind: "missing" }
-  | { readonly kind: "present"; readonly byteHash: string; readonly semanticHash: string | null } {
+  | {
+    readonly kind: "present";
+    readonly byteHash: string;
+    readonly semanticHash: string | null;
+    readonly bridgeId: string | null;
+  } {
   if (isExactObject(input, ["kind"]) && input.kind === "missing") {
     return Object.freeze({ kind: "missing" });
   }
   if (
-    isExactObject(input, ["kind", "byteHash", "semanticHash"]) &&
+    (isExactObject(input, ["kind", "byteHash", "semanticHash"]) ||
+      isExactObject(input, ["kind", "byteHash", "semanticHash", "bridgeId"])) &&
     input.kind === "present" &&
     typeof input.byteHash === "string" &&
     HASH_PATTERN.test(input.byteHash) &&
-    validHashOrNull(input.semanticHash)
+    validHashOrNull(input.semanticHash) &&
+    (input.bridgeId === undefined || input.bridgeId === null || (typeof input.bridgeId === "string" && UUID_PATTERN.test(input.bridgeId)))
   ) {
     return Object.freeze({
       kind: "present",
       byteHash: input.byteHash,
       semanticHash: input.semanticHash,
+      bridgeId: input.bridgeId ?? null,
     });
   }
   throw new Error("Invalid local recovery observation");
@@ -105,13 +119,14 @@ function observedLocalCompletion(
   byteHash: string | null,
   semanticHash: string | null,
   completedAt: string,
+  allocatedBridgeId: string | null = null,
 ): JournalCompletionV1 {
   return parseJournalCompletion({
     schemaVersion: 1,
     resultByteHash: byteHash,
     resultSemanticHash: semanticHash,
     resultRemoteId: null,
-    allocatedBridgeId: null,
+    allocatedBridgeId,
     observedRemoteEditedAt: null,
     completedAt,
   });
@@ -148,9 +163,13 @@ async function classifyLocal(
   }
   const observation = parseLocalObservation(await observer.observe(intent));
   if (observation.kind === "present" && observation.byteHash === intent.resultByteHash) {
+    const allocatedBridgeId = intent.effectKind === "initialize-pair" ? observation.bridgeId : null;
+    if (intent.effectKind === "initialize-pair" && allocatedBridgeId === null) {
+      return null;
+    }
     return Object.freeze({
       kind: "reconciled",
-      evidence: observedLocalCompletion(observation.byteHash, observation.semanticHash, completedAt),
+      evidence: observedLocalCompletion(observation.byteHash, observation.semanticHash, completedAt, allocatedBridgeId),
     });
   }
   if (
@@ -204,13 +223,20 @@ export async function recoverIncompleteJournal(dependencies: RecoveryDependencie
   } catch {
     return safeResult("recovery-required", 0, 0, 0);
   }
-  intents.sort((left, right) => (left.id < right.id ? -1 : left.id > right.id ? 1 : 0));
+  intents.sort((left, right) => {
+    if (left.effectKind === "commit-state" && right.effectKind !== "commit-state") return 1;
+    if (left.effectKind !== "commit-state" && right.effectKind === "commit-state") return -1;
+    return left.id < right.id ? -1 : left.id > right.id ? 1 : 0;
+  });
 
   let processed = 0;
   let reconciled = 0;
   let retryable = 0;
   for (const intent of intents) {
     try {
+      if (intent.effectKind === "commit-state") {
+        return safeResult("recovery-required", processed, reconciled, retryable, intent);
+      }
       let resolved: { readonly kind: ResolvedKind; readonly evidence: JournalCompletionV1 } | null;
       if (
         intent.effectKind === "initialize-pair" ||

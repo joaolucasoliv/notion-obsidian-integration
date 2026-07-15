@@ -387,15 +387,18 @@ export function persistedLinkMapping(state: Readonly<{ readonly pairs: Record<st
 export async function localRecoveryObservation(
   root: CanonicalVaultRoot,
   relativePath: string,
-): Promise<{ readonly kind: "missing" } | { readonly kind: "present"; readonly byteHash: string; readonly semanticHash: string | null }> {
+): Promise<
+  | { readonly kind: "missing" }
+  | { readonly kind: "present"; readonly byteHash: string; readonly semanticHash: string | null; readonly bridgeId: string | null }
+> {
   const observed = await observeSafeVaultNoteBytes(root, relativePath);
   if (observed.kind === "missing") return observed;
   const byteHash = await sha256Hex(observed.bytes);
   try {
     const note = parseLocalNote(relativePath, observed.bytes);
     const semantic = normalizeLocal(parseMarkdown(note.body), note.tags);
-    return Object.freeze({ kind: "present" as const, byteHash, semanticHash: await semanticHash(semantic) });
+    return Object.freeze({ kind: "present" as const, byteHash, semanticHash: await semanticHash(semantic), bridgeId: note.bridgeId });
   } catch {
-    return Object.freeze({ kind: "present" as const, byteHash, semanticHash: null });
+    return Object.freeze({ kind: "present" as const, byteHash, semanticHash: null, bridgeId: null });
   }
 }

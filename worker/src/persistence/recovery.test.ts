@@ -17,6 +17,7 @@ const HASH_A = "a".repeat(64);
 const HASH_B = "b".repeat(64);
 const HASH_C = "c".repeat(64);
 const TIMESTAMP = "2026-07-14T12:34:56.000Z";
+const BRIDGE_ID = "55555555-5555-4555-8555-555555555555";
 
 function intent(
   id: string,
@@ -183,6 +184,73 @@ describe("recoverIncompleteJournal", () => {
 
     expect(result).toMatchObject({ status: "reconciled", reconciled: 1, retryable: 0 });
     expect(journal.completed).toEqual([{ id: INTENT_A, evidence: evidence(HASH_B) }]);
+  });
+
+  it("preserves the proven Bridge ID when recovering an initialize-pair post-write", async () => {
+    const journal = new MemoryJournalStore([
+      intent(INTENT_A, "initialize-pair", {
+        relativePath: "Notes/Bridge.md",
+        expectedByteHash: HASH_A,
+        resultByteHash: HASH_B,
+      }),
+    ]);
+
+    const result = await recoverIncompleteJournal({
+      journal,
+      localObserver: local({
+        kind: "present",
+        byteHash: HASH_B,
+        semanticHash: HASH_C,
+        bridgeId: BRIDGE_ID,
+      } as never),
+      remoteObserver: remote({ kind: "unprovable" }),
+      now: () => TIMESTAMP,
+    });
+
+    expect(result).toMatchObject({ status: "reconciled", reconciled: 1, retryable: 0 });
+    expect(journal.completed).toEqual([{
+      id: INTENT_A,
+      evidence: { ...evidence(HASH_B), resultSemanticHash: HASH_C, allocatedBridgeId: BRIDGE_ID },
+    }]);
+  });
+
+  it("recovers an initialize-pair before failing closed at its pending state commit fence", async () => {
+    const commitId = "11111111-1111-4111-8111-111111111111";
+    const journal = new MemoryJournalStore([
+      intent(commitId, "commit-state", {
+        relativePath: null,
+        remoteId: null,
+        allocationId: null,
+        expectedByteHash: null,
+        expectedSemanticHash: null,
+        resultByteHash: null,
+        resultSemanticHash: null,
+        expectedRemoteEditedAt: null,
+      }),
+      intent(INTENT_A, "initialize-pair", {
+        relativePath: "Notes/Bridge.md",
+        expectedByteHash: HASH_A,
+        resultByteHash: HASH_B,
+      }),
+    ]);
+
+    const result = await recoverIncompleteJournal({
+      journal,
+      localObserver: local({ kind: "present", byteHash: HASH_B, semanticHash: HASH_C, bridgeId: BRIDGE_ID }),
+      remoteObserver: remote({ kind: "unprovable" }),
+      now: () => TIMESTAMP,
+    });
+
+    expect(result).toMatchObject({
+      status: "recovery-required",
+      processed: 1,
+      reconciled: 1,
+      blockedId: commitId,
+    });
+    expect(journal.completed).toEqual([{
+      id: INTENT_A,
+      evidence: { ...evidence(HASH_B), resultSemanticHash: HASH_C, allocatedBridgeId: BRIDGE_ID },
+    }]);
   });
 
   it("marks a missing conflict target as retryable before a create mutation", async () => {

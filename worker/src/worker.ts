@@ -1,4 +1,6 @@
 import {
+  parseJournalCompletion,
+  parseJournalIntent,
   type BridgeRunSummary,
   type BridgeStateV1,
   type Clock,
@@ -10,6 +12,8 @@ import {
   type UuidSource,
   type ParsedBridgeConfigV1,
   type ParsedBridgeStateV1,
+  type JournalCompletionV1,
+  type JournalIntentV1,
 } from "@grandbox-bridge/shared";
 import type { ConfigStore } from "./persistence/config-store.js";
 import type { JournalStore } from "./persistence/journal-store.js";
@@ -78,6 +82,48 @@ function safeTimestamp(clock: Clock): string {
   } catch {
     return "1970-01-01T00:00:00.000Z";
   }
+}
+
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+
+function nextJournalId(uuid: UuidSource): string {
+  try {
+    const value = uuid.randomUUID();
+    if (typeof value !== "string" || !UUID_PATTERN.test(value)) throw new Error("Invalid UUID");
+    return value;
+  } catch {
+    throw new WorkerFailure(fixedError("internal-error"));
+  }
+}
+
+function stateCommitIntent(installationId: string, uuid: UuidSource, clock: Clock): JournalIntentV1 {
+  return parseJournalIntent({
+    schemaVersion: 1,
+    id: nextJournalId(uuid),
+    installationId,
+    effectKind: "commit-state",
+    relativePath: null,
+    remoteId: null,
+    allocationId: null,
+    expectedByteHash: null,
+    expectedSemanticHash: null,
+    resultByteHash: null,
+    resultSemanticHash: null,
+    expectedRemoteEditedAt: null,
+    createdAt: safeTimestamp(clock),
+  });
+}
+
+function stateCommitCompletion(clock: Clock): JournalCompletionV1 {
+  return parseJournalCompletion({
+    schemaVersion: 1,
+    resultByteHash: null,
+    resultSemanticHash: null,
+    resultRemoteId: null,
+    allocatedBridgeId: null,
+    observedRemoteEditedAt: null,
+    completedAt: safeTimestamp(clock),
+  });
 }
 
 function summary(
@@ -253,26 +299,31 @@ export class GrandboxBridgeWorker implements BridgeWorker {
     let context: LoadedRunContext;
     try {
       context = await this.loadContext();
+      if (input.mode === "preview" && await this.previewHasIncompleteJournal()) {
+        return summary(input, startedAt, { planned: 0, writes: 0, pushed: 0, pulled: 0, conflicts: 0, errors: 0 }, "recovery-required", this.dependencies.clock);
+      }
       const notion = await this.dependencies.createNotionApi(context.token, {
         config: context.config,
         state: context.state,
         root: context.root,
       });
-      const recovery = await recoverIncompleteJournal({
-        journal: this.dependencies.journal,
-        localObserver: { observe: async (intent) => intent.relativePath === null
-          ? Object.freeze({ kind: "missing" as const })
-          : localRecoveryObservation(context.root, intent.relativePath) },
-        remoteObserver: asRemoteRecoveryObserver(notion, this.dependencies.clock),
-        now: () => safeTimestamp(this.dependencies.clock),
-      });
-      if (recovery.status === "recovery-required") {
-        safeLog(this.dependencies.logger, {
-          level: "error",
-          event: "recovery-required",
-          fields: { installationId: context.config.installationId, errorCode: "recovery-required", retryable: false },
+      if (input.mode === "apply") {
+        const recovery = await recoverIncompleteJournal({
+          journal: this.dependencies.journal,
+          localObserver: { observe: async (intent) => intent.relativePath === null
+            ? Object.freeze({ kind: "missing" as const })
+            : localRecoveryObservation(context.root, intent.relativePath) },
+          remoteObserver: asRemoteRecoveryObserver(notion, this.dependencies.clock),
+          now: () => safeTimestamp(this.dependencies.clock),
         });
-        return summary(input, startedAt, { planned: 0, writes: 0, pushed: 0, pulled: 0, conflicts: 0, errors: 0 }, "recovery-required", this.dependencies.clock);
+        if (recovery.status === "recovery-required") {
+          safeLog(this.dependencies.logger, {
+            level: "error",
+            event: "recovery-required",
+            fields: { installationId: context.config.installationId, errorCode: "recovery-required", retryable: false },
+          });
+          return summary(input, startedAt, { planned: 0, writes: 0, pushed: 0, pulled: 0, conflicts: 0, errors: 0 }, "recovery-required", this.dependencies.clock);
+        }
       }
 
       await notion.verifyConnection();
@@ -290,6 +341,15 @@ export class GrandboxBridgeWorker implements BridgeWorker {
         fields: { mode: input.mode, reason: input.reason, outcome: "failed", errorCode: error.code, retryable: error.retryable },
       });
       return failedSummary(input, startedAt, this.dependencies.clock);
+    }
+  }
+
+  private async previewHasIncompleteJournal(): Promise<boolean> {
+    try {
+      const pending = await this.dependencies.journal.incomplete();
+      return !Array.isArray(pending) || pending.length > 0;
+    } catch {
+      return true;
     }
   }
 
@@ -318,6 +378,10 @@ export class GrandboxBridgeWorker implements BridgeWorker {
       return summary(input, startedAt, counts, outcomeFor(counts, input.mode), this.dependencies.clock);
     }
 
+    const stateFence = planned === 0 ? null : stateCommitIntent(context.config.installationId, this.dependencies.uuid, this.dependencies.clock);
+    if (stateFence !== null) {
+      await this.dependencies.journal.begin(stateFence);
+    }
     const executed = await executePlans(context.state, pairs, {
       installationId: context.config.installationId,
       notionConfig: context.config.notion as NonNullable<ParsedBridgeConfigV1["notion"]>,
@@ -332,10 +396,15 @@ export class GrandboxBridgeWorker implements BridgeWorker {
     const runSummary = summary(input, startedAt, counts, outcomeFor(counts, input.mode), this.dependencies.clock);
     const nextState: BridgeStateV1 = {
       ...executed.state,
-      lastFullReconciliationAt: input.reason === "reconciliation" ? runSummary.completedAt : executed.state.lastFullReconciliationAt,
+      lastFullReconciliationAt: input.reason === "reconciliation" && counts.errors === 0
+        ? runSummary.completedAt
+        : executed.state.lastFullReconciliationAt,
       lastRun: runSummary,
     };
     await this.dependencies.state.save(nextState);
+    if (stateFence !== null) {
+      await this.dependencies.journal.complete(stateFence.id, stateCommitCompletion(this.dependencies.clock));
+    }
     safeLog(this.dependencies.logger, {
       level: "info",
       event: "run-completed",

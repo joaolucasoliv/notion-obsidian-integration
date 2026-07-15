@@ -44,4 +44,15 @@ describe("reconciliation", () => {
     expect(result).toMatchObject({ outcome: "partial", pushed: 1, errors: 1 });
     expect(harness.notion.creates).toBe(1);
   });
+
+  it("does not mark a partial reconciliation as a full reconciliation", async () => {
+    const harness = await BridgeHarness.create();
+    await harness.writeNote("Good.md", optedIn("good\n"));
+    await harness.writeNote("Broken.md", "---\nnotion_sync: [\n---\nbroken\n");
+
+    const result = await harness.apply("reconciliation");
+
+    expect(result).toMatchObject({ outcome: "partial", pushed: 1, errors: 1 });
+    expect(harness.state.value.lastFullReconciliationAt).toBeNull();
+  });
 });

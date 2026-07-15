@@ -125,6 +125,25 @@ describe("journal schemas", () => {
     expect(parseJournalCompletion(completion)).toEqual(completion);
   });
 
+  it("allows a metadata-only state commit fence and rejects note material on it", () => {
+    const fence = {
+      ...validIntent(),
+      effectKind: "commit-state",
+      relativePath: null,
+      remoteId: null,
+      allocationId: null,
+      expectedByteHash: null,
+      expectedSemanticHash: null,
+      resultByteHash: null,
+      resultSemanticHash: null,
+      expectedRemoteEditedAt: null,
+    };
+
+    expect(parseJournalIntent(fence)).toEqual(fence);
+    expect(() => parseJournalIntent({ ...fence, bodyMarkdown: "must not persist" })).toThrow(/unrecognized/i);
+    expect(() => parseJournalIntent({ ...fence, resultSemanticHash: HASH })).toThrow(/commit-state/i);
+  });
+
   it("requires nullable planned local postcondition hashes on every intent", () => {
     const missingByteHash = validIntent();
     const missingSemanticHash = validIntent();

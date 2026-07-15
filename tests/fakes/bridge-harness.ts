@@ -73,7 +73,10 @@ class MemoryConfigStore implements ConfigStore {
 class MemoryStateStore implements StateStore {
   public saves = 0;
 
-  public constructor(public value: BridgeStateV1) {}
+  public constructor(
+    public value: BridgeStateV1,
+    private remainingFailures = 0,
+  ) {}
 
   public async load(): Promise<BridgeStateV1> {
     return structuredClone(this.value);
@@ -81,6 +84,10 @@ class MemoryStateStore implements StateStore {
 
   public async save(next: BridgeStateV1): Promise<void> {
     this.saves += 1;
+    if (this.remainingFailures > 0) {
+      this.remainingFailures -= 1;
+      throw new Error("synthetic state persistence failure");
+    }
     this.value = structuredClone(next);
   }
 }
@@ -156,6 +163,9 @@ export class FakeNotionApi implements NotionApi {
   public bodyUpdates = 0;
   public propertyUpdates = 0;
   public verifyFails = false;
+  public corruptCreateBridgeResult = false;
+  public corruptBodyResult = false;
+  public corruptManagedStatusResult = false;
   private readonly pages = new Map<string, StoredPage>();
 
   public async verifyConnection(): Promise<{ userId: string; name: string | null }> {
@@ -194,7 +204,11 @@ export class FakeNotionApi implements NotionApi {
       editedAt: NOW,
     };
     this.pages.set(pageId, page);
-    return this.observe(page);
+    const observed = this.observe(page);
+    if (this.corruptCreateBridgeResult && observed.kind === "present") {
+      return { ...observed, bridgeId: THIRD_UUID };
+    }
+    return observed;
   }
 
   public async updateBodyExact(input: Parameters<NotionApi["updateBodyExact"]>[0]): Promise<NotionObservation> {
@@ -208,7 +222,14 @@ export class FakeNotionApi implements NotionApi {
     page.semanticHash = await semanticHash(mapped.semantic);
     page.editedAt = "2026-07-14T12:34:57.000Z";
     this.bodyUpdates += 1;
-    return this.observe(page);
+    const observed = this.observe(page);
+    if (this.corruptBodyResult && observed.kind === "present") {
+      return {
+        ...observed,
+        semantic: { ...observed.semantic, bodyMarkdown: "synthetic incorrect body\n" },
+      };
+    }
+    return observed;
   }
 
   public async updateManagedProperties(input: Parameters<NotionApi["updateManagedProperties"]>[0]): Promise<NotionObservation> {
@@ -224,7 +245,11 @@ export class FakeNotionApi implements NotionApi {
     page.semanticHash = await semanticHash(page.semantic);
     page.editedAt = "2026-07-14T12:34:57.000Z";
     this.propertyUpdates += 1;
-    return this.observe(page);
+    const observed = this.observe(page);
+    if (this.corruptManagedStatusResult && observed.kind === "present") {
+      return { ...observed, managed: { ...observed.managed, status: "synced" } };
+    }
+    return observed;
   }
 
   public async editBody(pageId: string, body: string): Promise<void> {
@@ -274,7 +299,7 @@ function emptyLinks() {
 export class BridgeHarness {
   public readonly journal = new MemoryJournal();
   public readonly notion = new FakeNotionApi();
-  public readonly state = new MemoryStateStore(initialState());
+  public readonly state: MemoryStateStore;
   public readonly uuid = new CountingUuidSource();
   public readonly logger = new RecordingLogger();
   public readonly credentials: MemoryCredentials;
@@ -282,10 +307,22 @@ export class BridgeHarness {
   private constructor(
     public readonly root: CanonicalVaultRoot,
     credentials: MemoryCredentials,
-    options: Readonly<{ vaultFingerprintMismatch?: boolean; lockFails?: boolean; verifyFails?: boolean }>,
+    options: Readonly<{
+      vaultFingerprintMismatch?: boolean;
+      lockFails?: boolean;
+      verifyFails?: boolean;
+      stateSaveFailures?: number;
+      corruptCreateBridgeResult?: boolean;
+      corruptBodyResult?: boolean;
+      corruptManagedStatusResult?: boolean;
+    }>,
   ) {
+    this.state = new MemoryStateStore(initialState(), options.stateSaveFailures ?? 0);
     this.credentials = credentials;
     this.notion.verifyFails = options.verifyFails === true;
+    this.notion.corruptCreateBridgeResult = options.corruptCreateBridgeResult === true;
+    this.notion.corruptBodyResult = options.corruptBodyResult === true;
+    this.notion.corruptManagedStatusResult = options.corruptManagedStatusResult === true;
     const config: BridgeConfigV1 = {
       schemaVersion: 1,
       installationId: INSTALLATION_ID,
@@ -330,6 +367,10 @@ export class BridgeHarness {
       vaultFingerprintMismatch?: boolean;
       lockFails?: boolean;
       verifyFails?: boolean;
+      stateSaveFailures?: number;
+      corruptCreateBridgeResult?: boolean;
+      corruptBodyResult?: boolean;
+      corruptManagedStatusResult?: boolean;
     }> = {},
   ): Promise<BridgeHarness> {
     const directory = await realpath(await mkdtemp(join(tmpdir(), "grandbox-task8-")));

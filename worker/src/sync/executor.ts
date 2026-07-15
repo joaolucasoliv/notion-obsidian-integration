@@ -14,10 +14,12 @@ import {
   type PlannedEffect,
   type SafeError,
   type SafeErrorCode,
+  type SemanticNote,
   type UuidSource,
 } from "@grandbox-bridge/shared";
 import { sha256Hex } from "@grandbox-bridge/shared";
 import { upsertBridgeId } from "../markdown/frontmatter.js";
+import { semanticHash } from "../markdown/normalize.js";
 import type { JournalStore } from "../persistence/journal-store.js";
 import type { VaultWriter } from "../vault/writer.js";
 import { safeErrorFrom } from "./reconcile.js";
@@ -62,6 +64,16 @@ interface EffectResult {
   readonly local: { readonly byteHash: string; readonly semanticHash: string | null } | null;
   readonly remote: Extract<NotionObservation, { readonly kind: "present" }> | null;
   readonly bridgeId: string | null;
+}
+
+type PresentNotion = Extract<NotionObservation, { readonly kind: "present" }>;
+
+interface ExpectedRemotePostcondition {
+  readonly pageId: string | null;
+  readonly bridgeId: string;
+  readonly semantic: SemanticNote;
+  readonly semanticHash: string;
+  readonly managed: PresentNotion["managed"];
 }
 
 interface PairExecutionResult {
@@ -145,6 +157,76 @@ function managedMatches(
   );
 }
 
+function semanticMatches(left: SemanticNote, right: SemanticNote): boolean {
+  return (
+    left.bodyMarkdown === right.bodyMarkdown &&
+    left.tags.length === right.tags.length &&
+    left.tags.every((tag, index) => tag === right.tags[index])
+  );
+}
+
+function managedPostconditionMatches(
+  observed: PresentNotion["managed"],
+  expected: PresentNotion["managed"],
+): boolean {
+  return (
+    observed.title === expected.title &&
+    observed.obsidianPath === expected.obsidianPath &&
+    observed.status === expected.status
+  );
+}
+
+async function remotePostcondition(
+  pageId: string | null,
+  bridgeId: string,
+  semantic: SemanticNote,
+  managed: PresentNotion["managed"],
+): Promise<ExpectedRemotePostcondition> {
+  try {
+    const expectedSemantic: SemanticNote = {
+      bodyMarkdown: semantic.bodyMarkdown,
+      tags: [...semantic.tags],
+    };
+    return Object.freeze({
+      pageId,
+      bridgeId,
+      semantic: expectedSemantic,
+      semanticHash: await semanticHash(expectedSemantic),
+      managed: Object.freeze({ ...managed }),
+    });
+  } catch {
+    throw new ExecutorError(fixedError("invalid-response"));
+  }
+}
+
+async function requireRemotePostcondition(
+  observed: NotionObservation,
+  expected: ExpectedRemotePostcondition,
+): Promise<PresentNotion> {
+  try {
+    if (
+      observed.kind !== "present" ||
+      !UUID_PATTERN.test(observed.pageId) ||
+      observed.bridgeId !== expected.bridgeId ||
+      (expected.pageId !== null && observed.pageId !== expected.pageId) ||
+      !observed.complete ||
+      observed.unsupportedKinds.length !== 0 ||
+      !semanticMatches(observed.semantic, expected.semantic) ||
+      !managedPostconditionMatches(observed.managed, expected.managed)
+    ) {
+      throw new ExecutorError(fixedError("invalid-response"));
+    }
+    const observedHash = await semanticHash(observed.semantic);
+    if (observed.semanticHash !== observedHash || observed.semanticHash !== expected.semanticHash) {
+      throw new ExecutorError(fixedError("invalid-response"));
+    }
+    return observed;
+  } catch (caught) {
+    if (caught instanceof ExecutorError) throw caught;
+    throw new ExecutorError(fixedError("invalid-response"));
+  }
+}
+
 function effectIntent(
   effect: PlannedEffect,
   context: {
@@ -195,7 +277,7 @@ function completion(
   return parseJournalCompletion({
     schemaVersion: 1,
     resultByteHash: result.local?.byteHash ?? null,
-    resultSemanticHash: result.local?.semanticHash ?? null,
+    resultSemanticHash: result.remote?.semanticHash ?? result.local?.semanticHash ?? null,
     resultRemoteId: result.remote?.pageId ?? null,
     allocatedBridgeId: result.bridgeId,
     observedRemoteEditedAt: result.remote?.editedAt ?? null,
@@ -321,6 +403,7 @@ async function executeEffect(
   let expectedRemoteEditedAt: string | null = null;
   let allocationId: string | null = null;
   let bridgeId = allocatedBridgeId;
+  let expectedRemote: ExpectedRemotePostcondition | null = null;
 
   if (effect.kind === "initialize-pair") {
     if (effect.identity.kind !== "allocate-on-apply") throw new ExecutorError(fixedError("invalid-response"));
@@ -343,8 +426,13 @@ async function executeEffect(
   } else if (effect.kind === "create-notion-page") {
     if (input.local.kind !== "present") throw new ExecutorError(fixedError("invalid-response"));
     allocationId = effect.identity.kind === "allocate-on-apply" ? effect.identity.allocationId : null;
-    expectedSemanticHash = input.local.semanticHash;
-    resultSemanticHash = input.local.semanticHash;
+    expectedRemote = await remotePostcondition(
+      null,
+      resolvedBridgeId(effect.identity, bridgeId),
+      input.local.semantic,
+      { title: effect.title, obsidianPath: effect.obsidianPath, status: effect.status },
+    );
+    resultSemanticHash = expectedRemote.semanticHash;
   } else if (effect.kind === "write-local") {
     plannedLocal = {
       content: effect.nextBytes,
@@ -355,12 +443,42 @@ async function executeEffect(
     resultSemanticHash = plannedLocal.semanticHash;
   } else if (effect.kind === "create-conflict") {
     plannedLocal = { content: effect.content, byteHash: await sha256Hex(effect.content), semanticHash: "" };
-  } else if (input.notion.kind === "present") {
-    expectedSemanticHash = input.notion.semanticHash;
-    resultSemanticHash = effect.kind === "update-notion-body-exact" && input.local.kind === "present"
-      ? input.local.semanticHash
-      : input.notion.semanticHash;
+  } else if (effect.kind === "update-notion-body-exact") {
+    if (input.local.kind !== "present") throw new ExecutorError(fixedError("invalid-response"));
+    const remote = currentRemote(input, results);
+    expectedSemanticHash = remote.semanticHash;
     expectedRemoteEditedAt = expectedRevision(effect, input, results);
+    expectedRemote = await remotePostcondition(
+      effect.pageId,
+      resolvedBridgeId(plan.identity, bridgeId),
+      { bodyMarkdown: input.local.semantic.bodyMarkdown, tags: remote.semantic.tags },
+      remote.managed,
+    );
+    resultSemanticHash = expectedRemote.semanticHash;
+  } else if (effect.kind === "update-notion-properties") {
+    const remote = currentRemote(input, results);
+    if (!managedMatches(remote, effect.expected)) throw new ExecutorError(fixedError("revision-race"));
+    expectedSemanticHash = remote.semanticHash;
+    expectedRemoteEditedAt = expectedRevision(effect, input, results);
+    expectedRemote = await remotePostcondition(
+      effect.pageId,
+      resolvedBridgeId(plan.identity, bridgeId),
+      { bodyMarkdown: remote.semantic.bodyMarkdown, tags: [...effect.next.tags] },
+      effect.next,
+    );
+    resultSemanticHash = expectedRemote.semanticHash;
+  } else {
+    const remote = currentRemote(input, results);
+    if (remote.managed.status !== effect.expectedStatus) throw new ExecutorError(fixedError("revision-race"));
+    expectedSemanticHash = remote.semanticHash;
+    expectedRemoteEditedAt = expectedRevision(effect, input, results);
+    expectedRemote = await remotePostcondition(
+      effect.pageId,
+      resolvedBridgeId(plan.identity, bridgeId),
+      remote.semantic,
+      { ...remote.managed, status: effect.nextStatus },
+    );
+    resultSemanticHash = expectedRemote.semanticHash;
   }
 
   const intent = effectIntent(effect, {
@@ -386,6 +504,7 @@ async function executeEffect(
     if (written.byteHash !== plannedLocal.byteHash) throw new ExecutorError(fixedError("revision-race"));
     result = { local: { byteHash: written.byteHash, semanticHash: plannedLocal.semanticHash }, remote: null, bridgeId };
   } else if (effect.kind === "create-notion-page") {
+    if (expectedRemote === null) throw new ExecutorError(fixedError("internal-error"));
     const observed = await dependencies.notion.createNotePage({
       parentPageId: dependencies.notionConfig.parentPageId,
       dataSourceId: dependencies.notionConfig.dataSourceId,
@@ -395,18 +514,18 @@ async function executeEffect(
       tags: effect.tags,
       markdown: effect.markdown,
     });
-    if (observed.kind !== "present") throw new ExecutorError(fixedError("invalid-response"));
-    result = { local: null, remote: observed, bridgeId };
+    result = { local: null, remote: await requireRemotePostcondition(observed, expectedRemote), bridgeId };
   } else if (effect.kind === "update-notion-body-exact") {
+    if (expectedRemote === null) throw new ExecutorError(fixedError("internal-error"));
     const observed = await dependencies.notion.updateBodyExact({
       pageId: effect.pageId,
       oldMarkdown: effect.oldMarkdown,
       newMarkdown: effect.newMarkdown,
       observedEditedAt: expectedRevision(effect, input, results),
     });
-    if (observed.kind !== "present") throw new ExecutorError(fixedError("invalid-response"));
-    result = { local: null, remote: observed, bridgeId };
+    result = { local: null, remote: await requireRemotePostcondition(observed, expectedRemote), bridgeId };
   } else if (effect.kind === "update-notion-properties") {
+    if (expectedRemote === null) throw new ExecutorError(fixedError("internal-error"));
     const remote = currentRemote(input, results);
     if (!managedMatches(remote, effect.expected)) throw new ExecutorError(fixedError("revision-race"));
     const observed = await dependencies.notion.updateManagedProperties({
@@ -417,9 +536,9 @@ async function executeEffect(
       status: effect.next.status,
       observedEditedAt: expectedRevision(effect, input, results),
     });
-    if (observed.kind !== "present") throw new ExecutorError(fixedError("invalid-response"));
-    result = { local: null, remote: observed, bridgeId };
+    result = { local: null, remote: await requireRemotePostcondition(observed, expectedRemote), bridgeId };
   } else if (effect.kind === "set-notion-status") {
+    if (expectedRemote === null) throw new ExecutorError(fixedError("internal-error"));
     const remote = currentRemote(input, results);
     if (remote.managed.status !== effect.expectedStatus) throw new ExecutorError(fixedError("revision-race"));
     const observed = await dependencies.notion.updateManagedProperties({
@@ -430,8 +549,7 @@ async function executeEffect(
       status: effect.nextStatus,
       observedEditedAt: expectedRevision(effect, input, results),
     });
-    if (observed.kind !== "present") throw new ExecutorError(fixedError("invalid-response"));
-    result = { local: null, remote: observed, bridgeId };
+    result = { local: null, remote: await requireRemotePostcondition(observed, expectedRemote), bridgeId };
   } else if (effect.kind === "write-local") {
     if (plannedLocal === null) throw new ExecutorError(fixedError("internal-error"));
     const written = await dependencies.writer.write({

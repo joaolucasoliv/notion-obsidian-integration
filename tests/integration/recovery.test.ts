@@ -9,11 +9,50 @@ describe("recovery and journal order", () => {
 
     await harness.apply();
 
-    expect(harness.journal.begun.map((entry) => entry.effectKind)).toEqual(["initialize-pair", "create-notion-page"]);
-    expect(harness.journal.completed.map((entry) => entry.id)).toEqual(harness.journal.begun.map((entry) => entry.id));
-    expect(harness.journal.begun[0]?.allocationId).toMatch(/^[0-9a-f]{64}$/u);
-    expect(harness.journal.begun[1]?.allocationId).toBe(harness.journal.begun[0]?.allocationId);
+    expect(harness.journal.begun.map((entry) => entry.effectKind)).toEqual(["commit-state", "initialize-pair", "create-notion-page"]);
+    expect(harness.journal.begun[0]).toMatchObject({
+      relativePath: null,
+      remoteId: null,
+      allocationId: null,
+      expectedByteHash: null,
+      expectedSemanticHash: null,
+      resultByteHash: null,
+      resultSemanticHash: null,
+      expectedRemoteEditedAt: null,
+    });
+    expect(harness.journal.completed.map((entry) => entry.id)).toEqual([
+      harness.journal.begun[1]?.id,
+      harness.journal.begun[2]?.id,
+      harness.journal.begun[0]?.id,
+    ]);
+    expect(harness.journal.begun[1]?.allocationId).toMatch(/^[0-9a-f]{64}$/u);
+    expect(harness.journal.begun[2]?.allocationId).toBe(harness.journal.begun[1]?.allocationId);
     expect(JSON.stringify(harness.journal.begun)).not.toContain("journal\\n");
+  });
+
+  it("does not create a second remote page after state persistence fails", async () => {
+    const harness = await BridgeHarness.create({ stateSaveFailures: 1 });
+    await harness.writeNote("DurableState.md", optedIn("durable\n"));
+
+    const first = await harness.apply();
+
+    expect(first).toMatchObject({ outcome: "failed", errors: 1 });
+    expect(Object.keys(harness.state.value.pairs)).toEqual([]);
+    expect(harness.notion.creates).toBe(1);
+    const stateFence = harness.journal.begun.find((entry) => entry.effectKind === "commit-state");
+    expect(stateFence).toMatchObject({
+      relativePath: null,
+      remoteId: null,
+      allocationId: null,
+      expectedByteHash: null,
+      resultSemanticHash: null,
+    });
+    expect(harness.journal.completed.some((entry) => entry.id === stateFence?.id)).toBe(false);
+
+    const second = await harness.apply();
+
+    expect(second).toMatchObject({ outcome: "recovery-required", writes: 0, errors: 0 });
+    expect(harness.notion.creates).toBe(1);
   });
 
   it("completes a retryable local precondition and replans instead of replaying its stale intent", async () => {
@@ -131,7 +170,7 @@ describe("recovery and journal order", () => {
     const result = await harness.apply();
 
     expect(result).toMatchObject({ outcome: "success", pulled: 1, errors: 0 });
-    expect(harness.journal.completed.at(-2)?.id).toBe("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee");
+    expect(harness.journal.completed.some((entry) => entry.id === "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee")).toBe(true);
     expect(harness.notion.bodyUpdates).toBe(beforeBodyUpdates);
     await expect(harness.note(pair.localPath)).resolves.toContain("remote post");
   });
