@@ -185,4 +185,29 @@ describe("AtomicVaultWriter", () => {
     ).rejects.toThrow(/vault writer failed/i);
     await expect(readFile(join(createOutside, "new.md"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
   });
+
+  it("rejects a regular victim swapped after the final baseline read without overwriting it", async () => {
+    const vault = await temporaryVault();
+    const target = join(vault, "Notes", "Bridge.md");
+    const victim = join(vault, "victim.md");
+    await mkdir(join(vault, "Notes"), { recursive: true });
+    await writeFile(target, "old", "utf8");
+    await writeFile(victim, "regular victim", "utf8");
+    const root = await canonicalVaultRoot(vault, INSTALLATION_ID, { mode: "bootstrap" });
+    const writer = new AtomicVaultWriter(root, {
+      beforeFinalWriteTargetCheck: async ({ targetPath }) => {
+        await rename(targetPath, `${targetPath}.saved`);
+        await rename(victim, targetPath);
+      },
+    });
+
+    await expect(
+      writer.write({
+        relativePath: "Notes/Bridge.md",
+        expectedByteHash: await sha256Hex("old"),
+        content: "new",
+      }),
+    ).rejects.toThrow(/vault writer failed/i);
+    expect(await readFile(target, "utf8")).toBe("regular victim");
+  });
 });

@@ -168,7 +168,7 @@ describe("FileJournalStore", () => {
     }
   });
 
-  it("caps all persisted journal records at 1,024", async () => {
+  it("caps journal operation IDs at 1,024", async () => {
     const directory = await temporaryDirectory();
     const journal = await privateJournal(directory);
     for (let index = 0; index < 1_025; index += 1) {
@@ -178,6 +178,34 @@ describe("FileJournalStore", () => {
     const store = new FileJournalStore(journal, INSTALLATION_ID);
 
     await expect(store.incomplete()).rejects.toThrow(/journal store failed/i);
+  });
+
+  it("serializes 1,023 plus two concurrent distinct begins, permits completion at 1,024, and rejects an extra begin", async () => {
+    const directory = await temporaryDirectory();
+    const journal = await privateJournal(directory);
+    for (let index = 0; index < 1_023; index += 1) {
+      const id = randomUUID();
+      await putPrivateJson(join(journal, `intent-${id}.json`), intent(id));
+    }
+    const stores = [
+      new FileJournalStore(journal, INSTALLATION_ID),
+      new FileJournalStore(journal, INSTALLATION_ID),
+    ] as const;
+    const contenders = [randomUUID(), randomUUID()] as const;
+    const settled = await Promise.allSettled(contenders.map((id, index) => stores[index].begin(intent(id))));
+
+    expect(settled.filter((entry) => entry.status === "fulfilled")).toHaveLength(1);
+    expect(settled.filter((entry) => entry.status === "rejected")).toHaveLength(1);
+
+    const completedId = contenders.find((_, index) => settled[index]?.status === "fulfilled");
+    if (completedId === undefined) {
+      throw new Error("expected one concurrent begin to succeed");
+    }
+    await expect(stores[0].complete(completedId, completion())).resolves.toBeUndefined();
+    await expect(stores[1].begin(intent(randomUUID()))).rejects.toThrow(/journal store failed/i);
+    expect(await readdir(journal)).toHaveLength(1_025);
+    expect((await stores[0].incomplete()).map((row) => row.id)).not.toContain(completedId);
+    expect(await stores[1].incomplete()).toHaveLength(1_023);
   });
 
   it("does not persist an attempted note-body field or reflect its canary", async () => {

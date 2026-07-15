@@ -27,6 +27,7 @@ export interface VaultWriter {
 /** Narrow test-only synchronization hooks; no runtime configuration consumes these. */
 export interface AtomicVaultWriterTestHooks {
   readonly beforeWriteRename?: (paths: Readonly<{ targetPath: string; temporaryPath: string }>) => Promise<void>;
+  readonly beforeFinalWriteTargetCheck?: (paths: Readonly<{ targetPath: string; temporaryPath: string }>) => Promise<void>;
   readonly beforeCreateFinalize?: (
     paths: Readonly<{ parentPath: string; targetPath: string; temporaryPath: string }>,
   ) => Promise<void>;
@@ -144,9 +145,16 @@ export class AtomicVaultWriter implements VaultWriter {
       ) {
         throw vaultWriterError();
       }
+      await this.testHooks.beforeFinalWriteTargetCheck?.({
+        targetPath: baseline.targetPath,
+        temporaryPath: temporary.path,
+      });
       await this.assertOwnedTemporary(temporary);
-      await this.assertExistingTarget(segments);
-      await rename(temporary.path, baseline.targetPath);
+      const finalTarget = await this.assertExistingTarget(segments);
+      if (!sameIdentity(baseline.identity, finalTarget.identity)) {
+        throw vaultWriterError();
+      }
+      await rename(temporary.path, finalTarget.targetPath);
       temporary = undefined;
       await this.syncDirectory(baseline.parentPath);
 
