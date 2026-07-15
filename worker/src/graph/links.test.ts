@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
+  commentClosingInsideMarkdownLinkLabelFixtureMarkdown,
+  commentOpeningInsideMarkdownLinkLabelFixtureMarkdown,
   graphVaultFixture,
   markdownContextCommentFixtureMarkdown,
   obsidianCommentFixtureMarkdown,
@@ -40,6 +42,18 @@ describe("extractGraphLinks", () => {
       { kind: "wikilink", target: "CommentVisible" },
       { kind: "wikilink", target: "FenceVisible" },
       { kind: "wikilink", target: "InlineVisible" },
+    ]);
+  });
+
+  it("does not admit a Markdown destination when its label opens an Obsidian comment", () => {
+    expect(extractGraphLinks(commentOpeningInsideMarkdownLinkLabelFixtureMarkdown())).toEqual([
+      { kind: "wikilink", target: "Visible" },
+    ]);
+  });
+
+  it("conservatively rejects a Markdown destination when its label closes an Obsidian comment", () => {
+    expect(extractGraphLinks(commentClosingInsideMarkdownLinkLabelFixtureMarkdown())).toEqual([
+      { kind: "wikilink", target: "Visible" },
     ]);
   });
 

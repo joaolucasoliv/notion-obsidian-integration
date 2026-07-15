@@ -73,15 +73,18 @@ function localWikiTarget(target: string): string | null {
 interface CommentMask {
   readonly source: string;
   readonly inComment: boolean;
+  readonly delimiterCount: number;
 }
 
 function maskObsidianComments(markdown: string, initiallyInComment: boolean): CommentMask {
   let output = "";
   let inComment = initiallyInComment;
+  let delimiterCount = 0;
   for (let index = 0; index < markdown.length;) {
     if (markdown.startsWith("%%", index)) {
       output += "  ";
       inComment = !inComment;
+      delimiterCount += 1;
       index += 2;
       continue;
     }
@@ -89,7 +92,7 @@ function maskObsidianComments(markdown: string, initiallyInComment: boolean): Co
     output += inComment && character !== "\r" && character !== "\n" ? " " : character;
     index += 1;
   }
-  return { source: output, inComment };
+  return { source: output, inComment, delimiterCount };
 }
 
 function sourceRange(documentSource: string, node: Nodes): string | null {
@@ -117,19 +120,35 @@ export function extractGraphLinks(markdown: string): GraphLink[] {
   const document = parseMarkdown(bodyWithoutFrontmatter(markdown));
   const links = new Map<string, GraphLink>();
   let inObsidianComment = false;
+  let commentDelimiterCount = 0;
   const add = (link: GraphLink): void => {
     links.set(`${link.kind}\0${link.target}`, link);
   };
   const visit = (node: Nodes, insideMarkdownLink: boolean): void => {
-    if (node.type === "link" && !inObsidianComment) {
-      const target = localMarkdownTarget(node.url);
-      if (target !== null) add({ kind: "markdown-link", target });
+    if (node.type === "link") {
+      const startedInObsidianComment = inObsidianComment;
+      const delimiterCountAtStart = commentDelimiterCount;
+      if ("children" in node && Array.isArray(node.children)) {
+        for (const child of node.children as Nodes[]) {
+          visit(child, true);
+        }
+      }
+      if (
+        !startedInObsidianComment &&
+        !inObsidianComment &&
+        commentDelimiterCount === delimiterCountAtStart
+      ) {
+        const target = localMarkdownTarget(node.url);
+        if (target !== null) add({ kind: "markdown-link", target });
+      }
+      return;
     }
     if (node.type === "text") {
       const source = sourceRange(document.source, node);
       if (source !== null) {
         const masked = maskObsidianComments(source, inObsidianComment);
         inObsidianComment = masked.inComment;
+        commentDelimiterCount += masked.delimiterCount;
         if (!insideMarkdownLink) {
           const scan = scanObsidianText(masked.source);
           for (const construct of scan.constructs) {
@@ -142,7 +161,7 @@ export function extractGraphLinks(markdown: string): GraphLink[] {
     }
     if ("children" in node && Array.isArray(node.children)) {
       for (const child of node.children as Nodes[]) {
-        visit(child, insideMarkdownLink || node.type === "link");
+        visit(child, insideMarkdownLink);
       }
     }
   };

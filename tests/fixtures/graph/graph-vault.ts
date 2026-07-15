@@ -117,6 +117,14 @@ export function markdownContextCommentFixtureMarkdown(): string {
   return "`%%`\n[[InlineVisible]]\n\n```md\n%%\n```\n[[FenceVisible]]\n\n%% [[Hidden]] %%\n[[CommentVisible]]\n";
 }
 
+export function commentOpeningInsideMarkdownLinkLabelFixtureMarkdown(): string {
+  return "[%% hidden](Secret.md)\n%%\n[[Visible]]\n";
+}
+
+export function commentClosingInsideMarkdownLinkLabelFixtureMarkdown(): string {
+  return "%%\n[hidden %%](Secret.md)\n[[Visible]]\n";
+}
+
 export function rawDelimiterFixture(): SyntheticGraphSourceNote[] {
   return [
     note("Encoded.md", [], "[[Secret%23hidden]]\n[[Secret%3Fquery]]\n"),
