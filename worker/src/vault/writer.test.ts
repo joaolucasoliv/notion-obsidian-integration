@@ -210,4 +210,32 @@ describe("AtomicVaultWriter", () => {
     ).rejects.toThrow(/vault writer failed/i);
     expect(await readFile(target, "utf8")).toBe("regular victim");
   });
+
+  it("rejects a same-inode mutation after the final writer hook without overwriting it", async () => {
+    const vault = await temporaryVault();
+    const target = join(vault, "Notes", "Bridge.md");
+    await mkdir(join(vault, "Notes"), { recursive: true });
+    await writeFile(target, "old", "utf8");
+    const originalIdentity = await lstat(target);
+    const root = await canonicalVaultRoot(vault, INSTALLATION_ID, { mode: "bootstrap" });
+    const writer = new AtomicVaultWriter(root, {
+      beforeFinalWriteTargetCheck: async ({ targetPath }) => {
+        await writeFile(targetPath, "attacker mutation", "utf8");
+      },
+    });
+
+    await expect(
+      writer.write({
+        relativePath: "Notes/Bridge.md",
+        expectedByteHash: await sha256Hex("old"),
+        content: "new",
+      }),
+    ).rejects.toThrow(/vault writer failed/i);
+    expect(await readFile(target, "utf8")).toBe("attacker mutation");
+    const observedIdentity = await lstat(target);
+    expect({ dev: observedIdentity.dev, ino: observedIdentity.ino }).toEqual({
+      dev: originalIdentity.dev,
+      ino: originalIdentity.ino,
+    });
+  });
 });

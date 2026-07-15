@@ -180,7 +180,7 @@ describe("FileJournalStore", () => {
     await expect(store.incomplete()).rejects.toThrow(/journal store failed/i);
   });
 
-  it("serializes 1,023 plus two concurrent distinct begins, permits completion at 1,024, and rejects an extra begin", async () => {
+  it("serializes trailing-slash journal paths at 1,023, permits completion at 1,024, and rejects an extra begin", async () => {
     const directory = await temporaryDirectory();
     const journal = await privateJournal(directory);
     for (let index = 0; index < 1_023; index += 1) {
@@ -189,7 +189,7 @@ describe("FileJournalStore", () => {
     }
     const stores = [
       new FileJournalStore(journal, INSTALLATION_ID),
-      new FileJournalStore(journal, INSTALLATION_ID),
+      new FileJournalStore(`${journal}/`, INSTALLATION_ID),
     ] as const;
     const contenders = [randomUUID(), randomUUID()] as const;
     const settled = await Promise.allSettled(contenders.map((id, index) => stores[index].begin(intent(id))));

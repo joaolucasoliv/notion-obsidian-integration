@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { chmod, link, lstat, mkdir, open, readdir, unlink } from "node:fs/promises";
-import { isAbsolute, join, normalize } from "node:path";
+import { isAbsolute, join, normalize, resolve } from "node:path";
 import {
   parseJournalCompletion,
   parseJournalIntent,
@@ -54,6 +54,16 @@ function assertJournalDirectorySyntax(journalDir: string): void {
   if (!isAbsolute(journalDir) || journalDir.includes("\0") || normalize(journalDir) !== journalDir) {
     throw journalStoreError();
   }
+}
+
+function normalizedJournalQueueKey(journalDir: string): string {
+  assertJournalDirectorySyntax(journalDir);
+  // `resolve` is lexical only: it removes a trailing separator without following symlinks.
+  const queueKey = resolve(journalDir);
+  if (!isAbsolute(queueKey) || queueKey.includes("\0") || normalize(queueKey) !== queueKey) {
+    throw journalStoreError();
+  }
+  return queueKey;
 }
 
 function intentFilename(id: string): string {
@@ -112,13 +122,14 @@ export class FileJournalStore implements JournalStore {
    * so Task 8's outer runtime lock must cover journal mutations when workers are shared.
    */
   private static readonly mutationTails = new Map<string, Promise<void>>();
+  private readonly journalQueueKey: string;
 
   public constructor(
     private readonly journalDir: string,
     private readonly installationId: string,
   ) {
     try {
-      assertJournalDirectorySyntax(journalDir);
+      this.journalQueueKey = normalizedJournalQueueKey(journalDir);
       assertValidInstallationId(installationId);
     } catch {
       throw journalStoreError();
@@ -269,19 +280,19 @@ export class FileJournalStore implements JournalStore {
   }
 
   private async serializeMutation<T>(mutation: () => Promise<T>): Promise<T> {
-    const previous = FileJournalStore.mutationTails.get(this.journalDir) ?? Promise.resolve();
+    const previous = FileJournalStore.mutationTails.get(this.journalQueueKey) ?? Promise.resolve();
     let release!: () => void;
     const current = new Promise<void>((resolve) => {
       release = resolve;
     });
-    FileJournalStore.mutationTails.set(this.journalDir, current);
+    FileJournalStore.mutationTails.set(this.journalQueueKey, current);
     try {
       await previous;
       return await mutation();
     } finally {
       release();
-      if (FileJournalStore.mutationTails.get(this.journalDir) === current) {
-        FileJournalStore.mutationTails.delete(this.journalDir);
+      if (FileJournalStore.mutationTails.get(this.journalQueueKey) === current) {
+        FileJournalStore.mutationTails.delete(this.journalQueueKey);
       }
     }
   }

@@ -150,11 +150,14 @@ export class AtomicVaultWriter implements VaultWriter {
         temporaryPath: temporary.path,
       });
       await this.assertOwnedTemporary(temporary);
-      const finalTarget = await this.assertExistingTarget(segments);
-      if (!sameIdentity(baseline.identity, finalTarget.identity)) {
+      const finalBaseline = await this.readExisting(segments);
+      if (
+        finalBaseline.byteHash !== input.expectedByteHash ||
+        !sameIdentity(baseline.identity, finalBaseline.identity)
+      ) {
         throw vaultWriterError();
       }
-      await rename(temporary.path, finalTarget.targetPath);
+      await rename(temporary.path, finalBaseline.targetPath);
       temporary = undefined;
       await this.syncDirectory(baseline.parentPath);
 
