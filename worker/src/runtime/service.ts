@@ -46,6 +46,11 @@ export interface ServiceStatus {
   readonly enabled: boolean;
 }
 
+/** A bounded, read-only status result for plugin controls. */
+export interface ServiceReadStatus extends ServiceStatus {
+  readonly configured: boolean;
+}
+
 function serviceError(): Error {
   return new Error("Unsafe service path");
 }
@@ -162,7 +167,7 @@ async function assertSafeDirectory(directoryPath: string): Promise<void> {
   }
 }
 
-async function assertSafeRegularFile(filePath: string, requirePrivateMode: boolean): Promise<void> {
+async function safeRegularFileState(filePath: string, requirePrivateMode: boolean): Promise<"present" | "missing"> {
   try {
     await assertCanonicalRuntimePath(filePath);
     const entry = await lstat(filePath);
@@ -173,7 +178,15 @@ async function assertSafeRegularFile(filePath: string, requirePrivateMode: boole
     ) {
       throw serviceError();
     }
-  } catch {
+    return "present";
+  } catch (caught) {
+    if ((caught as NodeJS.ErrnoException).code === "ENOENT") return "missing";
+    throw serviceError();
+  }
+}
+
+async function assertSafeRegularFile(filePath: string, requirePrivateMode: boolean): Promise<void> {
+  if ((await safeRegularFileState(filePath, requirePrivateMode)) !== "present") {
     throw serviceError();
   }
 }
@@ -294,6 +307,36 @@ export function renderLaunchAgentPlist(input: unknown): string {
     "<key>StandardErrorPath</key><string>/dev/null</string>",
     "</dict></plist>",
   ].join("");
+}
+
+/**
+ * Reads the local service state without creating files or invoking a mutating
+ * launchctl operation. Missing local worker assets are reported only as an
+ * unconfigured state; malformed or unsafe paths still fail closed.
+ */
+export async function readServiceStatus(input: InstallServiceInput): Promise<ServiceReadStatus> {
+  const launch = validatedLaunchAgentInput(input);
+  const location = validateLocation(input);
+  if (launch.installationId !== location.installationId) {
+    throw serviceError();
+  }
+  await assertSafeDirectory(location.homeDirectory);
+  const assets = await Promise.all([
+    safeRegularFileState(launch.nodePath, false),
+    safeRegularFileState(launch.workerPath, false),
+    safeRegularFileState(launch.configPath, true),
+  ]);
+  if (assets.some((asset) => asset !== "present")) {
+    return Object.freeze({ label: location.label, plistPath: location.plistPath, configured: false, enabled: false });
+  }
+  const printed = await runLaunchctl(location.runner, ["print", `gui/${location.uid}/${location.label}`]);
+  if (printed.code === 0) {
+    return Object.freeze({ label: location.label, plistPath: location.plistPath, configured: true, enabled: true });
+  }
+  if (printed.code === LAUNCHCTL_SERVICE_ABSENT_EXIT_CODE) {
+    return Object.freeze({ label: location.label, plistPath: location.plistPath, configured: true, enabled: false });
+  }
+  throw serviceCommandError();
 }
 
 /** Installs and verifies one per-user LaunchAgent through an injected, argv-only launchctl boundary. */

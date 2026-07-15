@@ -113,7 +113,7 @@ export class MemoryJournal implements JournalStore {
 class MemoryCredentials implements CredentialStore {
   public getCalls = 0;
 
-  public constructor(private readonly token: string | null = "ntn_synthetic_token") {}
+  public constructor(private readonly token: string | null = "local-test-token") {}
 
   public async get(): Promise<string | null> {
     this.getCalls += 1;

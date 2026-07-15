@@ -14,11 +14,14 @@ import { assertCanonicalRuntimePath, assertValidInstallationId } from "../runtim
 const PRIVATE_DIRECTORY_MODE = 0o700;
 const PRIVATE_FILE_MODE = 0o600;
 const MAX_JOURNAL_OPERATION_IDS = 1_024;
-const MAX_JOURNAL_AUDIT_ROWS = MAX_JOURNAL_OPERATION_IDS * 2;
+// One retirement marker may coexist with the previous maximum of intent and
+// completion rows while an interrupted rotation is being recovered.
+const MAX_JOURNAL_AUDIT_ROWS = MAX_JOURNAL_OPERATION_IDS * 2 + 1;
 const MAX_JOURNAL_JSON_BYTES = 64 * 1_024;
 const JOURNAL_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const INTENT_FILE_PATTERN = /^intent-([0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.json$/;
 const COMPLETION_FILE_PATTERN = /^completion-([0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.json$/;
+const RETIREMENT_FILE_PATTERN = /^retirement-([0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.json$/;
 
 export interface JournalStore {
   begin(intent: JournalIntentV1): Promise<void>;
@@ -26,10 +29,17 @@ export interface JournalStore {
   incomplete(): Promise<readonly JournalIntentV1[]>;
 }
 
-/** Narrow test-only synchronization seam; no runtime configuration consumes this. */
+/** Narrow test-only durability and rotation seams; no runtime configuration consumes them. */
 export interface FileJournalStoreTestHooks {
   readonly syncDirectory?: (directoryPath: string, sync: () => Promise<void>) => Promise<void>;
+  readonly syncFile?: (filePath: string, sync: () => Promise<void>) => Promise<void>;
+  readonly rotationThreshold?: number;
+  readonly cacheSnapshots?: boolean;
+  readonly beforeCompactionPhase?: (phase: JournalCompactionPhase) => Promise<void>;
 }
+
+/** Narrow test-only interruption seam after each durable compaction phase. */
+export type JournalCompactionPhase = "retirement-written" | "intent-removed" | "completion-removed" | "retirement-removed";
 
 interface FileIdentity {
   readonly dev: number;
@@ -37,8 +47,15 @@ interface FileIdentity {
 }
 
 interface JournalSnapshot {
-  readonly intents: ReadonlyMap<string, JournalIntentV1>;
-  readonly completions: ReadonlySet<string>;
+  readonly intents: Map<string, JournalIntentV1>;
+  readonly completions: Set<string>;
+  readonly retirements: Map<string, JournalRetirement>;
+}
+
+interface JournalRetirement {
+  readonly id: string;
+  readonly intent: JournalIntentV1;
+  readonly completion: JournalCompletionV1;
 }
 
 function journalStoreError(): Error {
@@ -81,6 +98,11 @@ function completionFilename(id: string): string {
   return `completion-${id}.json`;
 }
 
+function retirementFilename(id: string): string {
+  assertJournalId(id);
+  return `retirement-${id}.json`;
+}
+
 function exactIntentSnapshot(intent: JournalIntentV1): Record<string, unknown> {
   const value = Object.create(null) as Record<string, unknown>;
   value.schemaVersion = intent.schemaVersion;
@@ -111,6 +133,45 @@ function exactCompletionSnapshot(completion: JournalCompletionV1): Record<string
   return value;
 }
 
+function exactRetirementSnapshot(retirement: JournalRetirement): Record<string, unknown> {
+  const value = Object.create(null) as Record<string, unknown>;
+  value.schemaVersion = 1;
+  value.id = retirement.id;
+  value.intent = exactIntentSnapshot(retirement.intent);
+  value.completion = exactCompletionSnapshot(retirement.completion);
+  return value;
+}
+
+function sameIntent(left: JournalIntentV1, right: JournalIntentV1): boolean {
+  return JSON.stringify(exactIntentSnapshot(left)) === JSON.stringify(exactIntentSnapshot(right));
+}
+
+function sameCompletion(left: JournalCompletionV1, right: JournalCompletionV1): boolean {
+  return JSON.stringify(exactCompletionSnapshot(left)) === JSON.stringify(exactCompletionSnapshot(right));
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function hasExactKeys(value: Record<string, unknown>, expected: readonly string[]): boolean {
+  const actual = Object.keys(value).sort();
+  const sortedExpected = [...expected].sort();
+  return actual.length === sortedExpected.length && actual.every((key, index) => key === sortedExpected[index]);
+}
+
+function parseRetirement(value: unknown): JournalRetirement {
+  if (!isRecord(value) || !hasExactKeys(value, ["schemaVersion", "id", "intent", "completion"])) {
+    throw journalStoreError();
+  }
+  if (value.schemaVersion !== 1 || typeof value.id !== "string") throw journalStoreError();
+  assertJournalId(value.id);
+  const intent = parseJournalIntent(value.intent);
+  const completion = parseJournalCompletion(value.completion);
+  if (intent.id !== value.id) throw journalStoreError();
+  return Object.freeze({ id: value.id, intent, completion });
+}
+
 function serializeRecord(value: Record<string, unknown>): string {
   const serialized = JSON.stringify(value);
   if (serialized === undefined || Buffer.byteLength(serialized, "utf8") > MAX_JOURNAL_JSON_BYTES) {
@@ -128,6 +189,7 @@ export class FileJournalStore implements JournalStore {
    */
   private static readonly mutationTails = new Map<string, Promise<void>>();
   private readonly journalQueueKey: string;
+  private cachedSnapshot: JournalSnapshot | null = null;
 
   public constructor(
     private readonly journalDir: string,
@@ -147,13 +209,23 @@ export class FileJournalStore implements JournalStore {
       const parsed = parseJournalIntent(intent);
       this.assertBoundIntent(parsed);
       await this.serializeMutation(async () => {
-        const snapshot = await this.readSnapshot();
-        if (snapshot.intents.size >= MAX_JOURNAL_OPERATION_IDS || snapshot.intents.has(parsed.id)) {
+        await this.recoverRetirements();
+        let snapshot = await this.readSnapshot();
+        const outstanding = [...snapshot.intents.values()].filter((entry) => !snapshot.completions.has(entry.id));
+        if (outstanding.length >= MAX_JOURNAL_OPERATION_IDS || snapshot.intents.has(parsed.id) || snapshot.retirements.has(parsed.id)) {
           throw journalStoreError();
         }
+        if (snapshot.intents.size >= this.rotationThreshold() && snapshot.completions.size > 0) {
+          await this.compactOneCompleted(snapshot);
+          snapshot = await this.readSnapshot();
+          if (snapshot.intents.size >= MAX_JOURNAL_OPERATION_IDS) throw journalStoreError();
+        }
         await this.writeExclusive(intentFilename(parsed.id), serializeRecord(exactIntentSnapshot(parsed)));
+        snapshot.intents.set(parsed.id, parsed);
+        this.rememberSnapshot(snapshot);
       });
     } catch {
+      this.clearCachedSnapshot();
       throw journalStoreError();
     }
   }
@@ -163,13 +235,17 @@ export class FileJournalStore implements JournalStore {
       assertJournalId(id);
       const parsed = parseJournalCompletion(evidence);
       await this.serializeMutation(async () => {
+        await this.recoverRetirements();
         const snapshot = await this.readSnapshot();
         if (!snapshot.intents.has(id) || snapshot.completions.has(id)) {
           throw journalStoreError();
         }
         await this.writeExclusive(completionFilename(id), serializeRecord(exactCompletionSnapshot(parsed)));
+        snapshot.completions.add(id);
+        this.rememberSnapshot(snapshot);
       });
     } catch {
+      this.clearCachedSnapshot();
       throw journalStoreError();
     }
   }
@@ -268,8 +344,9 @@ export class FileJournalStore implements JournalStore {
   }
 
   private async readSnapshot(): Promise<JournalSnapshot> {
+    if (this.testHooks.cacheSnapshots && this.cachedSnapshot !== null) return this.cachedSnapshot;
     if (!(await this.journalDirectoryExists())) {
-      return { intents: new Map(), completions: new Set() };
+      return this.rememberSnapshot({ intents: new Map(), completions: new Set(), retirements: new Map() });
     }
 
     const entries = await readdir(this.journalDir, { withFileTypes: true });
@@ -279,11 +356,13 @@ export class FileJournalStore implements JournalStore {
     entries.sort((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0));
 
     const intents = new Map<string, JournalIntentV1>();
-    const completions = new Set<string>();
+    const completions = new Map<string, JournalCompletionV1>();
+    const retirements = new Map<string, JournalRetirement>();
     for (const entry of entries) {
       const intentMatch = INTENT_FILE_PATTERN.exec(entry.name);
       const completionMatch = COMPLETION_FILE_PATTERN.exec(entry.name);
-      if ((intentMatch === null && completionMatch === null) || entry.isSymbolicLink() || !entry.isFile()) {
+      const retirementMatch = RETIREMENT_FILE_PATTERN.exec(entry.name);
+      if ((intentMatch === null && completionMatch === null && retirementMatch === null) || entry.isSymbolicLink() || !entry.isFile()) {
         throw journalStoreError();
       }
 
@@ -298,15 +377,35 @@ export class FileJournalStore implements JournalStore {
         continue;
       }
 
-      const id = completionMatch?.[1];
-      if (id === undefined || completions.has(id)) {
-        throw journalStoreError();
+      if (completionMatch !== null) {
+        const id = completionMatch[1] as string;
+        if (completions.has(id)) throw journalStoreError();
+        completions.set(id, await this.readCompletionFile(filePath));
+        continue;
       }
-      await this.readCompletionFile(filePath);
-      completions.add(id);
+
+      const id = retirementMatch?.[1];
+      if (id === undefined || retirements.has(id)) throw journalStoreError();
+      const parsed = await this.readRetirementFile(filePath, id);
+      this.assertBoundIntent(parsed.intent);
+      retirements.set(id, parsed);
     }
 
-    for (const id of completions) {
+    if (retirements.size > 1) throw journalStoreError();
+    for (const retirement of retirements.values()) {
+      const rowIntent = intents.get(retirement.id);
+      const rowCompletion = completions.get(retirement.id);
+      if (rowIntent !== undefined && !sameIntent(rowIntent, retirement.intent)) throw journalStoreError();
+      if (rowCompletion !== undefined && !sameCompletion(rowCompletion, retirement.completion)) throw journalStoreError();
+      // Marker -> intent removal -> completion removal is the only durable
+      // sequence. A marker paired with an intent but no completion cannot be
+      // produced by that sequence, so recovery must fail closed.
+      if (rowIntent !== undefined && rowCompletion === undefined) throw journalStoreError();
+      intents.delete(retirement.id);
+      completions.delete(retirement.id);
+    }
+
+    for (const id of completions.keys()) {
       if (!intents.has(id)) {
         throw journalStoreError();
       }
@@ -314,7 +413,65 @@ export class FileJournalStore implements JournalStore {
     if (intents.size > MAX_JOURNAL_OPERATION_IDS) {
       throw journalStoreError();
     }
-    return { intents, completions };
+    return this.rememberSnapshot({ intents, completions: new Set(completions.keys()), retirements });
+  }
+
+  private async recoverRetirements(): Promise<void> {
+    const snapshot = await this.readSnapshot();
+    for (const retirement of snapshot.retirements.values()) {
+      await this.finishRetirement(retirement, false);
+      snapshot.retirements.delete(retirement.id);
+    }
+    this.rememberSnapshot(snapshot);
+  }
+
+  private async compactOneCompleted(snapshot: JournalSnapshot): Promise<void> {
+    if (snapshot.retirements.size !== 0) throw journalStoreError();
+    const id = [...snapshot.completions].sort()[0];
+    if (id === undefined) throw journalStoreError();
+    const intent = snapshot.intents.get(id);
+    if (intent === undefined) throw journalStoreError();
+    const retirement = Object.freeze({
+      id,
+      intent,
+      completion: await this.readCompletionFile(join(this.journalDir, completionFilename(id))),
+    });
+    await this.writeExclusive(retirementFilename(id), serializeRecord(exactRetirementSnapshot(retirement)));
+    await this.beforeCompactionPhase("retirement-written");
+    await this.finishRetirement(retirement, true);
+    snapshot.intents.delete(id);
+    snapshot.completions.delete(id);
+    this.rememberSnapshot(snapshot);
+  }
+
+  private async finishRetirement(retirement: JournalRetirement, invokeHooks: boolean): Promise<void> {
+    await this.removeExpectedIntent(retirement);
+    if (invokeHooks) await this.beforeCompactionPhase("intent-removed");
+    await this.removeExpectedCompletion(retirement);
+    if (invokeHooks) await this.beforeCompactionPhase("completion-removed");
+    await this.removeExpectedRetirement(retirement);
+    if (invokeHooks) await this.beforeCompactionPhase("retirement-removed");
+  }
+
+  private async beforeCompactionPhase(phase: JournalCompactionPhase): Promise<void> {
+    await this.testHooks.beforeCompactionPhase?.(phase);
+  }
+
+  private rotationThreshold(): number {
+    const threshold = this.testHooks.rotationThreshold ?? MAX_JOURNAL_OPERATION_IDS;
+    if (!Number.isSafeInteger(threshold) || threshold < 1 || threshold > MAX_JOURNAL_OPERATION_IDS) {
+      throw journalStoreError();
+    }
+    return threshold;
+  }
+
+  private rememberSnapshot(snapshot: JournalSnapshot): JournalSnapshot {
+    if (this.testHooks.cacheSnapshots) this.cachedSnapshot = snapshot;
+    return snapshot;
+  }
+
+  private clearCachedSnapshot(): void {
+    this.cachedSnapshot = null;
   }
 
   private async serializeMutation<T>(mutation: () => Promise<T>): Promise<T> {
@@ -359,6 +516,74 @@ export class FileJournalStore implements JournalStore {
     return parsed;
   }
 
+  private async readRetirementFile(filePath: string, expectedId: string): Promise<JournalRetirement> {
+    const before = await this.assertPrivateRegularFile(filePath);
+    const parsed = await readStrictJson(filePath, parseRetirement, { maxBytes: MAX_JOURNAL_JSON_BYTES });
+    const after = await this.assertPrivateRegularFile(filePath);
+    if (!isSameIdentity(before, after) || parsed.id !== expectedId) {
+      throw journalStoreError();
+    }
+    return parsed;
+  }
+
+  private async removeExpectedIntent(retirement: JournalRetirement): Promise<void> {
+    const filePath = join(this.journalDir, intentFilename(retirement.id));
+    const before = await this.privateRegularFileOrNull(filePath);
+    if (before === null) return;
+    const parsed = await this.readIntentFile(filePath, retirement.id);
+    const after = await this.privateRegularFileOrNull(filePath);
+    if (after === null || !isSameIdentity(before, after) || !sameIntent(parsed, retirement.intent)) {
+      throw journalStoreError();
+    }
+    await unlink(filePath);
+    await this.syncJournalDirectory();
+  }
+
+  private async removeExpectedCompletion(retirement: JournalRetirement): Promise<void> {
+    const filePath = join(this.journalDir, completionFilename(retirement.id));
+    const before = await this.privateRegularFileOrNull(filePath);
+    if (before === null) return;
+    const parsed = await this.readCompletionFile(filePath);
+    const after = await this.privateRegularFileOrNull(filePath);
+    if (after === null || !isSameIdentity(before, after) || !sameCompletion(parsed, retirement.completion)) {
+      throw journalStoreError();
+    }
+    await unlink(filePath);
+    await this.syncJournalDirectory();
+  }
+
+  private async removeExpectedRetirement(retirement: JournalRetirement): Promise<void> {
+    const filePath = join(this.journalDir, retirementFilename(retirement.id));
+    const before = await this.privateRegularFileOrNull(filePath);
+    if (before === null) throw journalStoreError();
+    const parsed = await this.readRetirementFile(filePath, retirement.id);
+    const after = await this.privateRegularFileOrNull(filePath);
+    if (
+      after === null ||
+      !isSameIdentity(before, after) ||
+      !sameIntent(parsed.intent, retirement.intent) ||
+      !sameCompletion(parsed.completion, retirement.completion)
+    ) {
+      throw journalStoreError();
+    }
+    await unlink(filePath);
+    await this.syncJournalDirectory();
+  }
+
+  private async privateRegularFileOrNull(filePath: string): Promise<FileIdentity | null> {
+    await assertCanonicalRuntimePath(filePath);
+    try {
+      const entry = await lstat(filePath);
+      if (entry.isSymbolicLink() || !entry.isFile() || (entry.mode & 0o777) !== PRIVATE_FILE_MODE) {
+        throw journalStoreError();
+      }
+      return { dev: entry.dev, ino: entry.ino };
+    } catch (caught) {
+      if ((caught as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw journalStoreError();
+    }
+  }
+
   private async assertPrivateRegularFile(filePath: string): Promise<FileIdentity> {
     await assertCanonicalRuntimePath(filePath);
     const entry = await lstat(filePath);
@@ -382,18 +607,19 @@ export class FileJournalStore implements JournalStore {
         constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW,
         PRIVATE_FILE_MODE,
       );
-      const opened = await handle.stat();
+      const activeHandle = handle;
+      const opened = await activeHandle.stat();
       temporaryIdentity = { dev: opened.dev, ino: opened.ino };
       if (!opened.isFile() || (opened.mode & 0o777) !== PRIVATE_FILE_MODE) {
         throw journalStoreError();
       }
-      await handle.writeFile(serialized, "utf8");
-      await handle.sync();
-      const afterSync = await handle.stat();
+      await activeHandle.writeFile(serialized, "utf8");
+      await this.syncFile(temporary, () => activeHandle.sync());
+      const afterSync = await activeHandle.stat();
       if (!afterSync.isFile() || !isSameIdentity(temporaryIdentity, afterSync)) {
         throw journalStoreError();
       }
-      await handle.close();
+      await activeHandle.close();
       handle = undefined;
 
       await this.assertPrivateRegularFile(temporary);
@@ -428,6 +654,14 @@ export class FileJournalStore implements JournalStore {
 
   private async syncJournalDirectory(): Promise<void> {
     await this.syncDirectory(this.journalDir);
+  }
+
+  private async syncFile(filePath: string, sync: () => Promise<void>): Promise<void> {
+    if (this.testHooks.syncFile === undefined) {
+      await sync();
+    } else {
+      await this.testHooks.syncFile(filePath, sync);
+    }
   }
 
   private async syncDirectory(directoryPath: string): Promise<void> {

@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { chmod, lstat, mkdtemp, readFile, realpath, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -5,11 +6,16 @@ import { describe, expect, it } from "vitest";
 import {
   disableService,
   installService,
+  readServiceStatus,
   renderLaunchAgentPlist,
   type ServiceCommand,
 } from "./service.js";
 
 const INSTALLATION_ID = "11111111-1111-4111-8111-111111111111";
+const REDACTION_CANARY = readFileSync(
+  new URL("../../../tests/fixtures/safe/credential-canary.txt", import.meta.url),
+  "utf8",
+).trim();
 
 async function temporaryHome(): Promise<string> {
   return realpath(await mkdtemp(join(tmpdir(), "grandbox-service-")));
@@ -30,7 +36,7 @@ describe("renderLaunchAgentPlist", () => {
       nodePath: "/usr/local/bin/node",
       workerPath: "/opt/grandbox/bridge-worker.cjs",
       configPath: "/Users/jo/Library/Application Support/Grandbox Bridge/config.json",
-      token: "ntn_synthetic_private_token",
+      token: REDACTION_CANARY,
       relayToken: "relay-token-synthetic",
       graphKey: "graph-key-synthetic",
     } as never);
@@ -63,6 +69,39 @@ describe("renderLaunchAgentPlist", () => {
 });
 
 describe("LaunchAgent service lifecycle", () => {
+  it("reads a configured service state through one argv-only print without mutating launchd", async () => {
+    const homeDirectory = await temporaryHome();
+    const nodePath = join(homeDirectory, "node");
+    const workerPath = join(homeDirectory, "bridge-worker.cjs");
+    const configPath = join(homeDirectory, "config.json");
+    await Promise.all([
+      writeFile(nodePath, "node", { mode: 0o700 }),
+      writeFile(workerPath, "worker", { mode: 0o600 }),
+      writeFile(configPath, "{}", { mode: 0o600 }),
+    ]);
+    const commands: ServiceCommand[] = [];
+
+    const status = await readServiceStatus({
+      homeDirectory,
+      installationId: INSTALLATION_ID,
+      nodePath,
+      workerPath,
+      configPath,
+      uid: 501,
+      runner: {
+        run: async (command: ServiceCommand) => {
+          commands.push(command);
+          return { code: 113 };
+        },
+      },
+    });
+
+    expect(status).toEqual({ label: expectedLabel(), plistPath: expectedPlist(homeDirectory), configured: true, enabled: false });
+    expect(commands).toEqual([
+      { executable: "/bin/launchctl", args: ["print", `gui/501/${expectedLabel()}`] },
+    ]);
+  });
+
   it("uses an injected launchctl runner with absolute bootstrap, bootout, and print paths", async () => {
     const homeDirectory = await temporaryHome();
     const nodePath = join(homeDirectory, "node");

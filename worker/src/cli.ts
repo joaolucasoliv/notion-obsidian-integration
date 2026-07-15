@@ -255,7 +255,10 @@ function runtimeLock(lockPath: string): WorkerLock {
   };
 }
 
-function decoderFor(state: Parameters<typeof persistedLinkMapping>[0]): NotionObservationDecoder {
+/** Production decoder composition shared with the real Notion client boundary. */
+export function createProductionNotionObservationDecoder(
+  state: Parameters<typeof persistedLinkMapping>[0],
+): NotionObservationDecoder {
   return {
     decode: async (record: Readonly<RawNotionPageRecord>) => {
       const mapped = fromNotionMarkdown(record.sourceMarkdown, persistedLinkMapping(state), record.managed.tags);
@@ -270,7 +273,7 @@ function decoderFor(state: Parameters<typeof persistedLinkMapping>[0]): NotionOb
         editedAt: record.editedAt,
         pageUrl: record.pageUrl,
         sourceMarkdown: record.sourceMarkdown,
-        complete: !record.truncated,
+        complete: !record.truncated && record.unknownBlockIds.length === 0,
         unsupportedKinds: unsupported,
         semantic: mapped.semantic,
         semanticHash: await semanticHash(mapped.semantic),
@@ -306,7 +309,7 @@ export async function createProductionWorker(configPath: string): Promise<Bridge
     createNotionApi: async (token, context) => new NotionClient(
       token,
       new FetchNotionTransport(),
-      decoderFor(context.state),
+      createProductionNotionObservationDecoder(context.state),
       { clock: { now: () => new Date(), sleep: async (milliseconds) => new Promise((resolveSleep) => setTimeout(resolveSleep, milliseconds)) } },
     ),
   });

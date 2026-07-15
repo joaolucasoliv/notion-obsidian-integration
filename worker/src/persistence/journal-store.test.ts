@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { JournalCompletionV1, JournalIntentV1 } from "@grandbox-bridge/shared";
 import { describe, expect, it } from "vitest";
-import { FileJournalStore } from "./journal-store.js";
+import { FileJournalStore, type JournalCompactionPhase } from "./journal-store.js";
 
 const INSTALLATION_ID = "11111111-1111-4111-8111-111111111111";
 const OTHER_INSTALLATION_ID = "22222222-2222-4222-8222-222222222222";
@@ -45,10 +45,40 @@ function completion(): JournalCompletionV1 {
   };
 }
 
+function retirement(id: string): Record<string, unknown> {
+  return { schemaVersion: 1, id, intent: intent(id), completion: completion() };
+}
+
 type DirectorySyncHook = (directoryPath: string, sync: () => Promise<void>) => Promise<void>;
 
 function journalStoreWithSyncHook(journalDir: string, syncDirectory: DirectorySyncHook): FileJournalStore {
   return new FileJournalStore(journalDir, INSTALLATION_ID, { syncDirectory });
+}
+
+function journalStoreWithCompactionFault(journalDir: string, interruptedAt: JournalCompactionPhase): FileJournalStore {
+  return new FileJournalStore(journalDir, INSTALLATION_ID, {
+    beforeCompactionPhase: async (phase) => {
+      if (phase === interruptedAt) throw new Error(`injected compaction interruption at ${phase}`);
+    },
+  });
+}
+
+function fastRotatingJournalStore(journalDir: string): FileJournalStore {
+  return new FileJournalStore(journalDir, INSTALLATION_ID, {
+    // This endurance case exercises the same begin/complete and rotation
+    // transitions; dedicated cases above and below cover real fsync ordering.
+    syncDirectory: async () => undefined,
+    syncFile: async () => undefined,
+    cacheSnapshots: true,
+  });
+}
+
+async function seedCompletedRows(journal: string, count: number): Promise<void> {
+  for (let index = 0; index < count; index += 1) {
+    const id = randomUUID();
+    await putPrivateJson(join(journal, `intent-${id}.json`), intent(id));
+    await putPrivateJson(join(journal, `completion-${id}.json`), completion());
+  }
 }
 
 async function privateJournal(directory: string): Promise<string> {
@@ -234,6 +264,21 @@ describe("FileJournalStore", () => {
         },
       },
       {
+        name: "wrong-mode retirement marker",
+        arrange: async (journal) => {
+          const path = join(journal, `retirement-${INTENT_A}.json`);
+          await putPrivateJson(path, retirement(INTENT_A));
+          await chmod(path, 0o644);
+        },
+      },
+      {
+        name: "retirement marker with an impossible intent-only remainder",
+        arrange: async (journal) => {
+          await putPrivateJson(join(journal, `retirement-${INTENT_A}.json`), retirement(INTENT_A));
+          await putPrivateJson(join(journal, `intent-${INTENT_A}.json`), intent(INTENT_A));
+        },
+      },
+      {
         name: "wrong journal directory mode",
         arrange: async (journal) => {
           await chmod(journal, 0o755);
@@ -248,6 +293,15 @@ describe("FileJournalStore", () => {
           await symlink(target, join(journal, `intent-${INTENT_A}.json`));
         },
       },
+      {
+        name: "symlink retirement marker",
+        arrange: async (journal) => {
+          const outside = await mkdtemp(join(tmpdir(), "grandbox-journal-retirement-outside-"));
+          const target = join(outside, "retirement.json");
+          await putPrivateJson(target, retirement(INTENT_A));
+          await symlink(target, join(journal, `retirement-${INTENT_A}.json`));
+        },
+      },
     ];
 
     for (const testCase of cases) {
@@ -260,20 +314,21 @@ describe("FileJournalStore", () => {
     }
   });
 
-  it("caps journal operation IDs at 1,024", async () => {
+  it("caps outstanding journal operations at 1,024", async () => {
     const directory = await temporaryDirectory();
     const journal = await privateJournal(directory);
-    for (let index = 0; index < 1_025; index += 1) {
+    for (let index = 0; index < 1_024; index += 1) {
       const id = randomUUID();
       await putPrivateJson(join(journal, `intent-${id}.json`), intent(id));
     }
     const store = new FileJournalStore(journal, INSTALLATION_ID);
 
-    await expect(store.incomplete()).rejects.toThrow(/journal store failed/i);
+    await expect(store.incomplete()).resolves.toHaveLength(1_024);
+    await expect(store.begin(intent(randomUUID()))).rejects.toThrow(/journal store failed/i);
   });
 
   it(
-    "serializes trailing-slash journal paths at 1,023, permits completion at 1,024, and rejects an extra begin",
+    "serializes trailing-slash journal paths at 1,023 and frees completed capacity for a later begin",
     async () => {
       const directory = await temporaryDirectory();
       const journal = await privateJournal(directory);
@@ -296,13 +351,77 @@ describe("FileJournalStore", () => {
         throw new Error("expected one concurrent begin to succeed");
       }
       await expect(stores[0].complete(completedId, completion())).resolves.toBeUndefined();
-      await expect(stores[1].begin(intent(randomUUID()))).rejects.toThrow(/journal store failed/i);
-      expect(await readdir(journal)).toHaveLength(1_025);
+      await expect(stores[1].begin(intent(randomUUID()))).resolves.toBeUndefined();
       expect((await stores[0].incomplete()).map((row) => row.id)).not.toContain(completedId);
-      expect(await stores[1].incomplete()).toHaveLength(1_023);
+      expect(await stores[1].incomplete()).toHaveLength(1_024);
     },
     15_000,
   );
+
+  it(
+    "permits more than 1,024 sequential begin/complete operations before a later begin",
+    async () => {
+      const directory = await temporaryDirectory();
+      const store = fastRotatingJournalStore(join(directory, "journal"));
+
+      for (let index = 0; index < 1_025; index += 1) {
+        const id = randomUUID();
+        await store.begin(intent(id));
+        await store.complete(id, completion());
+      }
+
+      const later = randomUUID();
+      await expect(store.begin(intent(later))).resolves.toBeUndefined();
+      await expect(store.incomplete()).resolves.toEqual([intent(later)]);
+    },
+    60_000,
+  );
+
+  it(
+    "preserves outstanding intents while rotating completed rows",
+    async () => {
+      const directory = await temporaryDirectory();
+      const journal = await privateJournal(directory);
+      await seedCompletedRows(journal, 1_023);
+      const pending = randomUUID();
+      const later = randomUUID();
+      const store = new FileJournalStore(journal, INSTALLATION_ID);
+      await store.begin(intent(pending));
+
+      await expect(store.begin(intent(later))).resolves.toBeUndefined();
+
+      const recovered = new FileJournalStore(journal, INSTALLATION_ID);
+      expect((await recovered.incomplete()).map((row) => row.id)).toEqual([later, pending].sort());
+    },
+    30_000,
+  );
+
+  it.each([
+    "retirement-written",
+    "intent-removed",
+    "completion-removed",
+    "retirement-removed",
+  ] as const)("recovers an interrupted completed-row rotation at %s without completing another outstanding intent", async (phase) => {
+    const directory = await temporaryDirectory();
+    const journal = await privateJournal(directory);
+    await seedCompletedRows(journal, 1_023);
+    const pending = randomUUID();
+    const first = new FileJournalStore(journal, INSTALLATION_ID);
+    await first.begin(intent(pending));
+
+    const faulting = journalStoreWithCompactionFault(journal, phase);
+    await expect(faulting.begin(intent(randomUUID()))).rejects.toThrow(/journal store failed/i);
+
+    if (phase === "retirement-written") {
+      const marker = (await readdir(journal)).find((entry) => entry.startsWith("retirement-"));
+      if (marker === undefined) throw new Error("expected a durable retirement marker");
+      expect((await lstat(join(journal, marker))).mode & 0o777).toBe(0o600);
+    }
+
+    const recovered = new FileJournalStore(journal, INSTALLATION_ID);
+    await expect(recovered.incomplete()).resolves.toEqual([intent(pending)]);
+    await expect(recovered.begin(intent(randomUUID()))).resolves.toBeUndefined();
+  }, 30_000);
 
   it("does not persist an attempted note-body field or reflect its canary", async () => {
     const directory = await temporaryDirectory();

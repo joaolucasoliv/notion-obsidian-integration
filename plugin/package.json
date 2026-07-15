@@ -17,6 +17,7 @@
   },
   "dependencies": {
     "@grandbox-bridge/shared": "0.1.0",
+    "@grandbox-bridge/worker": "0.1.0",
     "yaml": "2.9.0"
   }
 }

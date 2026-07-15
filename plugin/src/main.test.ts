@@ -1,9 +1,13 @@
-import { readFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, realpath, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { BridgeRunSummary } from "@grandbox-bridge/shared";
 import { App, Notice, TFile } from "../../tests/fakes/obsidian.js";
 import type { ExternalLocator } from "./locator.js";
 import type { BridgeStatus, ServiceStatus, WorkerController } from "./controller.js";
+import { NodeServiceCommandRunner, type ServiceProcessCommand } from "./service-manager.js";
+import { deriveExternalLocator } from "./locator.js";
 
 vi.mock("obsidian", async () => import("../../tests/fakes/obsidian.js"));
 
@@ -71,8 +75,76 @@ class RecordingController implements WorkerController {
   public async status(): Promise<BridgeStatus> { return this.statusValue; }
 }
 
+async function serviceLocator(): Promise<ExternalLocator> {
+  const homeDirectory = await realpath(await mkdtemp(join(tmpdir(), "grandbox-plugin-main-service-")));
+  const nodeExecutable = join(homeDirectory, "node");
+  const workerPath = join(homeDirectory, "bridge-worker.cjs");
+  const locator = deriveExternalLocator({ installationId: INSTALLATION_ID, homeDirectory, nodeExecutable, workerPath });
+  await mkdir(dirname(locator.configPath), { recursive: true, mode: 0o700 });
+  await Promise.all([
+    writeFile(nodeExecutable, "node", { mode: 0o700 }),
+    writeFile(workerPath, "worker", { mode: 0o600 }),
+    writeFile(locator.configPath, "{}", { mode: 0o600 }),
+  ]);
+  await Promise.all([chmod(nodeExecutable, 0o700), chmod(workerPath, 0o600), chmod(locator.configPath, 0o600)]);
+  return locator;
+}
+
 describe("GrandboxBridgePlugin", () => {
   beforeEach(() => Notice.clear());
+
+  it("constructs a concrete service manager without load-time process execution and reaches the hardened boundary on explicit controls", async () => {
+    const { GrandboxBridgePlugin } = await import("./main.js");
+    const locator = await serviceLocator();
+    const commands: ServiceProcessCommand[] = [];
+    let enabled = false;
+    const runner = new NodeServiceCommandRunner({
+      run: async (command: ServiceProcessCommand) => {
+        commands.push(command);
+        const action = command.args[0];
+        if (action === "bootout") {
+          const wasEnabled = enabled;
+          enabled = false;
+          return { code: wasEnabled ? 0 : 113 };
+        }
+        if (action === "bootstrap") {
+          enabled = true;
+          return { code: 0 };
+        }
+        if (action === "print") return { code: enabled ? 0 : 113 };
+        throw new Error("unexpected service action");
+      },
+    });
+    class TestPlugin extends GrandboxBridgePlugin {
+      protected override deriveLocator(_id: string): ExternalLocator { return locator; }
+      protected override createServiceCommandRunner(): NodeServiceCommandRunner { return runner; }
+      protected override serviceUserId(): number { return 501; }
+    }
+    const plugin = new TestPlugin(new App(), { id: "grandbox-bridge" });
+
+    await plugin.onload();
+    expect(commands).toEqual([]);
+
+    await runCommand(plugin, "show-status");
+    await runCommand(plugin, "install-service");
+    await runCommand(plugin, "disable-service");
+
+    const label = `com.grandbox.bridge.${INSTALLATION_ID}`;
+    const plistPath = join(locator.homeDirectory, "Library", "LaunchAgents", `${label}.plist`);
+    expect(commands).toEqual([
+      { executable: "/bin/launchctl", args: ["print", `gui/501/${label}`], shell: false },
+      { executable: "/bin/launchctl", args: ["bootout", "gui/501", plistPath], shell: false },
+      { executable: "/bin/launchctl", args: ["bootstrap", "gui/501", plistPath], shell: false },
+      { executable: "/bin/launchctl", args: ["print", `gui/501/${label}`], shell: false },
+      { executable: "/bin/launchctl", args: ["bootout", "gui/501", plistPath], shell: false },
+      { executable: "/bin/launchctl", args: ["print", `gui/501/${label}`], shell: false },
+    ]);
+    expect(Notice.messages).toEqual([
+      "Grandbox Bridge: ready; background service disabled.",
+      "Grandbox Bridge: background service enabled.",
+      "Grandbox Bridge: background service disabled.",
+    ]);
+  });
 
   it("waits for layout-ready before registering debounced vault listeners", async () => {
     const { GrandboxBridgePlugin } = await import("./main.js");

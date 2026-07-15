@@ -84,6 +84,7 @@ function validExternalLocator(value: unknown): value is ExternalLocator {
   const locator = value as ExternalLocator;
   if (
     !isCanonicalInstallationId(locator.installationId) ||
+    !isAbsoluteNormalizedPath(locator.homeDirectory) ||
     !isAbsoluteNormalizedPath(locator.runtimeRoot) ||
     !isAbsoluteNormalizedPath(locator.configPath) ||
     !isAbsoluteNormalizedPath(locator.nodeExecutable) ||
@@ -92,6 +93,7 @@ function validExternalLocator(value: unknown): value is ExternalLocator {
     return false;
   }
   return (
+    locator.runtimeRoot === `${locator.homeDirectory}/Library/Application Support/Grandbox Bridge/${locator.installationId}` &&
     locator.runtimeRoot.endsWith(`/Library/Application Support/Grandbox Bridge/${locator.installationId}`) &&
     locator.configPath === `${locator.runtimeRoot}/config.json`
   );
@@ -248,15 +250,6 @@ export class NodeWorkerProcessRunner implements WorkerProcessRunner {
         resolve(Object.freeze({ code: typeof code === "number" ? code : 1, stdout: Buffer.concat(chunks).toString("utf8") }));
       });
     });
-  }
-}
-
-/** The Task 10 shell intentionally cannot install or inspect a live service by itself. */
-export class UnavailableServiceManager implements ServiceManager {
-  public async install(_locator: ExternalLocator): Promise<ServiceStatus> { throw controllerError(); }
-  public async disable(_locator: ExternalLocator): Promise<ServiceStatus> { throw controllerError(); }
-  public async status(_locator: ExternalLocator): Promise<BridgeStatus> {
-    return Object.freeze({ configuration: "unconfigured", service: "unknown" });
   }
 }
 

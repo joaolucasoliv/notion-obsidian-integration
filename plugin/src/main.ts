@@ -4,12 +4,12 @@ import { changeNoteOptIn, isGeneratedGithubNote, isManageableMarkdownPath } from
 import {
   LocalWorkerController,
   NodeWorkerProcessRunner,
-  UnavailableServiceManager,
   supportsEventSync,
   type BridgeStatus,
   type WorkerController,
 } from "./controller.js";
 import { deriveExternalLocator, isCanonicalInstallationId, type ExternalLocator } from "./locator.js";
+import { NodeServiceCommandRunner, RuntimeServiceManager } from "./service-manager.js";
 import { GrandboxBridgeSettingTab } from "./settings.js";
 import { STATUS_NOTE_PATH, updateStatusNote } from "./status-note.js";
 
@@ -91,14 +91,29 @@ export class GrandboxBridgePlugin extends Plugin {
   }
 
   protected createWorkerController(locator: ExternalLocator): WorkerController {
-    return new LocalWorkerController(locator, new NodeWorkerProcessRunner(), new UnavailableServiceManager());
+    return new LocalWorkerController(
+      locator,
+      new NodeWorkerProcessRunner(),
+      new RuntimeServiceManager(() => this.serviceUserId(), this.createServiceCommandRunner()),
+    );
+  }
+
+  /** Construction is inert; the runner is invoked only by an explicit service control. */
+  protected createServiceCommandRunner(): NodeServiceCommandRunner {
+    return new NodeServiceCommandRunner();
+  }
+
+  protected serviceUserId(): number {
+    const uid = typeof process.getuid === "function" ? process.getuid() : null;
+    if (typeof uid !== "number" || !Number.isSafeInteger(uid) || uid < 0) throw pluginError();
+    return uid;
   }
 
   protected createDebounceScheduler(): DebounceScheduler {
     return browserScheduler();
   }
 
-  private deriveLocator(id: string): ExternalLocator {
+  protected deriveLocator(id: string): ExternalLocator {
     const adapter = this.app.vault.adapter as unknown as { getBasePath?: () => string };
     const vaultRoot = adapter.getBasePath?.();
     const homeDirectory = process.env.HOME;

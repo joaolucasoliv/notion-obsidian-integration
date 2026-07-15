@@ -2,6 +2,7 @@ const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3
 
 export interface ExternalLocator {
   readonly installationId: string;
+  readonly homeDirectory: string;
   readonly runtimeRoot: string;
   readonly configPath: string;
   readonly nodeExecutable: string;
@@ -55,6 +56,7 @@ export function deriveExternalLocator(input: ExternalLocatorInput): ExternalLoca
   const runtimeRoot = `${input.homeDirectory}/Library/Application Support/Grandbox Bridge/${input.installationId}`;
   return Object.freeze({
     installationId: input.installationId,
+    homeDirectory: input.homeDirectory,
     runtimeRoot,
     configPath: `${runtimeRoot}/config.json`,
     nodeExecutable: input.nodeExecutable,
