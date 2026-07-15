@@ -188,7 +188,7 @@ function markdownStem(path: string): string {
 
 function targetCandidates(sourcePath: string, link: GraphLink): string[] {
   const decoded = safeDecodedTarget(link.target);
-  if (decoded === null || decoded.includes("?")) return [];
+  if (decoded === null) return [];
   if (decoded.length === 0) return [sourcePath];
 
   const sourceDirectory = sourcePath.split("/").slice(0, -1);
@@ -204,7 +204,7 @@ function uniqueBasenameTarget(
   byBasename: ReadonlyMap<string, readonly NormalizedNote[]>,
   basenameMultiplicity: ReadonlyMap<string, number>,
 ): NormalizedNote | null {
-  if (target.length === 0 || target.includes("/") || target.includes("?")) return null;
+  if (target.length === 0 || target.includes("/")) return null;
   const basename = markdownStem(target);
   if (basenameMultiplicity.get(basename) !== 1) return null;
   const matches = byBasename.get(basename);

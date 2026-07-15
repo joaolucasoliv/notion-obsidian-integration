@@ -6,6 +6,7 @@ import {
   graphVaultFixture,
   idFor,
   percentEncodedLinkFixture,
+  rawDelimiterFixture,
   repositoryOnlyFixture,
   technicalBasenameAmbiguityFixture,
 } from "../../../tests/fixtures/graph/graph-vault.js";
@@ -182,5 +183,26 @@ describe("buildGraphProjection", () => {
         ),
       ).toBe(false);
     }
+  });
+
+  it("resolves encoded literal delimiters without treating them as raw fragment or query syntax", () => {
+    const projection = buildGraphProjection(rawDelimiterFixture(), new Map(), INSTALLATION_ID);
+    const encodedSource = idFor("Encoded.md");
+    const rawSource = idFor("Raw.md");
+
+    expect(projection.edges).toContainEqual(
+      expect.objectContaining({ kind: "wikilink", source: encodedSource, target: idFor("Secret#hidden.md") }),
+    );
+    expect(projection.edges).toContainEqual(
+      expect.objectContaining({ kind: "wikilink", source: encodedSource, target: idFor("Secret?query.md") }),
+    );
+    expect(
+      projection.edges.some(
+        (edge) => edge.kind === "wikilink" && edge.source === encodedSource && edge.target === idFor("Secret.md"),
+      ),
+    ).toBe(false);
+    expect(projection.edges).toContainEqual(
+      expect.objectContaining({ kind: "wikilink", source: rawSource, target: idFor("Secret.md") }),
+    );
   });
 });

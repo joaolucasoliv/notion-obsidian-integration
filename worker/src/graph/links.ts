@@ -20,9 +20,14 @@ function bodyWithoutFrontmatter(markdown: string): string {
   }
 }
 
-function stripHeadingFragment(target: string): string {
+function rawPathBeforeStructure(target: string): string {
   const fragmentIndex = target.indexOf("#");
-  return fragmentIndex === -1 ? target : target.slice(0, fragmentIndex);
+  const queryIndex = target.indexOf("?");
+  const end = Math.min(
+    fragmentIndex === -1 ? target.length : fragmentIndex,
+    queryIndex === -1 ? target.length : queryIndex,
+  );
+  return target.slice(0, end);
 }
 
 function isExternalTarget(target: string): boolean {
@@ -53,23 +58,26 @@ function decodedLocalTarget(target: string): string | null {
 }
 
 function localMarkdownTarget(target: string): string | null {
-  const decoded = decodedLocalTarget(target);
+  const decoded = decodedLocalTarget(rawPathBeforeStructure(target));
   if (decoded === null) return null;
-  const path = stripHeadingFragment(decoded);
-  if (path.length === 0 || /\.md$/iu.test(path)) return path;
+  if (decoded.length === 0 || /\.md$/iu.test(decoded)) return decoded;
   return null;
 }
 
 function localWikiTarget(target: string): string | null {
-  const decoded = decodedLocalTarget(target);
+  const decoded = decodedLocalTarget(rawPathBeforeStructure(target));
   if (decoded === null) return null;
-  const path = stripHeadingFragment(decoded);
-  return path.includes("?") ? null : path;
+  return decoded;
 }
 
-function maskObsidianComments(markdown: string): string {
+interface CommentMask {
+  readonly source: string;
+  readonly inComment: boolean;
+}
+
+function maskObsidianComments(markdown: string, initiallyInComment: boolean): CommentMask {
   let output = "";
-  let inComment = false;
+  let inComment = initiallyInComment;
   for (let index = 0; index < markdown.length;) {
     if (markdown.startsWith("%%", index)) {
       output += "  ";
@@ -81,7 +89,7 @@ function maskObsidianComments(markdown: string): string {
     output += inComment && character !== "\r" && character !== "\n" ? " " : character;
     index += 1;
   }
-  return output;
+  return { source: output, inComment };
 }
 
 function sourceRange(documentSource: string, node: Nodes): string | null {
@@ -106,24 +114,29 @@ export function extractGraphLinks(markdown: string): GraphLink[] {
     throw new Error("Graph markdown must be a string");
   }
 
-  const document = parseMarkdown(maskObsidianComments(bodyWithoutFrontmatter(markdown)));
+  const document = parseMarkdown(bodyWithoutFrontmatter(markdown));
   const links = new Map<string, GraphLink>();
+  let inObsidianComment = false;
   const add = (link: GraphLink): void => {
     links.set(`${link.kind}\0${link.target}`, link);
   };
   const visit = (node: Nodes, insideMarkdownLink: boolean): void => {
-    if (node.type === "link") {
+    if (node.type === "link" && !inObsidianComment) {
       const target = localMarkdownTarget(node.url);
       if (target !== null) add({ kind: "markdown-link", target });
     }
-    if (node.type === "text" && !insideMarkdownLink) {
+    if (node.type === "text") {
       const source = sourceRange(document.source, node);
       if (source !== null) {
-        const scan = scanObsidianText(source);
-        for (const construct of scan.constructs) {
-          if (construct.kind !== "wikilink") continue;
-          const target = localWikiTarget(construct.target);
-          if (target !== null) add({ kind: "wikilink", target });
+        const masked = maskObsidianComments(source, inObsidianComment);
+        inObsidianComment = masked.inComment;
+        if (!insideMarkdownLink) {
+          const scan = scanObsidianText(masked.source);
+          for (const construct of scan.constructs) {
+            if (construct.kind !== "wikilink") continue;
+            const target = localWikiTarget(construct.target);
+            if (target !== null) add({ kind: "wikilink", target });
+          }
         }
       }
     }

@@ -113,6 +113,20 @@ export function obsidianCommentFixtureMarkdown(): string {
   return "%% [[Secret]] %%\n[[Visible]]\n";
 }
 
+export function markdownContextCommentFixtureMarkdown(): string {
+  return "`%%`\n[[InlineVisible]]\n\n```md\n%%\n```\n[[FenceVisible]]\n\n%% [[Hidden]] %%\n[[CommentVisible]]\n";
+}
+
+export function rawDelimiterFixture(): SyntheticGraphSourceNote[] {
+  return [
+    note("Encoded.md", [], "[[Secret%23hidden]]\n[[Secret%3Fquery]]\n"),
+    note("Raw.md", [], "[[Secret#heading]]\n[[Secret?query]]\n"),
+    note("Secret.md", [], "# Base secret\n"),
+    note("Secret#hidden.md", [], "# Literal hash secret\n"),
+    note("Secret?query.md", [], "# Literal query secret\n"),
+  ];
+}
+
 export function idFor(path: string): string {
   return createHash("sha256").update(`note\0${path}`, "utf8").digest("hex");
 }

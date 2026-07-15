@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
   graphVaultFixture,
+  markdownContextCommentFixtureMarkdown,
   obsidianCommentFixtureMarkdown,
   percentEncodedLinkFixture,
+  rawDelimiterFixture,
 } from "../../../tests/fixtures/graph/graph-vault.js";
 import { extractGraphLinks } from "./links.js";
 
@@ -30,6 +32,28 @@ describe("extractGraphLinks", () => {
   it("does not read wiki syntax inside Obsidian comments", () => {
     expect(extractGraphLinks(obsidianCommentFixtureMarkdown())).toEqual([
       { kind: "wikilink", target: "Visible" },
+    ]);
+  });
+
+  it("keeps visible links after comment delimiters inside inline and fenced code", () => {
+    expect(extractGraphLinks(markdownContextCommentFixtureMarkdown())).toEqual([
+      { kind: "wikilink", target: "CommentVisible" },
+      { kind: "wikilink", target: "FenceVisible" },
+      { kind: "wikilink", target: "InlineVisible" },
+    ]);
+  });
+
+  it("strips only raw target delimiters before decoding literal filename characters", () => {
+    const encoded = rawDelimiterFixture().find((note) => note.path === "Encoded.md");
+    const raw = rawDelimiterFixture().find((note) => note.path === "Raw.md");
+    if (encoded === undefined || raw === undefined) throw new Error("missing synthetic raw-delimiter fixture");
+
+    expect(extractGraphLinks(encoded.markdown)).toEqual([
+      { kind: "wikilink", target: "Secret#hidden" },
+      { kind: "wikilink", target: "Secret?query" },
+    ]);
+    expect(extractGraphLinks(raw.markdown)).toEqual([
+      { kind: "wikilink", target: "Secret" },
     ]);
   });
 });
