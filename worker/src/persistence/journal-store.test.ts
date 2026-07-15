@@ -68,11 +68,40 @@ async function putPrivateJson(path: string, value: unknown): Promise<void> {
 }
 
 describe("FileJournalStore", () => {
-  it("starts empty from a missing private journal directory", async () => {
+  it("treats a missing journal leaf below an existing private runtime parent as empty", async () => {
     const directory = await temporaryDirectory();
     const store = new FileJournalStore(join(directory, "journal"), INSTALLATION_ID);
 
     await expect(store.incomplete()).resolves.toEqual([]);
+  });
+
+  it.each([
+    {
+      name: "missing",
+      arrange: async (directory: string) => join(directory, "missing-runtime-parent", "journal"),
+    },
+    {
+      name: "symlinked",
+      arrange: async (directory: string) => {
+        const outside = await mkdtemp(join(tmpdir(), "grandbox-journal-parent-outside-"));
+        const parent = join(directory, "symlinked-runtime-parent");
+        await symlink(outside, parent);
+        return join(parent, "journal");
+      },
+    },
+    {
+      name: "non-directory",
+      arrange: async (directory: string) => {
+        const parent = join(directory, "file-runtime-parent");
+        await writeFile(parent, "not a directory", { mode: 0o600 });
+        return join(parent, "journal");
+      },
+    },
+  ])("fails closed when the immediate journal parent is $name during reads", async ({ arrange }) => {
+    const directory = await temporaryDirectory();
+    const store = new FileJournalStore(await arrange(directory), INSTALLATION_ID);
+
+    await expect(store.incomplete()).rejects.toThrow(/journal store failed/i);
   });
 
   it("fails closed instead of recursively creating a missing journal parent", async () => {
@@ -243,33 +272,37 @@ describe("FileJournalStore", () => {
     await expect(store.incomplete()).rejects.toThrow(/journal store failed/i);
   });
 
-  it("serializes trailing-slash journal paths at 1,023, permits completion at 1,024, and rejects an extra begin", async () => {
-    const directory = await temporaryDirectory();
-    const journal = await privateJournal(directory);
-    for (let index = 0; index < 1_023; index += 1) {
-      const id = randomUUID();
-      await putPrivateJson(join(journal, `intent-${id}.json`), intent(id));
-    }
-    const stores = [
-      new FileJournalStore(journal, INSTALLATION_ID),
-      new FileJournalStore(`${journal}/`, INSTALLATION_ID),
-    ] as const;
-    const contenders = [randomUUID(), randomUUID()] as const;
-    const settled = await Promise.allSettled(contenders.map((id, index) => stores[index].begin(intent(id))));
+  it(
+    "serializes trailing-slash journal paths at 1,023, permits completion at 1,024, and rejects an extra begin",
+    async () => {
+      const directory = await temporaryDirectory();
+      const journal = await privateJournal(directory);
+      for (let index = 0; index < 1_023; index += 1) {
+        const id = randomUUID();
+        await putPrivateJson(join(journal, `intent-${id}.json`), intent(id));
+      }
+      const stores = [
+        new FileJournalStore(journal, INSTALLATION_ID),
+        new FileJournalStore(`${journal}/`, INSTALLATION_ID),
+      ] as const;
+      const contenders = [randomUUID(), randomUUID()] as const;
+      const settled = await Promise.allSettled(contenders.map((id, index) => stores[index].begin(intent(id))));
 
-    expect(settled.filter((entry) => entry.status === "fulfilled")).toHaveLength(1);
-    expect(settled.filter((entry) => entry.status === "rejected")).toHaveLength(1);
+      expect(settled.filter((entry) => entry.status === "fulfilled")).toHaveLength(1);
+      expect(settled.filter((entry) => entry.status === "rejected")).toHaveLength(1);
 
-    const completedId = contenders.find((_, index) => settled[index]?.status === "fulfilled");
-    if (completedId === undefined) {
-      throw new Error("expected one concurrent begin to succeed");
-    }
-    await expect(stores[0].complete(completedId, completion())).resolves.toBeUndefined();
-    await expect(stores[1].begin(intent(randomUUID()))).rejects.toThrow(/journal store failed/i);
-    expect(await readdir(journal)).toHaveLength(1_025);
-    expect((await stores[0].incomplete()).map((row) => row.id)).not.toContain(completedId);
-    expect(await stores[1].incomplete()).toHaveLength(1_023);
-  });
+      const completedId = contenders.find((_, index) => settled[index]?.status === "fulfilled");
+      if (completedId === undefined) {
+        throw new Error("expected one concurrent begin to succeed");
+      }
+      await expect(stores[0].complete(completedId, completion())).resolves.toBeUndefined();
+      await expect(stores[1].begin(intent(randomUUID()))).rejects.toThrow(/journal store failed/i);
+      expect(await readdir(journal)).toHaveLength(1_025);
+      expect((await stores[0].incomplete()).map((row) => row.id)).not.toContain(completedId);
+      expect(await stores[1].incomplete()).toHaveLength(1_023);
+    },
+    15_000,
+  );
 
   it("does not persist an attempted note-body field or reflect its canary", async () => {
     const directory = await temporaryDirectory();

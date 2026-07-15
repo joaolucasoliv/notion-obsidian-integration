@@ -195,6 +195,7 @@ export class FileJournalStore implements JournalStore {
   }
 
   private async journalDirectoryExists(): Promise<boolean> {
+    await this.assertExistingJournalParent();
     await assertCanonicalRuntimePath(this.journalDir);
     try {
       const entry = await lstat(this.journalDir);
@@ -208,19 +209,33 @@ export class FileJournalStore implements JournalStore {
       return true;
     } catch (caught) {
       if ((caught as NodeJS.ErrnoException).code === "ENOENT") {
+        // An ENOENT for the leaf is empty only while its immediate runtime
+        // parent still exists as a safe directory; otherwise recovery must
+        // fail closed rather than silently treating a broken runtime path as
+        // a clean journal.
+        await this.assertExistingJournalParent();
         return false;
       }
       throw journalStoreError();
     }
   }
 
-  private async ensurePrivateJournalDirectory(): Promise<void> {
+  private async assertExistingJournalParent(): Promise<string> {
     const parent = dirname(this.journalDir);
-    await assertCanonicalRuntimePath(parent);
-    const parentEntry = await lstat(parent);
-    if (parentEntry.isSymbolicLink() || !parentEntry.isDirectory()) {
+    try {
+      await assertCanonicalRuntimePath(parent);
+      const parentEntry = await lstat(parent);
+      if (parentEntry.isSymbolicLink() || !parentEntry.isDirectory()) {
+        throw journalStoreError();
+      }
+      return parent;
+    } catch {
       throw journalStoreError();
     }
+  }
+
+  private async ensurePrivateJournalDirectory(): Promise<void> {
+    const parent = await this.assertExistingJournalParent();
     await assertCanonicalRuntimePath(this.journalDir);
     try {
       await mkdir(this.journalDir, { mode: PRIVATE_DIRECTORY_MODE });

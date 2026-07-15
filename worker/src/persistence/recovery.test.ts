@@ -1,6 +1,9 @@
+import { mkdtemp, realpath, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { JournalCompletionV1, JournalIntentV1 } from "@grandbox-bridge/shared";
 import { describe, expect, it, vi } from "vitest";
-import type { JournalStore } from "./journal-store.js";
+import { FileJournalStore, type JournalStore } from "./journal-store.js";
 import {
   recoverIncompleteJournal,
   type LocalRecoveryObserver,
@@ -74,6 +77,10 @@ function remote(result: Awaited<ReturnType<RemoteRecoveryObserver["classify"]>>)
   return { classify: async () => result };
 }
 
+async function temporaryDirectory(): Promise<string> {
+  return realpath(await mkdtemp(join(tmpdir(), "grandbox-recovery-")));
+}
+
 describe("recoverIncompleteJournal", () => {
   it("reports a clean local recovery when the journal is empty", async () => {
     const result = await recoverIncompleteJournal({
@@ -87,6 +94,44 @@ describe("recoverIncompleteJournal", () => {
     });
 
     expect(result.status).toBe("clean");
+  });
+
+  it.each([
+    {
+      name: "missing",
+      arrange: async (directory: string) => join(directory, "missing-runtime-parent", "journal"),
+    },
+    {
+      name: "symlinked",
+      arrange: async (directory: string) => {
+        const outside = await mkdtemp(join(tmpdir(), "grandbox-recovery-parent-outside-"));
+        const parent = join(directory, "symlinked-runtime-parent");
+        await symlink(outside, parent);
+        return join(parent, "journal");
+      },
+    },
+    {
+      name: "non-directory",
+      arrange: async (directory: string) => {
+        const parent = join(directory, "file-runtime-parent");
+        await writeFile(parent, "not a directory", { mode: 0o600 });
+        return join(parent, "journal");
+      },
+    },
+  ])("requires recovery when FileJournalStore reads through a $name parent", async ({ arrange }) => {
+    const directory = await temporaryDirectory();
+    const observe = vi.fn<LocalRecoveryObserver["observe"]>();
+    const classify = vi.fn<RemoteRecoveryObserver["classify"]>();
+
+    const result = await recoverIncompleteJournal({
+      journal: new FileJournalStore(await arrange(directory), INSTALLATION_ID),
+      localObserver: { observe },
+      remoteObserver: { classify },
+    });
+
+    expect(result).toMatchObject({ status: "recovery-required", processed: 0, reconciled: 0, retryable: 0 });
+    expect(observe).not.toHaveBeenCalled();
+    expect(classify).not.toHaveBeenCalled();
   });
 
   it("marks a write crash before mutation as retryable with pre-state evidence", async () => {
