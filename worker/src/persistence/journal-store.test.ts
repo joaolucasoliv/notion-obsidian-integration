@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { chmod, lstat, mkdir, mkdtemp, readdir, realpath, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { JournalCompletionV1, JournalIntentV1 } from "@grandbox-bridge/shared";
 import { describe, expect, it } from "vitest";
 import { FileJournalStore } from "./journal-store.js";
@@ -45,6 +45,12 @@ function completion(): JournalCompletionV1 {
   };
 }
 
+type DirectorySyncHook = (directoryPath: string, sync: () => Promise<void>) => Promise<void>;
+
+function journalStoreWithSyncHook(journalDir: string, syncDirectory: DirectorySyncHook): FileJournalStore {
+  return new FileJournalStore(journalDir, INSTALLATION_ID, { syncDirectory });
+}
+
 async function privateJournal(directory: string): Promise<string> {
   const journal = join(directory, "journal");
   await mkdir(journal, { mode: 0o700 });
@@ -67,6 +73,63 @@ describe("FileJournalStore", () => {
     const store = new FileJournalStore(join(directory, "journal"), INSTALLATION_ID);
 
     await expect(store.incomplete()).resolves.toEqual([]);
+  });
+
+  it("fails closed instead of recursively creating a missing journal parent", async () => {
+    const directory = await temporaryDirectory();
+    const missingParent = join(directory, "missing-runtime-parent");
+    const store = new FileJournalStore(join(missingParent, "journal"), INSTALLATION_ID);
+
+    await expect(store.begin(intent(INTENT_A))).rejects.toThrow(/journal store failed/i);
+    await expect(readdir(missingParent)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("fsyncs a new journal parent entry before its journal metadata", async () => {
+    const directory = await temporaryDirectory();
+    const journal = join(directory, "journal");
+    const synchronized: string[] = [];
+    const store = journalStoreWithSyncHook(journal, async (directoryPath, sync) => {
+      await sync();
+      synchronized.push(directoryPath);
+    });
+
+    await store.begin(intent(INTENT_A));
+
+    expect(synchronized.slice(0, 2)).toEqual([dirname(journal), journal]);
+  });
+
+  it("fails closed when syncing a newly created journal directory fails", async () => {
+    const directory = await temporaryDirectory();
+    const journal = join(directory, "journal");
+    const synchronized: string[] = [];
+    const store = journalStoreWithSyncHook(journal, async (directoryPath) => {
+      synchronized.push(directoryPath);
+      throw new Error("injected journal directory sync failure");
+    });
+
+    await expect(store.begin(intent(INTENT_A))).rejects.toThrow(/journal store failed/i);
+    expect(synchronized).toEqual([dirname(journal)]);
+    await expect(readdir(journal)).resolves.toEqual([]);
+  });
+
+  it("retries parent durability before a later begin after journal creation sync fails", async () => {
+    const directory = await temporaryDirectory();
+    const journal = join(directory, "journal");
+    const synchronized: string[] = [];
+    let failParentSync = true;
+    const store = journalStoreWithSyncHook(journal, async (directoryPath, sync) => {
+      synchronized.push(directoryPath);
+      if (directoryPath === dirname(journal) && failParentSync) {
+        failParentSync = false;
+        throw new Error("injected initial journal parent sync failure");
+      }
+      await sync();
+    });
+
+    await expect(store.begin(intent(INTENT_A))).rejects.toThrow(/journal store failed/i);
+    await expect(store.begin(intent(INTENT_B))).resolves.toBeUndefined();
+
+    expect(synchronized.slice(0, 2)).toEqual([dirname(journal), dirname(journal)]);
   });
 
   it("persists private intents in deterministic ID order without note bodies", async () => {

@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { chmod, link, lstat, mkdir, open, readdir, unlink } from "node:fs/promises";
-import { isAbsolute, join, normalize, resolve } from "node:path";
+import { dirname, isAbsolute, join, normalize, resolve } from "node:path";
 import {
   parseJournalCompletion,
   parseJournalIntent,
@@ -24,6 +24,11 @@ export interface JournalStore {
   begin(intent: JournalIntentV1): Promise<void>;
   complete(id: string, evidence: JournalCompletionV1): Promise<void>;
   incomplete(): Promise<readonly JournalIntentV1[]>;
+}
+
+/** Narrow test-only synchronization seam; no runtime configuration consumes this. */
+export interface FileJournalStoreTestHooks {
+  readonly syncDirectory?: (directoryPath: string, sync: () => Promise<void>) => Promise<void>;
 }
 
 interface FileIdentity {
@@ -127,6 +132,7 @@ export class FileJournalStore implements JournalStore {
   public constructor(
     private readonly journalDir: string,
     private readonly installationId: string,
+    private readonly testHooks: FileJournalStoreTestHooks = {},
   ) {
     try {
       this.journalQueueKey = normalizedJournalQueueKey(journalDir);
@@ -145,7 +151,6 @@ export class FileJournalStore implements JournalStore {
         if (snapshot.intents.size >= MAX_JOURNAL_OPERATION_IDS || snapshot.intents.has(parsed.id)) {
           throw journalStoreError();
         }
-        await this.ensurePrivateJournalDirectory();
         await this.writeExclusive(intentFilename(parsed.id), serializeRecord(exactIntentSnapshot(parsed)));
       });
     } catch {
@@ -162,7 +167,6 @@ export class FileJournalStore implements JournalStore {
         if (!snapshot.intents.has(id) || snapshot.completions.has(id)) {
           throw journalStoreError();
         }
-        await this.ensurePrivateJournalDirectory();
         await this.writeExclusive(completionFilename(id), serializeRecord(exactCompletionSnapshot(parsed)));
       });
     } catch {
@@ -211,14 +215,29 @@ export class FileJournalStore implements JournalStore {
   }
 
   private async ensurePrivateJournalDirectory(): Promise<void> {
+    const parent = dirname(this.journalDir);
+    await assertCanonicalRuntimePath(parent);
+    const parentEntry = await lstat(parent);
+    if (parentEntry.isSymbolicLink() || !parentEntry.isDirectory()) {
+      throw journalStoreError();
+    }
     await assertCanonicalRuntimePath(this.journalDir);
-    await mkdir(this.journalDir, { recursive: true, mode: PRIVATE_DIRECTORY_MODE });
+    try {
+      await mkdir(this.journalDir, { mode: PRIVATE_DIRECTORY_MODE });
+    } catch (caught) {
+      if ((caught as NodeJS.ErrnoException).code !== "EEXIST") {
+        throw journalStoreError();
+      }
+    }
     await assertCanonicalRuntimePath(this.journalDir);
     const before = await lstat(this.journalDir);
     if (before.isSymbolicLink() || !before.isDirectory()) {
       throw journalStoreError();
     }
-    await chmod(this.journalDir, PRIVATE_DIRECTORY_MODE);
+    const permissionsUpdated = (before.mode & 0o777) !== PRIVATE_DIRECTORY_MODE;
+    if (permissionsUpdated) {
+      await chmod(this.journalDir, PRIVATE_DIRECTORY_MODE);
+    }
     const after = await lstat(this.journalDir);
     if (
       after.isSymbolicLink() ||
@@ -227,6 +246,10 @@ export class FileJournalStore implements JournalStore {
     ) {
       throw journalStoreError();
     }
+    // A previous failed attempt may have created the directory without making
+    // its entry durable, so every successful ensure re-syncs the parent first.
+    await this.syncDirectory(parent);
+    await this.syncDirectory(this.journalDir);
   }
 
   private async readSnapshot(): Promise<JournalSnapshot> {
@@ -389,14 +412,27 @@ export class FileJournalStore implements JournalStore {
   }
 
   private async syncJournalDirectory(): Promise<void> {
-    await this.ensurePrivateJournalDirectory();
-    const handle = await open(this.journalDir, constants.O_RDONLY | constants.O_NOFOLLOW);
+    await this.syncDirectory(this.journalDir);
+  }
+
+  private async syncDirectory(directoryPath: string): Promise<void> {
+    await assertCanonicalRuntimePath(directoryPath);
+    const named = await lstat(directoryPath);
+    if (named.isSymbolicLink() || !named.isDirectory()) {
+      throw journalStoreError();
+    }
+    const handle = await open(directoryPath, constants.O_RDONLY | constants.O_NOFOLLOW);
     try {
       const entry = await handle.stat();
       if (!entry.isDirectory()) {
         throw journalStoreError();
       }
-      await handle.sync();
+      const sync = async (): Promise<void> => handle.sync();
+      if (this.testHooks.syncDirectory === undefined) {
+        await sync();
+      } else {
+        await this.testHooks.syncDirectory(directoryPath, sync);
+      }
     } finally {
       await handle.close();
     }

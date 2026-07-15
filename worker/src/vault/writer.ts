@@ -31,6 +31,7 @@ export interface AtomicVaultWriterTestHooks {
   readonly beforeCreateFinalize?: (
     paths: Readonly<{ parentPath: string; targetPath: string; temporaryPath: string }>,
   ) => Promise<void>;
+  readonly syncDirectory?: (directoryPath: string, sync: () => Promise<void>) => Promise<void>;
 }
 
 interface FileIdentity {
@@ -302,6 +303,7 @@ export class AtomicVaultWriter implements VaultWriter {
     await this.assertRoot();
     for (const segment of segments.slice(0, -1)) {
       const next = join(current, segment);
+      let created = false;
       try {
         await this.assertExistingDirectory(next);
       } catch (caught) {
@@ -311,14 +313,20 @@ export class AtomicVaultWriter implements VaultWriter {
         await this.assertExistingDirectory(current);
         try {
           await mkdir(next, { mode: PRIVATE_DIRECTORY_MODE });
-          await chmod(next, PRIVATE_DIRECTORY_MODE);
+          created = true;
         } catch (mkdirError) {
           if ((mkdirError as NodeJS.ErrnoException).code !== "EEXIST") {
             throw vaultWriterError();
           }
         }
         await this.assertExistingDirectory(next);
+        if (created) {
+          await chmod(next, PRIVATE_DIRECTORY_MODE);
+          await this.assertExistingDirectory(next);
+        }
       }
+      await this.syncDirectory(current);
+      await this.syncDirectory(next);
       current = next;
     }
     return this.assertAbsentTarget(segments);
@@ -470,7 +478,12 @@ export class AtomicVaultWriter implements VaultWriter {
       if (!entry.isDirectory()) {
         throw vaultWriterError();
       }
-      await handle.sync();
+      const sync = async (): Promise<void> => handle.sync();
+      if (this.testHooks.syncDirectory === undefined) {
+        await sync();
+      } else {
+        await this.testHooks.syncDirectory(directoryPath, sync);
+      }
     } finally {
       await handle.close();
     }

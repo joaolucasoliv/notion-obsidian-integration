@@ -122,6 +122,80 @@ describe("AtomicVaultWriter", () => {
     expect(await readFile(target, "utf8")).toBe(content);
   });
 
+  it("fsyncs each created ancestor entry and metadata before finalizing a create", async () => {
+    const vault = await temporaryVault();
+    const root = await canonicalVaultRoot(vault, INSTALLATION_ID, { mode: "bootstrap" });
+    const synchronized: string[] = [];
+    const writer = new AtomicVaultWriter(root, {
+      syncDirectory: async (directoryPath, sync) => {
+        await sync();
+        synchronized.push(directoryPath);
+      },
+    });
+    const newDirectory = join(root.canonicalRealPath, "New");
+    const nestedDirectory = join(newDirectory, "A");
+    const target = join(nestedDirectory, "note.md");
+
+    await writer.create({ relativePath: "New/A/note.md", expectedAbsent: true, content: "new" });
+
+    expect(synchronized).toEqual([
+      root.canonicalRealPath,
+      newDirectory,
+      newDirectory,
+      nestedDirectory,
+      nestedDirectory,
+      nestedDirectory,
+    ]);
+    expect((await lstat(newDirectory)).mode & 0o777).toBe(0o700);
+    expect((await lstat(nestedDirectory)).mode & 0o777).toBe(0o700);
+    expect(await readFile(target, "utf8")).toBe("new");
+  });
+
+  it("fails closed before descending when a created ancestor sync fails", async () => {
+    const vault = await temporaryVault();
+    const root = await canonicalVaultRoot(vault, INSTALLATION_ID, { mode: "bootstrap" });
+    const synchronized: string[] = [];
+    const writer = new AtomicVaultWriter(root, {
+      syncDirectory: async (directoryPath) => {
+        synchronized.push(directoryPath);
+        throw new Error("injected ancestor directory sync failure");
+      },
+    });
+    const nestedDirectory = join(vault, "New", "A");
+
+    await expect(
+      writer.create({ relativePath: "New/A/note.md", expectedAbsent: true, content: "new" }),
+    ).rejects.toThrow(/vault writer failed/i);
+    expect(synchronized).toEqual([root.canonicalRealPath]);
+    await expect(lstat(nestedDirectory)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("retries root durability before a later create after an ancestor sync fails", async () => {
+    const vault = await temporaryVault();
+    const root = await canonicalVaultRoot(vault, INSTALLATION_ID, { mode: "bootstrap" });
+    const synchronized: string[] = [];
+    let failRootSync = true;
+    const writer = new AtomicVaultWriter(root, {
+      syncDirectory: async (directoryPath, sync) => {
+        synchronized.push(directoryPath);
+        if (directoryPath === root.canonicalRealPath && failRootSync) {
+          failRootSync = false;
+          throw new Error("injected initial root sync failure");
+        }
+        await sync();
+      },
+    });
+
+    await expect(
+      writer.create({ relativePath: "New/A/first.md", expectedAbsent: true, content: "first" }),
+    ).rejects.toThrow(/vault writer failed/i);
+    await expect(
+      writer.create({ relativePath: "New/A/note.md", expectedAbsent: true, content: "new" }),
+    ).resolves.toEqual({ byteHash: await sha256Hex("new") });
+
+    expect(synchronized.slice(0, 2)).toEqual([root.canonicalRealPath, root.canonicalRealPath]);
+  });
+
   it("rejects symlink leaves and ancestors without following them", async () => {
     const vault = await temporaryVault();
     const outside = await temporaryVault();
