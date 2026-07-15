@@ -1,4 +1,4 @@
-import { constantTimeEqual, utf8 } from "./hmac.js";
+import { constantTimeEqual, utf8 } from "./hmac.ts";
 
 export interface BearerAuthenticator<T> {
   authenticate(bearer: string): Promise<T | null>;

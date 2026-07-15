@@ -1,8 +1,8 @@
-import type { GraphDocumentV1, GraphEnvelopeV1, GraphProjectionV1 } from "../contracts/graph.js";
-import { sha256Hex } from "./hash.js";
-import { fromBase64url, base64url } from "./base64url.js";
-import { canonicalJson } from "./canonical-json.js";
-import { parseGraphDocument, parseGraphEnvelope, parseGraphProjection } from "../schemas/graph.js";
+import type { GraphDocumentV1, GraphEnvelopeV1, GraphProjectionV1 } from "../contracts/graph.ts";
+import { sha256Hex } from "./hash.ts";
+import { fromBase64url, base64url } from "./base64url.ts";
+import { canonicalJson } from "./canonical-json.ts";
+import { parseGraphDocument, parseGraphEnvelope, parseGraphProjection } from "../schemas/graph.ts";
 
 export const MAX_GRAPH_DECOMPRESSED_BYTES = 5 * 1024 * 1024;
 

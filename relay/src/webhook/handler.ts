@@ -1,4 +1,4 @@
-import { authenticateRequestBearer, type BearerAuthenticator } from "../auth/bearer.js";
+import { authenticateRequestBearer, type BearerAuthenticator } from "../auth/bearer.ts";
 import {
   MAX_WEBHOOK_BODY_BYTES,
   WEBHOOK_RATE_LIMIT,
@@ -6,8 +6,8 @@ import {
   boundedRetryAfterSeconds,
   isJsonContentType,
   readBodyAtMost,
-} from "../auth/limits.js";
-import { verifyNotionBody } from "../auth/hmac.js";
+} from "../auth/limits.ts";
+import { verifyNotionBody } from "../auth/hmac.ts";
 import {
   badRequest,
   internalServerError,
@@ -17,9 +17,9 @@ import {
   tooManyRequests,
   unauthorized,
   unsupportedMediaType,
-} from "../http/response.js";
-import type { RateCounterResult, WebhookEventInput } from "../queue/repository.js";
-import { encryptBootstrapVerificationToken, parseBootstrapVerificationToken } from "./bootstrap.js";
+} from "../http/response.ts";
+import type { RateCounterResult, WebhookEventInput } from "../queue/repository.ts";
+import { encryptBootstrapVerificationToken, parseBootstrapVerificationToken } from "./bootstrap.ts";
 
 const EVENT_WINDOW_MILLISECONDS = 10 * 60 * 1_000;
 const UUID = /^[\da-f]{8}-[\da-f]{4}-[1-5][\da-f]{3}-[89ab][\da-f]{3}-[\da-f]{12}$/i;

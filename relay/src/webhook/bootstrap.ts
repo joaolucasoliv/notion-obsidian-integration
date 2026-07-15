@@ -1,4 +1,4 @@
-import { utf8 } from "../auth/hmac.js";
+import { utf8 } from "../auth/hmac.ts";
 
 const decoder = new TextDecoder("utf-8", { fatal: true });
 

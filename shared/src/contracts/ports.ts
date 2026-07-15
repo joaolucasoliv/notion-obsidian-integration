@@ -1,6 +1,6 @@
-import type { NotionObservation } from "./planning.js";
-import type { PairStatus } from "./core.js";
-import type { SafeLogEntry } from "../errors.js";
+import type { NotionObservation } from "./planning.ts";
+import type { PairStatus } from "./core.ts";
+import type { SafeLogEntry } from "../errors.ts";
 
 export type CredentialSlot = "notion-token" | "relay-token" | "relay-token-pending" | "graph-key";
 

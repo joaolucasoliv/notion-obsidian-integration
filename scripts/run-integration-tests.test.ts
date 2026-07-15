@@ -1,3 +1,6 @@
+import { readFile } from "node:fs/promises";
+import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { IntegrationRunnerError, runIntegrationTests, type IntegrationProcessAdapter } from "./run-integration-tests.mjs";
 
@@ -7,8 +10,13 @@ type Call = {
   readonly options: { readonly cwd: string; readonly shell: false; readonly maxOutputBytes: number; readonly env?: Readonly<Record<string, string>> };
 };
 
+type StartedCall = Call & {
+  readonly stop: () => Promise<void>;
+};
+
 class RecordingProcessAdapter implements IntegrationProcessAdapter {
   readonly calls: Call[] = [];
+  readonly startedCalls: StartedCall[] = [];
   readonly signalHandlers = new Map<string, () => void>();
   readonly root = "/repo";
   readonly secrets = ["local-anon-secret", "local-service-secret", "local-jwt-secret"];
@@ -19,8 +27,12 @@ class RecordingProcessAdapter implements IntegrationProcessAdapter {
   startFailsUntilStopped = false;
   private stoppedBeforeStart = false;
   failStart = false;
+  failFunctionStart = false;
   failReset = false;
   failVitest = false;
+  functionStopCount = 0;
+  runtimeEnvironmentRemovals = 0;
+  runtimeEnvironmentValues: Readonly<Record<string, string>> | null = null;
   invokeSignalDuringVitest: string | null = null;
   pauseOperation: "start" | "reset" | null = null;
   outputCapWhilePaused = false;
@@ -115,6 +127,20 @@ class RecordingProcessAdapter implements IntegrationProcessAdapter {
     return { code: 0, stdout: "", stderr: "" };
   }
 
+  async start(executable: string, args: readonly string[], options: Call["options"]): Promise<{ readonly stop: () => Promise<void> }> {
+    if (this.failFunctionStart) {
+      throw new IntegrationRunnerError("Local Edge Functions process could not start");
+    }
+    const call: StartedCall = {
+      executable,
+      args,
+      options,
+      stop: async () => { this.functionStopCount += 1; },
+    };
+    this.startedCalls.push(call);
+    return { stop: call.stop };
+  }
+
   onSignal(signal: "SIGINT" | "SIGTERM", handler: () => void): () => void {
     this.signalHandlers.set(signal, handler);
     return () => this.signalHandlers.delete(signal);
@@ -130,6 +156,8 @@ function runnerOptions(adapter: RecordingProcessAdapter) {
     cwd: adapter.root,
     localBinaries: {
       supabase: "/repo/node_modules/.bin/supabase",
+      supabaseNative: "/repo/node_modules/@supabase/cli-darwin-arm64/bin/supabase",
+      tsc: "/repo/node_modules/.bin/tsc",
       vitest: "/repo/node_modules/.bin/vitest",
     },
     configToml: "[api]\nenabled = true\n",
@@ -138,17 +166,53 @@ function runnerOptions(adapter: RecordingProcessAdapter) {
       readText: async () => "[api]\nenabled = true\n",
     },
     adapter,
+    createRuntimeEnvironment: async (values: Readonly<Record<string, string>>) => {
+      adapter.runtimeEnvironmentValues = values;
+      return {
+      path: "/tmp/grandbox-bridge-edge-functions.env",
+      remove: async () => { adapter.runtimeEnvironmentRemovals += 1; },
+      };
+    },
+    waitForFunctionRoutes: async () => undefined,
   };
 }
 
 describe("local relay integration runner", () => {
+  it("does not stage ignored build artifacts before serving Edge Functions", async () => {
+    const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
+    const runner = await readFile(resolve(root, "scripts/run-integration-tests.mjs"), "utf8");
+
+    expect(runner).not.toContain("stageEdgeFunctions");
+    expect(runner).not.toContain("_generated");
+  });
+
+  it("keeps each Edge entrypoint wired to committed TypeScript source", async () => {
+    const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
+    const [bridgeApi, notionWebhook, bridgeConfig, webhookConfig] = await Promise.all([
+      readFile(resolve(root, "relay/supabase/functions/bridge-api/index.ts"), "utf8"),
+      readFile(resolve(root, "relay/supabase/functions/notion-webhook/index.ts"), "utf8"),
+      readFile(resolve(root, "relay/supabase/functions/bridge-api/deno.json"), "utf8"),
+      readFile(resolve(root, "relay/supabase/functions/notion-webhook/deno.json"), "utf8"),
+    ]);
+
+    for (const entrypoint of [bridgeApi, notionWebhook]) {
+      expect(entrypoint).not.toContain("_generated");
+      expect(entrypoint).toContain("../../../src/");
+    }
+    for (const configuration of [bridgeConfig, webhookConfig]) {
+      expect(configuration).toContain("../../../../shared/src/index.ts");
+      expect(configuration).not.toContain("_generated");
+    }
+  });
+
   it("uses only local argv commands, resets the local database, and stops a stack it started", async () => {
     const adapter = new RecordingProcessAdapter();
     await runIntegrationTests(["tests/integration/relay-local.test.ts"], runnerOptions(adapter));
 
     expect(adapter.calls).toEqual(expect.arrayContaining([
       expect.objectContaining({ executable: "/repo/node_modules/.bin/supabase", args: ["--workdir", "relay", "status", "--output", "env"] }),
-      expect.objectContaining({ executable: "/repo/node_modules/.bin/supabase", args: ["--workdir", "relay", "start"] }),
+      expect.objectContaining({ executable: "/repo/node_modules/.bin/supabase", args: ["--workdir", "relay", "start", "--ignore-health-check", "--exclude", "vector,logflare"] }),
+      expect.objectContaining({ executable: "/repo/node_modules/.bin/tsc", args: ["-b", "shared", "relay"] }),
       expect.objectContaining({ executable: "/repo/node_modules/.bin/supabase", args: ["--workdir", "relay", "db", "reset", "--local"] }),
       expect.objectContaining({ executable: "/repo/node_modules/.bin/vitest", args: ["run", "--config", "vitest.integration.config.ts", "tests/integration/relay-local.test.ts"] }),
       expect.objectContaining({ executable: "/repo/node_modules/.bin/supabase", args: ["--workdir", "relay", "stop", "--no-backup"] }),
@@ -156,6 +220,27 @@ describe("local relay integration runner", () => {
     expect(adapter.calls.every((call) => call.options.shell === false)).toBe(true);
     expect(adapter.calls.every((call) => call.options.maxOutputBytes > 0)).toBe(true);
     expect(adapter.calls.some((call) => call.options.env && Object.values(call.options.env).includes("local-anon-secret"))).toBe(true);
+    expect(adapter.runtimeEnvironmentValues).toMatchObject({
+      RELAY_SERVICE_ROLE_KEY: "local-service-secret",
+      RELAY_TOKEN_PEPPER: "edge-local-fixture-pepper",
+    });
+  });
+
+  it("owns an explicit no-JWT Edge Functions server and stops it after an intended integration failure", async () => {
+    const adapter = new RecordingProcessAdapter();
+    adapter.failVitest = true;
+
+    await expect(runIntegrationTests(["tests/integration/relay-edge-local.test.ts"], runnerOptions(adapter))).rejects.toThrow(/Integration tests failed/i);
+
+    expect(adapter.startedCalls).toEqual([
+      expect.objectContaining({
+        executable: "/repo/node_modules/@supabase/cli-darwin-arm64/bin/supabase",
+        args: ["--workdir", "relay", "functions", "serve", "--no-verify-jwt", "--env-file", expect.any(String)],
+      }),
+    ]);
+    expect(adapter.startedCalls[0]?.options.shell).toBe(false);
+    expect(adapter.functionStopCount).toBe(1);
+    expect(adapter.runtimeEnvironmentRemovals).toBe(1);
   });
 
   it("does not stop a pre-existing local stack", async () => {

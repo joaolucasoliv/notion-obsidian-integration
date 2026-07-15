@@ -1,5 +1,5 @@
 import { z } from "zod";
-import type { GraphDocumentV1, GraphEnvelopeV1, GraphProjectionV1 } from "../contracts/graph.js";
+import type { GraphDocumentV1, GraphEnvelopeV1, GraphProjectionV1 } from "../contracts/graph.ts";
 
 export const MAX_GRAPH_NODES = 10_000;
 export const MAX_GRAPH_EDGES = 50_000;

@@ -1,7 +1,7 @@
-import type { PairingPayloadV1 } from "../contracts/relay.js";
-import { canonicalJson } from "./canonical-json.js";
-import { base64url, fromBase64url } from "./base64url.js";
-import { parsePairingPayload } from "../schemas/relay.js";
+import type { PairingPayloadV1 } from "../contracts/relay.ts";
+import { canonicalJson } from "./canonical-json.ts";
+import { base64url, fromBase64url } from "./base64url.ts";
+import { parsePairingPayload } from "../schemas/relay.ts";
 
 const PAIRING_CODE_PREFIX = "gbp1.";
 export const MAX_PAIRING_CODE_CHARACTERS = 4_096;

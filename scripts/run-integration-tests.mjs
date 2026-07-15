@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
-import { readFile, readdir, realpath } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -26,6 +27,16 @@ const REQUIRED_LOCAL_SERVICE_NAMES = Object.freeze([
 ]);
 const LOCAL_STATUS_POLL_INTERVAL_MS = 250;
 const LOCAL_STATUS_TIMEOUT_MS = 10_000;
+const EDGE_FUNCTIONS_READY_TIMEOUT_MS = 20_000;
+const EDGE_FUNCTION_REQUEST_TIMEOUT_MS = 1_000;
+const EDGE_FUNCTIONS_READY_PATH = "/functions/v1/bridge-api/v1/graph/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+const EDGE_WEBHOOK_READY_PATH = "/functions/v1/notion-webhook";
+const LOCAL_EDGE_RUNTIME_ENVIRONMENT = Object.freeze({
+  RELAY_TOKEN_PEPPER: "edge-local-fixture-pepper",
+  RELAY_WEBHOOK_TOKENS_JSON: JSON.stringify({
+    "11111111-1111-4111-8111-111111111111": "edge-local-fixture-webhook-token",
+  }),
+});
 
 export class IntegrationRunnerError extends Error {}
 
@@ -91,6 +102,25 @@ function nodeFileSystem() {
         }
         throw error;
       }
+    },
+  };
+}
+
+async function createLocalEdgeRuntimeEnvironment(values = LOCAL_EDGE_RUNTIME_ENVIRONMENT) {
+  const directory = await mkdtemp(join(tmpdir(), "grandbox-bridge-edge-"));
+  const path = join(directory, "functions.env");
+  const lines = Object.entries(values).map(([name, value]) => `${name}=${value}`);
+  try {
+    await writeFile(path, lines.join("\n") + "\n", { encoding: "utf8", mode: 0o600 });
+    await chmod(path, 0o600);
+  } catch (error) {
+    await rm(directory, { recursive: true, force: true });
+    throw error;
+  }
+  return {
+    path,
+    async remove() {
+      await rm(directory, { recursive: true, force: true });
     },
   };
 }
@@ -189,6 +219,77 @@ function localVitestEnvironment(statusOutput, environment) {
   };
 }
 
+function localEdgeRuntimeEnvironment(statusOutput) {
+  const values = parseStatusEnvironment(statusOutput);
+  return {
+    ...LOCAL_EDGE_RUNTIME_ENVIRONMENT,
+    RELAY_SERVICE_ROLE_KEY: statusValue(values, LOCAL_ENVIRONMENT_NAMES.serviceRoleKey),
+  };
+}
+
+function localApiUrl(statusOutput) {
+  const value = statusValue(parseStatusEnvironment(statusOutput), LOCAL_ENVIRONMENT_NAMES.apiUrl);
+  let parsed;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw runnerError("Local Supabase status returned an invalid API URL");
+  }
+  if (parsed.protocol !== "http:" || (parsed.hostname !== "127.0.0.1" && parsed.hostname !== "localhost")) {
+    throw runnerError("Local Supabase status returned a non-local API URL");
+  }
+  return parsed.origin;
+}
+
+function functionRoutesReady(bridge, webhook) {
+  return bridge.status === 404
+    && webhook.status === 405;
+}
+
+async function requestWithTimeout(request, url, timeoutMilliseconds) {
+  const controller = new AbortController();
+  let timeoutId;
+  const timeout = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => {
+      controller.abort();
+      reject(new Error("Local Edge Function readiness request timed out"));
+    }, timeoutMilliseconds);
+  });
+  try {
+    return await Promise.race([request(url, { signal: controller.signal }), timeout]);
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+async function waitForLocalFunctionRoutes(options) {
+  const deadline = Date.now() + (options.readyTimeoutMilliseconds ?? EDGE_FUNCTIONS_READY_TIMEOUT_MS);
+  let lastFailure = null;
+  let exited = null;
+  if (options.processResult !== null) {
+    void options.processResult.then((result) => { exited = result; });
+  }
+  while (Date.now() < deadline) {
+    try {
+      const [bridge, webhook] = await Promise.all([
+        requestWithTimeout(options.request, options.apiUrl + EDGE_FUNCTIONS_READY_PATH, options.requestTimeoutMilliseconds ?? EDGE_FUNCTION_REQUEST_TIMEOUT_MS),
+        requestWithTimeout(options.request, options.apiUrl + EDGE_WEBHOOK_READY_PATH, options.requestTimeoutMilliseconds ?? EDGE_FUNCTION_REQUEST_TIMEOUT_MS),
+      ]);
+      if (functionRoutesReady(bridge, webhook)) {
+        return;
+      }
+      lastFailure = `bridge=${bridge.status}, webhook=${webhook.status}`;
+    } catch {
+      lastFailure = "request failed";
+    }
+    if (options.isSignalled?.() || exited !== null) {
+      throw runnerError("Local Edge Functions process exited before its routes became ready");
+    }
+    await options.waitForPoll(LOCAL_STATUS_POLL_INTERVAL_MS);
+  }
+  throw runnerError(`Timed out waiting for local Edge Function routes (${lastFailure ?? "unavailable"})`);
+}
+
 async function resolveLocalBinary(cwd, name) {
   const nodeModules = resolve(cwd, "node_modules");
   const expected = join(nodeModules, ".bin", name);
@@ -200,6 +301,25 @@ async function resolveLocalBinary(cwd, name) {
   }
   if (!isDescendant(nodeModules, binary)) {
     throw runnerError(`Unsafe ${name} binary path`);
+  }
+  return binary;
+}
+
+async function resolveLocalSupabaseNativeBinary(cwd) {
+  const nodeModules = resolve(cwd, "node_modules");
+  const platform = process.platform === "win32" ? "win32" : process.platform;
+  const architecture = process.arch;
+  const packageName = `cli-${platform}-${architecture}`;
+  const executable = process.platform === "win32" ? "supabase.exe" : "supabase";
+  const expected = join(nodeModules, "@supabase", packageName, "bin", executable);
+  let binary;
+  try {
+    binary = await realpath(expected);
+  } catch {
+    throw runnerError("Missing checked-in local Supabase native binary");
+  }
+  if (!isDescendant(nodeModules, binary)) {
+    throw runnerError("Unsafe Supabase native binary path");
   }
   return binary;
 }
@@ -261,6 +381,79 @@ function nodeProcessAdapter() {
         });
       });
     },
+    start(executable, args, options) {
+      return new Promise((resolveStarted, rejectStarted) => {
+        let totalBytes = 0;
+        let stdout = "";
+        let stderr = "";
+        let outputLimitError = null;
+        let started = false;
+        let settled = false;
+        let resolveChildSettled;
+        let resolveResult;
+        activeChildSettled = new Promise((resolve) => { resolveChildSettled = resolve; });
+        const result = new Promise((resolve) => { resolveResult = resolve; });
+        const child = spawn(executable, args, {
+          cwd: options.cwd,
+          env: options.env,
+          shell: false,
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+        const failForOutput = () => {
+          if (!outputLimitError) {
+            outputLimitError = runnerError("Local subprocess output exceeded the safety limit");
+            child.kill("SIGTERM");
+          }
+        };
+        const append = (target, chunk) => {
+          if (outputLimitError) {
+            return target;
+          }
+          totalBytes += chunk.byteLength;
+          if (totalBytes > options.maxOutputBytes) {
+            failForOutput();
+            return target;
+          }
+          return target + chunk.toString("utf8");
+        };
+        const settle = (code) => {
+          if (settled) return;
+          settled = true;
+          resolveChildSettled();
+          resolveResult({ code: code ?? 1, stdout, stderr });
+        };
+        const stop = async () => {
+          if (!settled) {
+            child.kill("SIGTERM");
+          }
+          const ended = await result;
+          if (outputLimitError) {
+            throw outputLimitError;
+          }
+          if (ended.code !== 0 && !settled) {
+            throw runnerError("Local Edge Functions process could not stop");
+          }
+        };
+        child.stdout.on("data", (chunk) => { stdout = append(stdout, chunk); });
+        child.stderr.on("data", (chunk) => { stderr = append(stderr, chunk); });
+        child.once("spawn", () => {
+          started = true;
+          resolveStarted({ stop, result });
+        });
+        child.once("error", () => {
+          settle(1);
+          if (!started) {
+            rejectStarted(outputLimitError ?? runnerError("Local Edge Functions process could not start"));
+          }
+        });
+        child.once("close", (code) => {
+          settle(code);
+          if (!started) {
+            rejectStarted(outputLimitError ?? runnerError("Local Edge Functions process could not start"));
+          }
+        });
+      });
+    },
     waitForActiveChild() {
       return activeChildSettled;
     },
@@ -294,14 +487,21 @@ export async function runIntegrationTests(argv = [], options = {}) {
   await assertNoLinkedLocalState(cwd, filesystem);
   const localBinaries = options.localBinaries ?? {
     supabase: await resolveLocalBinary(cwd, "supabase"),
+    supabaseNative: await resolveLocalSupabaseNativeBinary(cwd),
+    tsc: await resolveLocalBinary(cwd, "tsc"),
     vitest: await resolveLocalBinary(cwd, "vitest"),
   };
   const adapter = options.adapter ?? nodeProcessAdapter();
   const waitForPoll = options.waitForPoll ?? wait;
+  const request = options.request ?? fetch;
+  const createRuntimeEnvironment = options.createRuntimeEnvironment ?? createLocalEdgeRuntimeEnvironment;
   const commandOptions = Object.freeze({ cwd, shell: false, maxOutputBytes: MAX_SUBPROCESS_OUTPUT_BYTES });
   let startedHere = false;
   let startAttemptedHere = false;
   let stopPromise = null;
+  let functionStopPromise = null;
+  let functionsProcess = null;
+  let runtimeEnvironment = null;
   let receivedSignal = null;
 
   const readLocalStatus = () => adapter.run(
@@ -322,7 +522,23 @@ export async function runIntegrationTests(argv = [], options = {}) {
     return status;
   };
 
+  const stopFunctionsIfOwned = async () => {
+    if (functionsProcess === null) {
+      return;
+    }
+    functionStopPromise ??= functionsProcess.stop();
+    await functionStopPromise;
+  };
+  const removeRuntimeEnvironment = async () => {
+    if (runtimeEnvironment === null) {
+      return;
+    }
+    const environmentFile = runtimeEnvironment;
+    runtimeEnvironment = null;
+    await environmentFile.remove();
+  };
   const stopIfOwned = async () => {
+    await stopFunctionsIfOwned();
     if (!startedHere && !startAttemptedHere) {
       return;
     }
@@ -353,6 +569,14 @@ export async function runIntegrationTests(argv = [], options = {}) {
 
   let primaryError = null;
   try {
+    await runChecked(
+      adapter,
+      localBinaries.tsc,
+      ["-b", "shared", "relay"],
+      commandOptions,
+      "Canonical relay build",
+    );
+    throwIfSignalled();
     let status = await readLocalStatus();
     throwIfSignalled();
     if (!isHealthyLocalStatus(status)) {
@@ -366,7 +590,13 @@ export async function runIntegrationTests(argv = [], options = {}) {
       );
       await waitForLocalStatus("to stop before restart", isStoppedLocalStatus);
       throwIfSignalled();
-      await runChecked(adapter, localBinaries.supabase, ["--workdir", "relay", "start"], commandOptions, "Local Supabase start");
+      await runChecked(
+        adapter,
+        localBinaries.supabase,
+        ["--workdir", "relay", "start", "--ignore-health-check", "--exclude", "vector,logflare"],
+        commandOptions,
+        "Local Supabase start",
+      );
       startedHere = true;
       throwIfSignalled();
       status = await waitForLocalStatus("to become healthy", isHealthyLocalStatus);
@@ -380,6 +610,26 @@ export async function runIntegrationTests(argv = [], options = {}) {
       commandOptions,
       "Local Supabase database reset",
     );
+    throwIfSignalled();
+    runtimeEnvironment = await createRuntimeEnvironment(localEdgeRuntimeEnvironment(status.stdout));
+    if (typeof adapter.start !== "function") {
+      throw runnerError("Local process adapter cannot start Edge Functions");
+    }
+    functionsProcess = await adapter.start(
+      localBinaries.supabaseNative ?? localBinaries.supabase,
+      ["--workdir", "relay", "functions", "serve", "--no-verify-jwt", "--env-file", runtimeEnvironment.path],
+      commandOptions,
+    );
+    const waitForFunctionRoutes = options.waitForFunctionRoutes ?? waitForLocalFunctionRoutes;
+    await waitForFunctionRoutes({
+      apiUrl: localApiUrl(status.stdout),
+      isSignalled: () => receivedSignal !== null,
+      processResult: functionsProcess.result ?? null,
+      request,
+      readyTimeoutMilliseconds: options.edgeFunctionsReadyTimeoutMs,
+      requestTimeoutMilliseconds: options.edgeFunctionsRequestTimeoutMs,
+      waitForPoll,
+    });
     throwIfSignalled();
     await runChecked(
       adapter,
@@ -396,12 +646,19 @@ export async function runIntegrationTests(argv = [], options = {}) {
     for (const remove of removers) {
       remove();
     }
+    let cleanupError = null;
     try {
       await stopIfOwned();
     } catch (error) {
-      if (!primaryError) {
-        throw error;
-      }
+      cleanupError = error;
+    }
+    try {
+      await removeRuntimeEnvironment();
+    } catch (error) {
+      cleanupError ??= error;
+    }
+    if (!primaryError && cleanupError) {
+      throw cleanupError;
     }
   }
 }

@@ -27,3 +27,9 @@ enabled = false
 
 [storage]
 enabled = false
+
+[functions.bridge-api]
+verify_jwt = false
+
+[functions.notion-webhook]
+verify_jwt = false

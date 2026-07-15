@@ -1,0 +1,7 @@
+{
+  "imports": {
+    "@grandbox-bridge/shared": "../../../../shared/src/index.ts",
+    "@supabase/supabase-js": "npm:@supabase/supabase-js@2.110.5",
+    "zod": "npm:zod@4.4.3"
+  }
+}

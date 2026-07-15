@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { bridgeRunSummarySchema } from "./summary.js";
+import { bridgeRunSummarySchema } from "./summary.ts";
 
 const sha256Schema = z.string().regex(/^[0-9a-f]{64}$/, "Expected a lowercase SHA-256 hash");
 const timestampSchema = z.string().datetime({ offset: true });

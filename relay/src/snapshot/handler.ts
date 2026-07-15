@@ -1,5 +1,5 @@
 import { parseGraphEnvelope, type GraphEnvelopeV1 } from "@grandbox-bridge/shared";
-import { boundedRetryAfterSeconds, isJsonContentType, readBodyAtMost } from "../auth/limits.js";
+import { boundedRetryAfterSeconds, isJsonContentType, readBodyAtMost } from "../auth/limits.ts";
 import {
   badRequest,
   conflict,
@@ -9,8 +9,8 @@ import {
   payloadTooLarge,
   tooManyRequests,
   unsupportedMediaType,
-} from "../http/response.js";
-import { isCanonicalGraphId, SnapshotRepository } from "./repository.js";
+} from "../http/response.ts";
+import { isCanonicalGraphId, SnapshotRepository } from "./repository.ts";
 
 const MAX_SNAPSHOT_REQUEST_BYTES = 8 * 1024 * 1024;
 const GRAPH_READ_LIMIT = 60;

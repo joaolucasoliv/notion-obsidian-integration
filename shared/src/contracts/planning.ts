@@ -5,8 +5,8 @@ import type {
   PlannedEffect,
   PairStatus,
   SemanticNote,
-} from "./core.js";
-import type { SafeError } from "../errors.js";
+} from "./core.ts";
+import type { SafeError } from "../errors.ts";
 
 export type LocalObservation =
   | {

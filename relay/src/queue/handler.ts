@@ -1,7 +1,7 @@
 import { base64url, fromBase64url } from "@grandbox-bridge/shared";
-import { authenticateRequestBearer } from "../auth/bearer.js";
-import { constantTimeEqual, utf8 } from "../auth/hmac.js";
-import { boundedRetryAfterSeconds, isJsonContentType, readBodyAtMost } from "../auth/limits.js";
+import { authenticateRequestBearer } from "../auth/bearer.ts";
+import { constantTimeEqual, utf8 } from "../auth/hmac.ts";
+import { boundedRetryAfterSeconds, isJsonContentType, readBodyAtMost } from "../auth/limits.ts";
 import {
   badRequest,
   conflict,
@@ -15,17 +15,17 @@ import {
   tooManyRequests,
   unauthorized,
   unsupportedMediaType,
-} from "../http/response.js";
-import { bridgeApiRoute, type BridgeApiRoute } from "../http/router.js";
-import { EventRepository, type StoredWebhookEvent } from "./repository.js";
+} from "../http/response.ts";
+import { bridgeApiRoute, type BridgeApiRoute } from "../http/router.ts";
+import { EventRepository, type StoredWebhookEvent } from "./repository.ts";
 import {
   handleAuthenticatedSnapshotUpload,
   handlePublicGraphRead,
   publicGraphNotFound,
   type SafeSnapshotLogCode,
   type SnapshotApiDependencies,
-} from "../snapshot/handler.js";
-import { SnapshotRepository } from "../snapshot/repository.js";
+} from "../snapshot/handler.ts";
+import { SnapshotRepository } from "../snapshot/repository.ts";
 
 const API_BODY_BYTES = 16 * 1024;
 const API_RATE_LIMIT = 120;

@@ -1,6 +1,6 @@
 import { z } from "zod";
-import type { PairingPayloadV1 } from "../contracts/relay.js";
-import { fromBase64url } from "../crypto/base64url.js";
+import type { PairingPayloadV1 } from "../contracts/relay.ts";
+import { fromBase64url } from "../crypto/base64url.ts";
 
 const identifierSchema = z.string().min(1).max(256);
 const pairingKeySchema = z.string().min(1).max(128).regex(/^[A-Za-z0-9_-]+$/).superRefine((value, context) => {
