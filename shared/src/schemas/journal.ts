@@ -32,6 +32,8 @@ export const journalEffectKindSchema = z.enum([
   "write-local",
   "create-conflict",
   "set-notion-status",
+  "register-relay-page",
+  "unregister-relay-page",
 ]);
 
 export const journalIntentV1Schema = z

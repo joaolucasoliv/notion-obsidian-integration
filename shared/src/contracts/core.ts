@@ -55,6 +55,7 @@ export interface BridgeConfigV1 {
   relay: null | { baseUrl: string };
   graph: null | {
     graphId: string;
+    keyId: string;
     webOrigin: string | null;
     domains: Array<{
       pathPrefix: string;

@@ -478,6 +478,22 @@ function managedProperties(input: {
   };
 }
 
+function blockParent(value: unknown, expectedBlockId: string): { readonly kind: "page" | "block"; readonly id: string } | null {
+  if (!isRecord(value) || value.object !== "block" || value.id !== expectedBlockId || !isRecord(value.parent) || typeof value.parent.type !== "string") {
+    throw clientFailure("invalid-response", false);
+  }
+  if (value.parent.type === "page_id") {
+    return isCanonicalUuid(value.parent.page_id) ? Object.freeze({ kind: "page" as const, id: value.parent.page_id }) : null;
+  }
+  if (value.parent.type === "block_id") {
+    return isCanonicalUuid(value.parent.block_id) ? Object.freeze({ kind: "block" as const, id: value.parent.block_id }) : null;
+  }
+  if (value.parent.type === "workspace" || value.parent.type === "database_id" || value.parent.type === "data_source_id") {
+    return null;
+  }
+  throw clientFailure("invalid-response", false);
+}
+
 export class NotionClient implements NotionApi {
   readonly #token: string;
   readonly #transport: NotionTransport;
@@ -527,6 +543,24 @@ export class NotionClient implements NotionApi {
     try {
       if (!isCanonicalUuid(pageId)) throw clientFailure("invalid-response", false);
       return await this.#decode(await this.#retrieveRaw(pageId));
+    } catch (caught) {
+      throw safeClientCaught(caught);
+    }
+  }
+
+  public async resolveEventPage(entityId: string, maxParentHops: number): Promise<string | null> {
+    try {
+      if (!isCanonicalUuid(entityId) || !Number.isSafeInteger(maxParentHops) || maxParentHops < 0 || maxParentHops > 16) {
+        throw clientFailure("invalid-response", false);
+      }
+      let current = entityId;
+      for (let hops = 0; hops < maxParentHops; hops += 1) {
+        const parent = blockParent(await this.#request<unknown>("GET", `/v1/blocks/${current}`), current);
+        if (parent === null) return null;
+        if (parent.kind === "page") return parent.id;
+        current = parent.id;
+      }
+      return null;
     } catch (caught) {
       throw safeClientCaught(caught);
     }

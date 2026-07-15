@@ -138,7 +138,7 @@ const credentialUnavailableFieldsSchema = z
   .object({
     runId: uuidSchema.optional(),
     installationId: uuidSchema.optional(),
-    slot: z.enum(["notion-token", "relay-token", "graph-key"]).optional(),
+    slot: z.enum(["notion-token", "relay-token", "relay-token-pending", "graph-key"]).optional(),
     errorCode: errorCodeSchema.optional(),
     retryable: z.boolean().optional(),
   })

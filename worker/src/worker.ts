@@ -1,4 +1,5 @@
 import {
+  fromBase64url,
   parseJournalCompletion,
   parseJournalIntent,
   type BridgeRunSummary,
@@ -10,11 +11,17 @@ import {
   type SafeErrorCode,
   type SafeLogger,
   type UuidSource,
+  type GraphPublishStateV1,
   type ParsedBridgeConfigV1,
   type ParsedBridgeStateV1,
   type JournalCompletionV1,
   type JournalIntentV1,
 } from "@grandbox-bridge/shared";
+import { buildGraphProjection, type GraphSourceNote } from "./graph/projection.js";
+import { GraphPublisher, type GraphNonceSource } from "./graph/publisher.js";
+import { RelayClient, RelayClientError, recoverPendingRelayTokenRotation } from "./relay/client.js";
+import { RelayEventSource, type RelayEvent } from "./relay/event-source.js";
+import { RelaySnapshotSink } from "./relay/snapshot-sink.js";
 import type { ConfigStore } from "./persistence/config-store.js";
 import type { JournalStore } from "./persistence/journal-store.js";
 import { recoverIncompleteJournal, type RemoteRecoveryObserver } from "./persistence/recovery.js";
@@ -55,6 +62,8 @@ export interface WorkerDependencies {
     context: Readonly<{ config: Readonly<ParsedBridgeConfigV1>; state: Readonly<ParsedBridgeStateV1>; root: CanonicalVaultRoot }>,
   ) => Promise<NotionApi> | NotionApi;
   readonly createWriter?: (root: CanonicalVaultRoot) => VaultWriter;
+  readonly createRelayClient?: (input: Readonly<{ baseUrl: string; token: string; clock: Clock }>) => RelayClient;
+  readonly nonceSource?: GraphNonceSource;
 }
 
 interface LoadedRunContext {
@@ -62,6 +71,18 @@ interface LoadedRunContext {
   readonly state: Readonly<ParsedBridgeStateV1>;
   readonly root: CanonicalVaultRoot;
   readonly token: string;
+  readonly relay: LoadedRelayContext | null;
+}
+
+interface LoadedRelayContext {
+  readonly relayToken: string;
+  readonly graphKey: Uint8Array;
+}
+
+interface RelayRunContext {
+  readonly client: RelayClient;
+  readonly source: RelayEventSource;
+  readonly graphKey: Uint8Array;
 }
 
 class WorkerFailure extends Error {
@@ -73,6 +94,22 @@ class WorkerFailure extends Error {
 
 function fixedError(code: SafeErrorCode, retryable = false): SafeError {
   return Object.freeze({ code, retryable });
+}
+
+function safeRelayError(caught: unknown): SafeError | null {
+  if (!(caught instanceof RelayClientError)) return null;
+  const codes: Readonly<Record<RelayClientError["code"], SafeErrorCode>> = {
+    authentication: "authentication-failed",
+    authorization: "authorization-failed",
+    "state-conflict": "revision-race",
+    "rate-limited": "rate-limited",
+    network: "network-failed",
+    timeout: "timeout",
+    "request-too-large": "request-too-large",
+    "response-too-large": "response-too-large",
+    "invalid-response": "invalid-response",
+  };
+  return fixedError(codes[caught.code], caught.retryable);
 }
 
 function safeTimestamp(clock: Clock): string {
@@ -138,6 +175,7 @@ function summary(
   counts: Pick<BridgeRunSummary, "planned" | "writes" | "pushed" | "pulled" | "conflicts" | "errors">,
   outcome: BridgeRunSummary["outcome"],
   clock: Clock,
+  graphUploads = 0,
 ): BridgeRunSummary {
   return Object.freeze({
     mode: input.mode,
@@ -148,7 +186,7 @@ function summary(
     pulled: counts.pulled,
     conflicts: counts.conflicts,
     errors: counts.errors,
-    graphUploads: 0,
+    graphUploads,
     startedAt,
     completedAt: safeTimestamp(clock),
   });
@@ -175,6 +213,18 @@ function validateContext(config: Readonly<ParsedBridgeConfigV1>, state: Readonly
   ) {
     throw new WorkerFailure(fixedError("invalid-config"));
   }
+  if ((config.relay === null) !== (config.graph === null)) {
+    throw new WorkerFailure(fixedError("invalid-config"));
+  }
+  if (
+    (config.graph === null && state.graph !== null) ||
+    (config.graph !== null && state.graph !== null && (
+      state.graph.graphId !== config.graph.graphId ||
+      state.graph.keyId !== config.graph.keyId
+    ))
+  ) {
+    throw new WorkerFailure(fixedError("invalid-state"));
+  }
 }
 
 function validateRoot(config: Readonly<ParsedBridgeConfigV1>, root: CanonicalVaultRoot): void {
@@ -192,6 +242,91 @@ function validateCredential(value: string | null): string {
     throw new WorkerFailure(fixedError("credential-unavailable"));
   }
   return value;
+}
+
+const GRAPH_KEY_BYTES = 32;
+const FULL_RECONCILIATION_INTERVAL_MS = 24 * 60 * 60 * 1_000;
+
+function validateRelayToken(value: string | null): string {
+  const token = validateCredential(value);
+  try {
+    if (token.length !== 43 || fromBase64url(token).byteLength !== GRAPH_KEY_BYTES) throw new Error("Invalid relay token");
+    return token;
+  } catch {
+    throw new WorkerFailure(fixedError("credential-unavailable"));
+  }
+}
+
+function validateGraphKey(value: string | null): Uint8Array {
+  const encoded = validateCredential(value);
+  try {
+    const key = fromBase64url(encoded);
+    if (key.byteLength !== GRAPH_KEY_BYTES) throw new Error("Invalid graph key");
+    return key;
+  } catch {
+    throw new WorkerFailure(fixedError("credential-unavailable"));
+  }
+}
+
+function initialGraphState(graph: NonNullable<ParsedBridgeConfigV1["graph"]>): GraphPublishStateV1 {
+  return Object.freeze({
+    projectionHash: null,
+    graphId: graph.graphId,
+    keyId: graph.keyId,
+    sequence: 0,
+    lastPublishedAt: null,
+  });
+}
+
+function fullReconciliationDue(lastFullReconciliationAt: string | null, clock: Clock): boolean {
+  if (lastFullReconciliationAt === null) return true;
+  try {
+    const previous = new Date(lastFullReconciliationAt).getTime();
+    const now = clock.now().getTime();
+    return Number.isFinite(previous) && Number.isFinite(now) && now - previous >= FULL_RECONCILIATION_INTERVAL_MS;
+  } catch {
+    return true;
+  }
+}
+
+function relayRegistryIntent(
+  installationId: string,
+  effectKind: "register-relay-page" | "unregister-relay-page",
+  pageId: string,
+  uuid: UuidSource,
+  clock: Clock,
+): JournalIntentV1 {
+  return parseJournalIntent({
+    schemaVersion: 1,
+    id: nextJournalId(uuid),
+    installationId,
+    effectKind,
+    relativePath: null,
+    remoteId: pageId,
+    allocationId: null,
+    expectedByteHash: null,
+    expectedSemanticHash: null,
+    resultByteHash: null,
+    resultSemanticHash: null,
+    expectedRemoteEditedAt: null,
+    createdAt: safeTimestamp(clock),
+  });
+}
+
+function relayRegistryCompletion(clock: Clock, pageId: string, bridgeId: string): JournalCompletionV1 {
+  return parseJournalCompletion({
+    schemaVersion: 1,
+    resultByteHash: null,
+    resultSemanticHash: null,
+    resultRemoteId: pageId,
+    allocatedBridgeId: bridgeId,
+    observedRemoteEditedAt: null,
+    completedAt: safeTimestamp(clock),
+  });
+}
+
+function isRegistryPair(pair: Readonly<ParsedBridgeStateV1["pairs"][string]>): boolean {
+  return pair.status === "synced";
 }
 
 function outcomeFor(
@@ -293,7 +428,7 @@ export class GrandboxBridgeWorker implements BridgeWorker {
     try {
       await this.loadContext();
     } catch (caught) {
-      const error = caught instanceof WorkerFailure ? caught.error : safeErrorFrom(caught, "invalid-config");
+      const error = caught instanceof WorkerFailure ? caught.error : safeRelayError(caught) ?? safeErrorFrom(caught, "invalid-config");
       safeLog(this.dependencies.logger, {
         level: "error",
         event: "run-failed",
@@ -323,10 +458,114 @@ export class GrandboxBridgeWorker implements BridgeWorker {
       const root = await this.dependencies.canonicalizeVault(config);
       validateRoot(config, root);
       const token = validateCredential(await this.dependencies.credentials.get("notion-token"));
-      return Object.freeze({ config, state, root, token });
+      const relay = config.relay === null || config.graph === null
+        ? null
+        : Object.freeze({
+            relayToken: validateRelayToken(await this.dependencies.credentials.get("relay-token")),
+            graphKey: validateGraphKey(await this.dependencies.credentials.get("graph-key")),
+          });
+      return Object.freeze({ config, state, root, token, relay });
     } catch (caught) {
       if (caught instanceof WorkerFailure) throw caught;
       throw new WorkerFailure(safeErrorFrom(caught, "invalid-config"));
+    }
+  }
+
+  private createRelayClient(config: Readonly<ParsedBridgeConfigV1>, token: string): RelayClient {
+    if (config.relay === null) throw new WorkerFailure(fixedError("invalid-config"));
+    return this.dependencies.createRelayClient?.({
+      baseUrl: config.relay.baseUrl,
+      token,
+      clock: this.dependencies.clock,
+    }) ?? new RelayClient({ baseUrl: config.relay.baseUrl, token, clock: this.dependencies.clock });
+  }
+
+  private async validateClaimedEvents(
+    notion: NotionApi,
+    state: Readonly<ParsedBridgeStateV1>,
+    events: readonly RelayEvent[],
+  ): Promise<void> {
+    const registeredPages = new Set(
+      Object.values(state.pairs)
+        .filter(isRegistryPair)
+        .map((pair) => pair.notionPageId),
+    );
+    for (const event of events) {
+      if (registeredPages.has(event.entityId)) continue;
+      const pageId = await notion.resolveEventPage(event.entityId, 16);
+      // Unknown pages are deliberately acknowledged only after the complete
+      // reconciliation succeeds; they never authorize a local mutation.
+      if (pageId !== null && !registeredPages.has(pageId)) continue;
+    }
+  }
+
+  private async graphProjection(
+    root: CanonicalVaultRoot,
+    config: Readonly<ParsedBridgeConfigV1>,
+    state: Readonly<BridgeStateV1>,
+  ) {
+    if (config.graph === null) throw new WorkerFailure(fixedError("invalid-config"));
+    const notes: GraphSourceNote[] = (await scanVaultNotes(root)).flatMap((entry) => entry.note === undefined
+      ? []
+      : [{
+          path: entry.note.path,
+          basename: entry.note.path.split("/").at(-1)?.replace(/\.md$/iu, "") ?? entry.note.path,
+          markdown: entry.note.body,
+          tags: [...entry.note.tags],
+        }]);
+    const pairs = new Map(
+      Object.values(state.pairs)
+        .filter(isRegistryPair)
+        .map((pair) => [pair.localPath, { notionUrl: `https://www.notion.so/${pair.notionPageId.replaceAll("-", "")}` }] as const),
+    );
+    return buildGraphProjection(notes, pairs, config.installationId, config.graph.domains);
+  }
+
+  private async synchronizeRelayRegistry(
+    context: LoadedRunContext,
+    relay: RelayRunContext | null,
+    nextState: Readonly<BridgeStateV1>,
+  ): Promise<void> {
+    if (relay === null) return;
+    const before = new Map(
+      Object.values(context.state.pairs)
+        .filter(isRegistryPair)
+        .map((pair) => [pair.bridgeId, pair] as const),
+    );
+    const after = new Map(
+      Object.values(nextState.pairs)
+        .filter(isRegistryPair)
+        .map((pair) => [pair.bridgeId, pair] as const),
+    );
+
+    for (const [bridgeId, pair] of after) {
+      const previous = before.get(bridgeId);
+      if (previous !== undefined && previous.notionPageId === pair.notionPageId) continue;
+      const intent = relayRegistryIntent(
+        context.config.installationId,
+        "register-relay-page",
+        pair.notionPageId,
+        this.dependencies.uuid,
+        this.dependencies.clock,
+      );
+      await this.dependencies.journal.begin(intent);
+      await relay.source.register(pair.notionPageId, bridgeId);
+      await this.dependencies.journal.complete(intent.id, relayRegistryCompletion(this.dependencies.clock, pair.notionPageId, bridgeId));
+    }
+
+    for (const [bridgeId, pair] of before) {
+      const current = after.get(bridgeId);
+      if (current !== undefined && current.notionPageId === pair.notionPageId) continue;
+      const intent = relayRegistryIntent(
+        context.config.installationId,
+        "unregister-relay-page",
+        pair.notionPageId,
+        this.dependencies.uuid,
+        this.dependencies.clock,
+      );
+      await this.dependencies.journal.begin(intent);
+      await relay.source.unregister(pair.notionPageId, bridgeId);
+      await this.dependencies.journal.complete(intent.id, relayRegistryCompletion(this.dependencies.clock, pair.notionPageId, bridgeId));
     }
   }
 
@@ -342,6 +581,34 @@ export class GrandboxBridgeWorker implements BridgeWorker {
         state: context.state,
         root: context.root,
       });
+      await notion.verifyConnection();
+
+      let relay: RelayRunContext | null = null;
+      let claimedEvents: readonly RelayEvent[] = [];
+      if (input.mode === "apply" && context.relay !== null) {
+        const rotationRecovery = await recoverPendingRelayTokenRotation({
+          credentials: this.dependencies.credentials,
+          clients: { create: (token) => this.createRelayClient(context.config, token) },
+        });
+        if (rotationRecovery === "recovery-required") {
+          safeLog(this.dependencies.logger, {
+            level: "error",
+            event: "recovery-required",
+            fields: { installationId: context.config.installationId, errorCode: "recovery-required", retryable: false },
+          });
+          return summary(input, startedAt, { planned: 0, writes: 0, pushed: 0, pulled: 0, conflicts: 0, errors: 0 }, "recovery-required", this.dependencies.clock);
+        }
+        const relayToken = rotationRecovery === "clean" || rotationRecovery === "cancelled"
+          ? context.relay.relayToken
+          : validateRelayToken(await this.dependencies.credentials.get("relay-token"));
+        const client = this.createRelayClient(context.config, relayToken);
+        const source = new RelayEventSource(client);
+        const claim = await source.claim(context.config.installationId, 50);
+        claimedEvents = claim.events;
+        await this.validateClaimedEvents(notion, context.state, claimedEvents);
+        relay = Object.freeze({ client, source, graphKey: context.relay.graphKey });
+      }
+
       if (input.mode === "apply") {
         const recovery = await recoverIncompleteJournal({
           journal: this.dependencies.journal,
@@ -361,15 +628,14 @@ export class GrandboxBridgeWorker implements BridgeWorker {
         }
       }
 
-      await notion.verifyConnection();
       const reconciled = await reconcilePairs(context.state, {
         root: context.root,
         notion,
         clock: this.dependencies.clock,
       });
-      return this.finishReconciliation(input, startedAt, context, notion, reconciled);
+      return this.finishReconciliation(input, startedAt, context, notion, reconciled, relay, claimedEvents);
     } catch (caught) {
-      const error = caught instanceof WorkerFailure ? caught.error : safeErrorFrom(caught);
+      const error = caught instanceof WorkerFailure ? caught.error : safeRelayError(caught) ?? safeErrorFrom(caught);
       safeLog(this.dependencies.logger, {
         level: "error",
         event: "run-failed",
@@ -394,6 +660,8 @@ export class GrandboxBridgeWorker implements BridgeWorker {
     context: LoadedRunContext,
     notion: NotionApi,
     reconciled: ReconciliationResult,
+    relay: RelayRunContext | null,
+    claimedEvents: readonly RelayEvent[],
   ): Promise<BridgeRunSummary> {
     const validation = validatePlanningBatch(reconciled.inputs);
     if (!validation.ok) {
@@ -431,13 +699,53 @@ export class GrandboxBridgeWorker implements BridgeWorker {
       clock: this.dependencies.clock,
       readLocalBytes: async (relativePath) => readCurrentLocal(context.root, relativePath),
     }, reconciled.failures.length);
-    const counts = executed.counts;
-    const runSummary = summary(input, startedAt, counts, outcomeFor(counts, input.mode), this.dependencies.clock);
+    const counts = {
+      planned: executed.counts.planned,
+      writes: executed.counts.writes,
+      pushed: executed.counts.pushed,
+      pulled: executed.counts.pulled,
+      conflicts: executed.counts.conflicts,
+      errors: executed.counts.errors,
+    };
+    let stateAfterGraph: BridgeStateV1 = executed.state;
+    let graphUploads = 0;
+    if (relay !== null) {
+      try {
+        if (context.config.graph === null) throw new WorkerFailure(fixedError("invalid-config"));
+        const projection = await this.graphProjection(context.root, context.config, executed.state);
+        const sink = new RelaySnapshotSink(relay.client);
+        const publisher = this.dependencies.nonceSource === undefined
+          ? new GraphPublisher({ sink })
+          : new GraphPublisher({ sink, nonceSource: this.dependencies.nonceSource });
+        const published = await publisher.publishIfChanged({
+          projection,
+          state: executed.state.graph ?? initialGraphState(context.config.graph),
+          key: relay.graphKey,
+          now: safeTimestamp(this.dependencies.clock),
+        });
+        stateAfterGraph = { ...executed.state, graph: published.state };
+        graphUploads = published.uploaded ? 1 : 0;
+      } catch {
+        // The graph state is intentionally retained. A later run recomputes
+        // the same projection and encrypts it with a fresh nonce.
+        counts.errors += 1;
+      }
+    }
+
+    await this.synchronizeRelayRegistry(context, relay, stateAfterGraph);
+    const runSummary = summary(
+      input,
+      startedAt,
+      counts,
+      outcomeFor(counts, input.mode),
+      this.dependencies.clock,
+      graphUploads,
+    );
     const stateWithoutRun: BridgeStateV1 = {
-      ...executed.state,
-      lastFullReconciliationAt: input.reason === "reconciliation" && counts.errors === 0
+      ...stateAfterGraph,
+      lastFullReconciliationAt: fullReconciliationDue(context.state.lastFullReconciliationAt, this.dependencies.clock) && counts.errors === 0
         ? runSummary.completedAt
-        : executed.state.lastFullReconciliationAt,
+        : stateAfterGraph.lastFullReconciliationAt,
     };
     const trueSemanticNoop =
       counts.planned === 0 &&
@@ -460,6 +768,9 @@ export class GrandboxBridgeWorker implements BridgeWorker {
     if (stateFence !== null) {
       await this.dependencies.journal.complete(stateFence.id, stateCommitCompletion(this.dependencies.clock));
     }
+    if (relay !== null && claimedEvents.length > 0 && counts.errors === 0) {
+      await relay.source.acknowledge(context.config.installationId, claimedEvents.map((event) => event.id));
+    }
     safeLog(this.dependencies.logger, {
       level: "info",
       event: "run-completed",
@@ -473,7 +784,7 @@ export class GrandboxBridgeWorker implements BridgeWorker {
         pulled: runSummary.pulled,
         conflicts: runSummary.conflicts,
         errors: runSummary.errors,
-        graphUploads: 0,
+        graphUploads: runSummary.graphUploads,
       },
     });
     return runSummary;

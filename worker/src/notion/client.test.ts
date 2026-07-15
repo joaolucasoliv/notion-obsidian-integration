@@ -18,6 +18,8 @@ const USER_ID = "11111111-1111-4111-8111-111111111111";
 const BRIDGE_ID = "22222222-2222-4222-8222-222222222222";
 const PAGE_ID = "33333333-3333-4333-8333-333333333333";
 const OTHER_PAGE_ID = "44444444-4444-4444-8444-444444444444";
+const BLOCK_ID = "55555555-5555-4555-8555-555555555555";
+const NESTED_BLOCK_ID = "66666666-6666-4666-8666-666666666666";
 const EDITED_AT = "2026-07-14T12:00:00.000Z";
 const TEST_CREDENTIALS = JSON.parse(
   readFileSync(new URL("../../../tests/fixtures/safe/notion-credentials.json", import.meta.url), "utf8"),
@@ -147,6 +149,25 @@ function expectSafeClientError(error: unknown, code: string, retryable: boolean)
 }
 
 describe("NotionClient request contract", () => {
+  it("resolves only bounded opaque block-parent hops without retrieving page content", async () => {
+    const transport = new RecordingTransport([
+      response({ object: "block", id: BLOCK_ID, parent: { type: "block_id", block_id: NESTED_BLOCK_ID } }),
+      response({ object: "block", id: NESTED_BLOCK_ID, parent: { type: "page_id", page_id: PAGE_ID } }),
+    ]);
+
+    await expect(client(transport).value.resolveEventPage(BLOCK_ID, 16)).resolves.toBe(PAGE_ID);
+    expect(transport.requests).toEqual([
+      { method: "GET", path: `/v1/blocks/${BLOCK_ID}`, headers: commonHeaders(), timeoutMs: 15_000, maxBytes: 2 * 1024 * 1024 },
+      { method: "GET", path: `/v1/blocks/${NESTED_BLOCK_ID}`, headers: commonHeaders(), timeoutMs: 15_000, maxBytes: 2 * 1024 * 1024 },
+    ]);
+
+    const tooDeep = new RecordingTransport([
+      response({ object: "block", id: BLOCK_ID, parent: { type: "block_id", block_id: NESTED_BLOCK_ID } }),
+    ]);
+    await expect(client(tooDeep).value.resolveEventPage(BLOCK_ID, 1)).resolves.toBeNull();
+    expect(tooDeep.requests).toHaveLength(1);
+  });
+
   it("sends exact-body compare-and-update with the required API version", async () => {
     const transport = new RecordingTransport([
       response(page()),

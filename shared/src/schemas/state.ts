@@ -34,7 +34,7 @@ export const graphPublishStateV1Schema = z
     projectionHash: sha256Schema.nullable(),
     graphId: z.string().min(1),
     keyId: z.string().min(1),
-    sequence: z.number().int().nonnegative(),
+    sequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
     lastPublishedAt: timestampSchema.nullable(),
   })
   .strict()

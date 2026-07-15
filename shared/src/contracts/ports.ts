@@ -2,7 +2,7 @@ import type { NotionObservation } from "./planning.js";
 import type { PairStatus } from "./core.js";
 import type { SafeLogEntry } from "../errors.js";
 
-export type CredentialSlot = "notion-token" | "relay-token" | "graph-key";
+export type CredentialSlot = "notion-token" | "relay-token" | "relay-token-pending" | "graph-key";
 
 export interface CredentialStore {
   get(slot: CredentialSlot): Promise<string | null>;
@@ -38,6 +38,8 @@ export interface UpdateManagedPropertiesInput {
 
 export interface NotionApi {
   verifyConnection(): Promise<{ userId: string; name: string | null }>;
+  /** Resolves a page or nested block identity without requesting page Markdown. */
+  resolveEventPage(entityId: string, maxParentHops: number): Promise<string | null>;
   retrievePage(pageId: string): Promise<NotionObservation>;
   createNotePage(input: CreateNotePageInput): Promise<NotionObservation>;
   updateBodyExact(input: UpdateBodyExactInput): Promise<NotionObservation>;

@@ -22,6 +22,7 @@ function validConfig() {
     relay: { baseUrl: "https://relay.example.test" },
     graph: {
       graphId: "primary-graph",
+      keyId: "key-2026-07",
       webOrigin: "https://graph.example.test",
       domains: [{ pathPrefix: "Research/", domain: "research" }],
     },
@@ -61,6 +62,10 @@ describe("parseBridgeConfig", () => {
     const malformedDomain = validConfig();
     malformedDomain.graph.domains[0].domain = "finance";
     expect(() => parseBridgeConfig(malformedDomain)).toThrow(/domain/i);
+
+    const missingKeyId = validConfig();
+    delete (missingKeyId.graph as { keyId?: string }).keyId;
+    expect(() => parseBridgeConfig(missingKeyId)).toThrow(/keyId/i);
   });
 
   it.each([

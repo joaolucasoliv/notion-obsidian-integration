@@ -59,6 +59,18 @@ describe("MacOSKeychainCredentialStore", () => {
     });
   });
 
+  it("keeps a pending relay rotation secret in its own Keychain slot", async () => {
+    const runner = new RecordingRunner([{ code: 0, stdout: "fixture-pending-relay-value\n", stderr: "" }]);
+    const store = new MacOSKeychainCredentialStore(INSTALLATION_ID, runner);
+
+    await expect(store.get("relay-token-pending")).resolves.toBe("fixture-pending-relay-value");
+    expect(runner.last).toEqual({
+      executable: "/usr/bin/security",
+      args: ["find-generic-password", "-a", INSTALLATION_ID, "-s", "GrandboxBridge/relay-token-pending", "-w"],
+      maxBytes: 8_192,
+    });
+  });
+
   it("returns null only for the Keychain not-found status", async () => {
     const runner = new RecordingRunner([{ code: 44, stdout: "", stderr: "fixture missing detail" }]);
     const store = new MacOSKeychainCredentialStore(INSTALLATION_ID, runner);

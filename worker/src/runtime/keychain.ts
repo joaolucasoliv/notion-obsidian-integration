@@ -3,7 +3,7 @@ import { assertValidInstallationId } from "./paths.js";
 
 const SECURITY_EXECUTABLE = "/usr/bin/security";
 const MAX_RUNNER_BYTES = 8_192;
-const VALID_SLOTS = new Set<CredentialSlot>(["notion-token", "relay-token", "graph-key"]);
+const VALID_SLOTS = new Set<CredentialSlot>(["notion-token", "relay-token", "relay-token-pending", "graph-key"]);
 
 export interface ProcessRunnerInput {
   readonly executable: string;

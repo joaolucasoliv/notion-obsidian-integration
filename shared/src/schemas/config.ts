@@ -79,6 +79,7 @@ const graphDomainSchema = z
 const graphConfigSchema = z
   .object({
     graphId: z.string().min(1),
+    keyId: z.string().min(1).max(256),
     webOrigin: persistedWebUrlSchema({ bareOrigin: true }).nullable(),
     domains: z.array(graphDomainSchema).readonly(),
   })

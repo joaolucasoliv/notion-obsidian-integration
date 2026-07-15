@@ -170,7 +170,9 @@ export class FakeNotionApi implements NotionApi {
   public corruptCreateBridgeResult = false;
   public corruptBodyResult = false;
   public corruptManagedStatusResult = false;
+  public failEventResolution = false;
   private readonly pages = new Map<string, StoredPage>();
+  private readonly eventParents = new Map<string, string | null>();
 
   public async verifyConnection(): Promise<{ userId: string; name: string | null }> {
     this.verifies += 1;
@@ -187,6 +189,28 @@ export class FakeNotionApi implements NotionApi {
       throw error;
     }
     return this.observe(page);
+  }
+
+  public setEventParent(entityId: string, parentId: string | null): void {
+    this.eventParents.set(entityId, parentId);
+  }
+
+  public async resolveEventPage(entityId: string, maxParentHops: number): Promise<string | null> {
+    if (this.failEventResolution) {
+      throw Object.assign(new Error("synthetic event resolution failure"), { code: "network-failed", retryable: true });
+    }
+    if (!Number.isSafeInteger(maxParentHops) || maxParentHops < 0) {
+      throw Object.assign(new Error("invalid parent depth"), { code: "invalid-response", retryable: false });
+    }
+    let current = entityId;
+    if (this.pages.has(current)) return current;
+    for (let hops = 0; hops < maxParentHops; hops += 1) {
+      const parent = this.eventParents.get(current);
+      if (parent === undefined || parent === null) return null;
+      if (this.pages.has(parent)) return parent;
+      current = parent;
+    }
+    return null;
   }
 
   public async createNotePage(input: Parameters<NotionApi["createNotePage"]>[0]): Promise<NotionObservation> {

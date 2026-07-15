@@ -19,6 +19,7 @@ function config(installationId = INSTALLATION_ID) {
     relay: null,
     graph: {
       graphId: "fixture-graph",
+      keyId: "fixture-key",
       webOrigin: null,
       domains: [{ pathPrefix: "Notes", domain: "personal" as const }],
     },
