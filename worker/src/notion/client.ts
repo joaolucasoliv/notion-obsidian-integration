@@ -617,6 +617,7 @@ export class NotionClient implements NotionApi {
   }
 
   async #request<T>(method: "GET" | "POST" | "PATCH", path: string, body?: unknown): Promise<T> {
+    const canRetry = method === "GET";
     let retryAttempt = 0;
     while (true) {
       let result: NotionTransportResponse<unknown>;
@@ -636,7 +637,7 @@ export class NotionClient implements NotionApi {
         });
       } catch (caught) {
         const failure = transportFailure(caught);
-        if (!failure.retryable || retryAttempt >= NOTION_MAX_RETRY_DELAYS) {
+        if (!canRetry || !failure.retryable || retryAttempt >= NOTION_MAX_RETRY_DELAYS) {
           throw clientFailure(failure.code, failure.retryable);
         }
         retryAttempt += 1;
@@ -647,7 +648,7 @@ export class NotionClient implements NotionApi {
       if (!validTransportResponse(result)) throw clientFailure("invalid-response", false);
       const failure = statusFailure(result.status);
       if (failure === null) return result.data as T;
-      if (!failure.retryable || retryAttempt >= NOTION_MAX_RETRY_DELAYS) {
+      if (!canRetry || !failure.retryable || retryAttempt >= NOTION_MAX_RETRY_DELAYS) {
         throw clientFailure(failure.code, failure.retryable);
       }
       retryAttempt += 1;

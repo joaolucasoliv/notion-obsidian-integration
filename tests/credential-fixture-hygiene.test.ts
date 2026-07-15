@@ -386,13 +386,17 @@ function isDiscardedAccess(node: ts.Expression): boolean {
   while (true) {
     if (ts.isExpressionStatement(current.parent) || ts.isVoidExpression(current.parent)) return true;
     const parent = current.parent;
-    if (ts.isBinaryExpression(parent) && parent.operatorToken.kind === ts.SyntaxKind.CommaToken && parent.right === current) {
+    if (
+      ts.isBinaryExpression(parent) &&
+      parent.operatorToken.kind === ts.SyntaxKind.CommaToken &&
+      (parent.left === current || parent.right === current)
+    ) {
       current = unwrapTransparentExpression(parent);
       continue;
     }
     if (
       ts.isCommaListExpression(parent) &&
-      parent.elements[parent.elements.length - 1] === current
+      parent.elements.includes(current)
     ) {
       current = unwrapTransparentExpression(parent);
       continue;
@@ -552,6 +556,8 @@ describe("credential fixture hygiene", () => {
   it.each([
     ["never used", "void 0;"],
     ["used only in a discarded expression", "void fixture.token;"],
+    ["used only in a left comma operand", "void (fixture.token, 0);"],
+    ["used only in a middle comma operand", "void (0, fixture.token, 1);"],
   ])("rejects a safe fixture read that is %s", (_label, replacement) => {
     const unusedFixture = SAFE_FIXTURE_READ.replace("const loaded = fixture.token;", replacement);
 

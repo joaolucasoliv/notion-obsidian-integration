@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdtemp, readFile, realpath, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, realpath, rename, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -89,6 +89,10 @@ class MemoryStateStore implements StateStore {
       throw new Error("synthetic state persistence failure");
     }
     this.value = structuredClone(next);
+  }
+
+  public failNextSaves(count = 1): void {
+    this.remainingFailures = count;
   }
 }
 
@@ -385,6 +389,10 @@ export class BridgeHarness {
 
   public async note(path: string): Promise<string> {
     return readFile(join(this.root.canonicalRealPath, path), "utf8");
+  }
+
+  public async renameNote(from: string, to: string): Promise<void> {
+    await rename(join(this.root.canonicalRealPath, from), join(this.root.canonicalRealPath, to));
   }
 
   public async apply(reason: WorkerRunInput["reason"] = "manual"): Promise<BridgeRunSummary> {

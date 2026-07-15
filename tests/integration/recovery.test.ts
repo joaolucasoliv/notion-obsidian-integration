@@ -55,6 +55,32 @@ describe("recovery and journal order", () => {
     expect(harness.notion.creates).toBe(1);
   });
 
+  it("fences a zero-effect convergence before the state save and requires recovery if it fails", async () => {
+    const harness = await BridgeHarness.create();
+    await harness.writeNote("Converged.md", optedIn("initial\n"));
+    await harness.apply();
+    await harness.writeNote("Converged.md", (await harness.note("Converged.md")).replace("initial", "converged"));
+    await harness.remoteBodyFor("Converged.md", "converged\n");
+    const beforeRemoteWrites = harness.notion.creates + harness.notion.bodyUpdates + harness.notion.propertyUpdates;
+    const journalBeforeFailure = harness.journal.begun.length;
+    harness.state.failNextSaves();
+
+    const first = await harness.apply();
+
+    expect(first).toMatchObject({ outcome: "failed", errors: 1 });
+    expect(harness.notion.creates + harness.notion.bodyUpdates + harness.notion.propertyUpdates).toBe(beforeRemoteWrites);
+    const stateFence = harness.journal.begun
+      .slice(journalBeforeFailure)
+      .find((entry) => entry.effectKind === "commit-state");
+    expect(stateFence).toBeDefined();
+    expect(harness.journal.completed.some((entry) => entry.id === stateFence?.id)).toBe(false);
+
+    const second = await harness.apply();
+
+    expect(second).toMatchObject({ outcome: "recovery-required", writes: 0, errors: 0 });
+    expect(harness.notion.creates + harness.notion.bodyUpdates + harness.notion.propertyUpdates).toBe(beforeRemoteWrites);
+  });
+
   it("completes a retryable local precondition and replans instead of replaying its stale intent", async () => {
     const harness = await BridgeHarness.create();
     await harness.writeNote("Retry.md", optedIn("retry\n"));
@@ -81,7 +107,7 @@ describe("recovery and journal order", () => {
     const result = await harness.apply("reconciliation");
 
     expect(result).toMatchObject({ outcome: "noop", writes: 0, errors: 0 });
-    expect(harness.journal.completed.at(-1)?.id).toBe("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb");
+    expect(harness.journal.completed.some((entry) => entry.id === "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")).toBe(true);
     expect(harness.notion.creates + harness.notion.bodyUpdates + harness.notion.propertyUpdates).toBe(beforeWrites);
   });
 
@@ -137,7 +163,7 @@ describe("recovery and journal order", () => {
     const result = await harness.apply();
 
     expect(result).toMatchObject({ outcome: "noop", writes: 0, errors: 0 });
-    expect(harness.journal.completed.at(-1)?.id).toBe("dddddddd-dddd-4ddd-8ddd-dddddddddddd");
+    expect(harness.journal.completed.some((entry) => entry.id === "dddddddd-dddd-4ddd-8ddd-dddddddddddd")).toBe(true);
     expect(harness.notion.bodyUpdates).toBe(beforeBodyUpdates);
   });
 

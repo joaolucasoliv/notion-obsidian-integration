@@ -158,14 +158,15 @@ function linkMapping(candidates: readonly StateCandidate[]): LinkMapping {
   const byLocalTarget = new Map<string, { readonly bridgeId: string; readonly notionPageUrl: string }>();
   const byNotionPageId = new Map<string, { readonly bridgeId: string; readonly localTarget: string }>();
   for (const candidate of candidates) {
+    const localPath = candidate.local.kind === "present" ? candidate.local.path : candidate.prior.localPath;
     const observedUrl = candidate.notion.kind === "present" ? candidate.notion.pageUrl : canonicalNotionUrl(candidate.prior.notionPageId);
-    byLocalTarget.set(candidate.prior.localPath, {
+    byLocalTarget.set(localPath, {
       bridgeId: candidate.prior.bridgeId,
       notionPageUrl: observedUrl,
     });
     byNotionPageId.set(candidate.prior.notionPageId, {
       bridgeId: candidate.prior.bridgeId,
-      localTarget: candidate.prior.localPath,
+      localTarget: localPath,
     });
   }
   return Object.freeze({ byLocalTarget, byNotionPageId });
@@ -284,11 +285,19 @@ export async function reconcilePairs(
     assertStateIdentity(state.pairs);
     const scanned = await (dependencies.scan ?? scanVaultNotes)(dependencies.root);
     const byPath = new Map<string, ScannedVaultNote>();
+    const byBridgeId = new Map<string, ScannedVaultNote>();
     for (const entry of scanned) {
       if (byPath.has(entry.path)) {
         throw new ReconciliationError(fixedError("identity-collision"));
       }
       byPath.set(entry.path, entry);
+      const bridgeId = entry.note?.bridgeId;
+      if (bridgeId !== undefined && bridgeId !== null) {
+        if (byBridgeId.has(bridgeId)) {
+          throw new ReconciliationError(fixedError("identity-collision"));
+        }
+        byBridgeId.set(bridgeId, entry);
+      }
     }
 
     const priors = Object.values(state.pairs).sort((left, right) => {
@@ -297,8 +306,11 @@ export async function reconcilePairs(
     });
     const stateCandidates: StateCandidate[] = [];
     const failures: ReconciliationFailure[] = [];
+    const pairedPaths = new Set<string>();
     for (const pair of priors) {
-      const observed = await observationForState(pair, byPath.get(pair.localPath), dependencies.notion);
+      const entry = byBridgeId.get(pair.bridgeId) ?? byPath.get(pair.localPath);
+      if (entry !== undefined) pairedPaths.add(entry.path);
+      const observed = await observationForState(pair, entry, dependencies.notion);
       if (asFailure(observed)) {
         failures.push(observed);
       } else {
@@ -319,7 +331,6 @@ export async function reconcilePairs(
       inputs.push(Object.freeze({ local, notion: candidate.notion, prior: candidate.prior, prepared }));
     }
 
-    const pairedPaths = new Set(priors.map((pair) => pair.localPath));
     for (const entry of scanned) {
       if (
         !pairedPaths.has(entry.path) &&

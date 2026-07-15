@@ -294,6 +294,30 @@ describe("NotionClient retries and fixed errors", () => {
     }
   });
 
+  it("does not replay an ambiguous page creation after a timeout", async () => {
+    const transport = new RecordingTransport([
+      new NotionTransportError("timeout"),
+      response(page()),
+      response(page()),
+      response(markdown()),
+    ]);
+    const { value, clock } = client(transport);
+    const error = await value.createNotePage({
+      parentPageId: USER_ID,
+      dataSourceId: OTHER_PAGE_ID,
+      bridgeId: BRIDGE_ID,
+      title: "Alpha",
+      obsidianPath: "Notes/Alpha.md",
+      tags: ["alpha"],
+      markdown: "# Alpha\n",
+    }).catch((caught) => caught);
+
+    expectSafeClientError(error, "timeout", true);
+    expect(transport.requests).toHaveLength(1);
+    expect(transport.requests[0]).toMatchObject({ method: "POST", path: "/v1/pages" });
+    expect(clock.delays).toEqual([]);
+  });
+
   it.each([
     [400, "invalid-response"],
     [401, "authentication-failed"],

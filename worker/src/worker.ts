@@ -128,6 +128,10 @@ function stateCommitCompletion(clock: Clock): JournalCompletionV1 {
   });
 }
 
+function sameDurableState(left: Readonly<BridgeStateV1>, right: Readonly<BridgeStateV1>): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
 function summary(
   input: WorkerRunInput,
   startedAt: string,
@@ -409,7 +413,11 @@ export class GrandboxBridgeWorker implements BridgeWorker {
       return summary(input, startedAt, counts, outcomeFor(counts, input.mode), this.dependencies.clock);
     }
 
-    const stateFence = planned === 0 ? null : stateCommitIntent(context.config.installationId, this.dependencies.uuid, this.dependencies.clock);
+    const requiresPreExecutionStateFence =
+      planned > 0 || pairs.some((pair) => pair.plan.stateAdvance.kind !== "none");
+    let stateFence = requiresPreExecutionStateFence
+      ? stateCommitIntent(context.config.installationId, this.dependencies.uuid, this.dependencies.clock)
+      : null;
     if (stateFence !== null) {
       await this.dependencies.journal.begin(stateFence);
     }
@@ -432,7 +440,13 @@ export class GrandboxBridgeWorker implements BridgeWorker {
         : executed.state.lastFullReconciliationAt,
       lastRun: runSummary,
     };
-    await this.dependencies.state.save(nextState);
+    if (!sameDurableState(context.state, nextState)) {
+      if (stateFence === null) {
+        stateFence = stateCommitIntent(context.config.installationId, this.dependencies.uuid, this.dependencies.clock);
+        await this.dependencies.journal.begin(stateFence);
+      }
+      await this.dependencies.state.save(nextState);
+    }
     if (stateFence !== null) {
       await this.dependencies.journal.complete(stateFence.id, stateCommitCompletion(this.dependencies.clock));
     }
