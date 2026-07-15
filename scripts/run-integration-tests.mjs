@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { readFile, realpath } from "node:fs/promises";
+import { readFile, readdir, realpath } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -16,6 +16,7 @@ const UNSAFE_ENVIRONMENT_NAMES = Object.freeze([
   "SUPABASE_PROJECT_REF",
   "SUPABASE_REMOTE_URL",
 ]);
+const SAFE_LOCAL_TEMPORARY_STATE = new Set(["cli-latest"]);
 
 export class IntegrationRunnerError extends Error {}
 
@@ -63,6 +64,36 @@ function assertSafeEnvironment(environment) {
   for (const name of UNSAFE_ENVIRONMENT_NAMES) {
     if (environment[name]) {
       throw runnerError("Linked or remote Supabase environment is not allowed");
+    }
+  }
+}
+
+function nodeFileSystem() {
+  return {
+    readText(path) {
+      return readFile(path, "utf8");
+    },
+    async readDirectory(path) {
+      try {
+        return await readdir(path);
+      } catch (error) {
+        if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") {
+          return [];
+        }
+        throw error;
+      }
+    },
+  };
+}
+
+async function assertNoLinkedLocalState(cwd, filesystem) {
+  const entries = await filesystem.readDirectory(join(cwd, "relay", "supabase", ".temp"));
+  if (!Array.isArray(entries)) {
+    throw runnerError("Unable to verify repository-local Supabase state");
+  }
+  for (const entry of entries) {
+    if (typeof entry !== "string" || !SAFE_LOCAL_TEMPORARY_STATE.has(entry)) {
+      throw runnerError("Repository-local Supabase temporary or linked state is not allowed");
     }
   }
 }
@@ -122,6 +153,7 @@ async function resolveLocalBinary(cwd, name) {
 }
 
 function nodeProcessAdapter() {
+  let activeChildSettled = Promise.resolve();
   return {
     run(executable, args, options) {
       return new Promise((resolveResult, rejectResult) => {
@@ -129,6 +161,9 @@ function nodeProcessAdapter() {
         let totalBytes = 0;
         let stdout = "";
         let stderr = "";
+        let outputLimitError = null;
+        let resolveChildSettled;
+        activeChildSettled = new Promise((resolve) => { resolveChildSettled = resolve; });
         const child = spawn(executable, args, {
           cwd: options.cwd,
           env: options.env,
@@ -136,13 +171,15 @@ function nodeProcessAdapter() {
           stdio: ["ignore", "pipe", "pipe"],
         });
         const failForOutput = () => {
-          if (!settled) {
-            settled = true;
+          if (!outputLimitError) {
+            outputLimitError = runnerError("Local subprocess output exceeded the safety limit");
             child.kill("SIGTERM");
-            rejectResult(runnerError("Local subprocess output exceeded the safety limit"));
           }
         };
         const append = (target, chunk) => {
+          if (outputLimitError) {
+            return target;
+          }
           totalBytes += chunk.byteLength;
           if (totalBytes > options.maxOutputBytes) {
             failForOutput();
@@ -153,18 +190,27 @@ function nodeProcessAdapter() {
         child.stdout.on("data", (chunk) => { stdout = append(stdout, chunk); });
         child.stderr.on("data", (chunk) => { stderr = append(stderr, chunk); });
         child.once("error", () => {
+          resolveChildSettled();
           if (!settled) {
             settled = true;
-            rejectResult(runnerError("Local subprocess could not start"));
+            rejectResult(outputLimitError ?? runnerError("Local subprocess could not start"));
           }
         });
         child.once("close", (code) => {
+          resolveChildSettled();
           if (!settled) {
             settled = true;
-            resolveResult({ code: code ?? 1, stdout, stderr });
+            if (outputLimitError) {
+              rejectResult(outputLimitError);
+            } else {
+              resolveResult({ code: code ?? 1, stdout, stderr });
+            }
           }
         });
       });
+    },
+    waitForActiveChild() {
+      return activeChildSettled;
     },
     onSignal(signal, handler) {
       process.once(signal, handler);
@@ -188,10 +234,12 @@ async function runChecked(adapter, executable, args, options, action) {
 export async function runIntegrationTests(argv = [], options = {}) {
   const cwd = resolve(options.cwd ?? process.cwd());
   const environment = options.environment ?? process.env;
+  const filesystem = options.filesystem ?? nodeFileSystem();
   assertSafeEnvironment(environment);
   const filters = assertSafeFilters(argv, cwd);
-  const configToml = options.configToml ?? await readFile(join(cwd, "relay", "supabase", "config.toml"), "utf8");
+  const configToml = options.configToml ?? await filesystem.readText(join(cwd, "relay", "supabase", "config.toml"));
   assertLocalConfiguration(configToml);
+  await assertNoLinkedLocalState(cwd, filesystem);
   const localBinaries = options.localBinaries ?? {
     supabase: await resolveLocalBinary(cwd, "supabase"),
     vitest: await resolveLocalBinary(cwd, "vitest"),
@@ -207,13 +255,18 @@ export async function runIntegrationTests(argv = [], options = {}) {
     if (!startedHere && !startAttemptedHere) {
       return;
     }
-    stopPromise ??= runChecked(
-      adapter,
-      localBinaries.supabase,
-      ["--workdir", "relay", "stop", "--no-backup"],
-      commandOptions,
-      "Local Supabase stop",
-    );
+    stopPromise ??= (async () => {
+      if (typeof adapter.waitForActiveChild === "function") {
+        await adapter.waitForActiveChild();
+      }
+      return runChecked(
+        adapter,
+        localBinaries.supabase,
+        ["--workdir", "relay", "stop", "--no-backup"],
+        commandOptions,
+        "Local Supabase stop",
+      );
+    })();
     await stopPromise;
   };
   const throwIfSignalled = () => {
@@ -223,7 +276,7 @@ export async function runIntegrationTests(argv = [], options = {}) {
   };
   const removers = ["SIGINT", "SIGTERM"].map((signal) => adapter.onSignal(signal, () => {
     receivedSignal = signal;
-    void stopIfOwned();
+    void stopIfOwned().catch(() => undefined);
   }));
 
   let primaryError = null;

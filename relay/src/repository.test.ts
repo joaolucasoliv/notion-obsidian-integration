@@ -1,3 +1,4 @@
+import { readFile } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
 import {
   EventRepository,
@@ -186,13 +187,37 @@ function repositoryHarness() {
   };
 }
 
-const SNAPSHOT: GraphSnapshotInput = {
-  graphId: "66666666-6666-4666-8666-666666666666",
-  keyId: "key-2026-07",
-  envelope: { version: 1, ciphertext: "synthetic-ciphertext" },
-  byteLength: 20,
-  createdAt: NOW.toISOString(),
-};
+const GRAPH_ID = "66666666-6666-4666-8666-666666666666";
+const CIPHERTEXT = "AQIDBAUGBwgJCgsMDQ4PEA";
+const NEXT_CIPHERTEXT = "ERITFBUWFxgZGhscHR4fIA";
+
+function graphEnvelope(
+  installationId = INSTALLATION_ID,
+  sequence = 1,
+  ciphertext = CIPHERTEXT,
+): Record<string, unknown> {
+  return {
+    version: 1,
+    algorithm: "A256GCM",
+    installationId,
+    keyId: "key-2026-07",
+    sequence,
+    createdAt: NOW.toISOString(),
+    nonce: "AAAAAAAAAAAAAAAA",
+    ciphertext,
+  };
+}
+
+function snapshotInput(envelope = graphEnvelope()): GraphSnapshotInput {
+  return {
+    graphId: GRAPH_ID,
+    // Legacy caller-supplied fields must not influence persisted metadata.
+    keyId: "caller-controlled-key-id",
+    byteLength: 1,
+    createdAt: "2000-01-01T00:00:00.000Z",
+    envelope,
+  } as GraphSnapshotInput;
+}
 
 describe("relay repository contracts", () => {
   it("leases an event, requeues an expired lease, and acknowledges idempotently", async () => {
@@ -244,11 +269,51 @@ describe("relay repository contracts", () => {
 
   it("uses sequence compare-and-set and returns the current installation snapshot", async () => {
     const repo = repositoryHarness();
-    await expect(repo.snapshots.compareAndSet(INSTALLATION_ID, 0, SNAPSHOT)).resolves.toMatchObject({ sequence: 1 });
-    await expect(repo.snapshots.compareAndSet(INSTALLATION_ID, 0, SNAPSHOT)).resolves.toBeNull();
-    await expect(repo.snapshots.compareAndSet(INSTALLATION_ID, 1, { ...SNAPSHOT, envelope: { ciphertext: "next" } })).resolves.toMatchObject({ sequence: 2 });
-    await expect(repo.snapshots.current(INSTALLATION_ID)).resolves.toMatchObject({ sequence: 2, envelope: { ciphertext: "next" } });
+    await expect(repo.snapshots.compareAndSet(INSTALLATION_ID, 0, snapshotInput())).resolves.toMatchObject({
+      sequence: 1,
+      keyId: "key-2026-07",
+      byteLength: 16,
+      createdAt: NOW.toISOString(),
+    });
+    await expect(repo.snapshots.compareAndSet(INSTALLATION_ID, 0, snapshotInput())).resolves.toBeNull();
+    await expect(repo.snapshots.compareAndSet(INSTALLATION_ID, 1, snapshotInput(graphEnvelope(INSTALLATION_ID, 2, NEXT_CIPHERTEXT)))).resolves.toMatchObject({ sequence: 2 });
+    await expect(repo.snapshots.current(INSTALLATION_ID)).resolves.toMatchObject({ sequence: 2, envelope: { ciphertext: NEXT_CIPHERTEXT } });
     await expect(repo.snapshots.current(OTHER_INSTALLATION_ID)).resolves.toBeNull();
+  });
+
+  it("rejects arbitrary body-like snapshot JSON before it reaches the store", async () => {
+    const repo = repositoryHarness();
+    await expect(repo.snapshots.compareAndSet(INSTALLATION_ID, 0, snapshotInput({ body: "PRIVATE BODY SENTINEL" }))).rejects.toThrow();
+    expect(repo.store.snapshots.size).toBe(0);
+  });
+
+  it("rejects an oversized ciphertext envelope before it reaches the store", async () => {
+    const repo = repositoryHarness();
+    await expect(repo.snapshots.compareAndSet(
+      INSTALLATION_ID,
+      0,
+      snapshotInput(graphEnvelope(INSTALLATION_ID, 1, "A".repeat(8 * 1024 * 1024 + 1))),
+    )).rejects.toThrow();
+    expect(repo.store.snapshots.size).toBe(0);
+  });
+
+  it("rejects an envelope belonging to another installation", async () => {
+    const repo = repositoryHarness();
+    await expect(repo.snapshots.compareAndSet(INSTALLATION_ID, 0, snapshotInput(graphEnvelope(OTHER_INSTALLATION_ID)))).rejects.toThrow(/installation/i);
+    expect(repo.store.snapshots.size).toBe(0);
+  });
+
+  it("rejects an envelope whose sequence does not match the CAS request", async () => {
+    const repo = repositoryHarness();
+    await expect(repo.snapshots.compareAndSet(INSTALLATION_ID, 0, snapshotInput(graphEnvelope(INSTALLATION_ID, 2)))).rejects.toThrow(/sequence/i);
+    expect(repo.store.snapshots.size).toBe(0);
+  });
+
+  it("revokes default execution privileges for future public-schema functions", async () => {
+    const migration = await readFile(new URL("../supabase/migrations/20260714000100_bridge_relay.sql", import.meta.url), "utf8");
+    expect(migration).toMatch(/alter default privileges in schema public revoke execute on functions from public;/i);
+    expect(migration).toMatch(/alter default privileges in schema public revoke execute on functions from anon;/i);
+    expect(migration).toMatch(/alter default privileges in schema public revoke execute on functions from authenticated;/i);
   });
 
   it("increments and resets aggregate rate counters atomically under concurrent requests", async () => {

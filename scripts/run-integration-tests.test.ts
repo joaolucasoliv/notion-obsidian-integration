@@ -17,6 +17,29 @@ class RecordingProcessAdapter implements IntegrationProcessAdapter {
   failReset = false;
   failVitest = false;
   invokeSignalDuringVitest: string | null = null;
+  pauseOperation: "start" | "reset" | null = null;
+  outputCapWhilePaused = false;
+  private resolvePauseReached!: () => void;
+  readonly pauseReached = new Promise<void>((resolve) => { this.resolvePauseReached = resolve; });
+  private pausedResult: { readonly resolve: (result: { readonly code: number; readonly stdout: string; readonly stderr: string }) => void; readonly reject: (error: Error) => void } | null = null;
+  private resolveActiveChild!: () => void;
+  private activeChild = Promise.resolve();
+
+  waitForActiveChild(): Promise<void> {
+    return this.activeChild;
+  }
+
+  releasePaused(): void {
+    const paused = this.pausedResult;
+    if (!paused) throw new Error("No paused process");
+    this.resolveActiveChild();
+    paused.resolve({ code: 0, stdout: "", stderr: "" });
+    this.pausedResult = null;
+  }
+
+  settleActiveChild(): void {
+    this.resolveActiveChild();
+  }
 
   async run(executable: string, args: readonly string[], options: Call["options"]): Promise<{ readonly code: number; readonly stdout: string; readonly stderr: string }> {
     this.calls.push({ executable, args, options });
@@ -26,6 +49,20 @@ class RecordingProcessAdapter implements IntegrationProcessAdapter {
         stdout: this.statusCode === 0 ? "API_URL=http://127.0.0.1:54321\nANON_KEY=local-anon-secret\nSERVICE_ROLE_KEY=local-service-secret\nJWT_SECRET=local-jwt-secret\n" : "",
         stderr: this.statusCode === 0 ? "" : "not running",
       };
+    }
+    const operation = args.includes("start") ? "start" : args.includes("db") && args.includes("reset") ? "reset" : null;
+    if (operation !== null && operation === this.pauseOperation) {
+      if (operation === "start" && !this.failStart) {
+        this.statusCode = 0;
+      }
+      this.activeChild = new Promise<void>((resolve) => { this.resolveActiveChild = resolve; });
+      this.resolvePauseReached();
+      if (this.outputCapWhilePaused) {
+        return Promise.reject(new IntegrationRunnerError("Local subprocess output exceeded the safety limit"));
+      }
+      return new Promise((resolve, reject) => {
+        this.pausedResult = { resolve, reject };
+      });
     }
     if (args.includes("start")) {
       if (!this.failStart) {
@@ -63,6 +100,10 @@ function runnerOptions(adapter: RecordingProcessAdapter) {
       vitest: "/repo/node_modules/.bin/vitest",
     },
     configToml: "[api]\nenabled = true\n",
+    filesystem: {
+      readDirectory: async () => ["cli-latest"],
+      readText: async () => "[api]\nenabled = true\n",
+    },
     adapter,
   };
 }
@@ -120,6 +161,36 @@ describe("local relay integration runner", () => {
     expect(supabaseCalls(adapter).filter((call) => call.args.includes("stop"))).toHaveLength(1);
   });
 
+  it("waits for an active start to settle before signal cleanup", async () => {
+    const adapter = new RecordingProcessAdapter();
+    adapter.pauseOperation = "start";
+    const running = runIntegrationTests([], runnerOptions(adapter));
+
+    await adapter.pauseReached;
+    adapter.signalHandlers.get("SIGINT")?.();
+    expect(supabaseCalls(adapter).filter((call) => call.args.includes("stop"))).toHaveLength(0);
+
+    adapter.releasePaused();
+    await expect(running).rejects.toThrow(/SIGINT/i);
+    expect(supabaseCalls(adapter).filter((call) => call.args.includes("stop"))).toHaveLength(1);
+  });
+
+  it("waits for an output-capped reset to settle before owned cleanup", async () => {
+    const adapter = new RecordingProcessAdapter();
+    adapter.pauseOperation = "reset";
+    adapter.outputCapWhilePaused = true;
+    const running = runIntegrationTests([], runnerOptions(adapter));
+
+    await adapter.pauseReached;
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(supabaseCalls(adapter).filter((call) => call.args.includes("stop"))).toHaveLength(0);
+
+    adapter.settleActiveChild();
+    await expect(running).rejects.toThrow(/output exceeded/i);
+    expect(supabaseCalls(adapter).filter((call) => call.args.includes("stop"))).toHaveLength(1);
+  });
+
   it.each(["--linked", "--project-ref", "--remote", "--unknown"]) ("rejects unsafe runner flag %s before spawning", async (flag) => {
     const adapter = new RecordingProcessAdapter();
     await expect(runIntegrationTests([flag], runnerOptions(adapter))).rejects.toThrow(/local|flag|remote/i);
@@ -132,6 +203,18 @@ describe("local relay integration runner", () => {
       ...runnerOptions(adapter),
       configToml: "project_id = 'remote-project-ref'\n",
     })).rejects.toThrow(/remote|linked/i);
+    expect(adapter.calls).toEqual([]);
+  });
+
+  it("rejects repository-local linked temporary state before spawning", async () => {
+    const adapter = new RecordingProcessAdapter();
+    await expect(runIntegrationTests([], {
+      ...runnerOptions(adapter),
+      filesystem: {
+        readDirectory: async () => ["project-ref"],
+        readText: async () => "[api]\nenabled = true\n",
+      },
+    })).rejects.toThrow(/linked|temporary|remote/i);
     expect(adapter.calls).toEqual([]);
   });
 });

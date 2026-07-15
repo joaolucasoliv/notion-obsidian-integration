@@ -1,16 +1,20 @@
+import { fromBase64url, parseGraphEnvelope, type GraphEnvelopeV1 } from "@grandbox-bridge/shared";
+
 const MAX_SNAPSHOT_BYTES = 8_388_608;
 
 export interface GraphSnapshotInput {
   readonly graphId: string;
-  readonly keyId: string;
-  readonly envelope: Readonly<Record<string, unknown>>;
-  readonly byteLength: number;
-  readonly createdAt: string;
+  readonly envelope: unknown;
 }
 
-export interface GraphSnapshotRecord extends GraphSnapshotInput {
+export interface GraphSnapshotRecord {
   readonly installationId: string;
   readonly sequence: number;
+  readonly graphId: string;
+  readonly keyId: string;
+  readonly envelope: GraphEnvelopeV1;
+  readonly byteLength: number;
+  readonly createdAt: string;
 }
 
 /** A service-role adapter owns the actual database transaction/CAS primitive. */
@@ -29,13 +33,51 @@ function assertText(value: string, name: string): void {
   }
 }
 
-function assertSnapshot(input: GraphSnapshotInput): void {
+function validateExpectedSequence(expectedSequence: number): void {
+  if (!Number.isSafeInteger(expectedSequence) || expectedSequence < 0 || expectedSequence >= Number.MAX_SAFE_INTEGER) {
+    throw new Error("Invalid expected snapshot sequence");
+  }
+}
+
+function deriveSnapshotRecord(
+  installationId: string,
+  expectedSequence: number,
+  input: GraphSnapshotInput,
+): GraphSnapshotRecord {
+  if (!input || typeof input !== "object") {
+    throw new Error("Invalid snapshot input");
+  }
   assertText(input.graphId, "graph ID");
-  assertText(input.keyId, "key ID");
-  assertText(input.createdAt, "snapshot timestamp");
-  if (!Number.isSafeInteger(input.byteLength) || input.byteLength < 1 || input.byteLength > MAX_SNAPSHOT_BYTES) {
+  let envelope: GraphEnvelopeV1;
+  try {
+    envelope = parseGraphEnvelope(input.envelope);
+  } catch {
+    throw new Error("Invalid graph snapshot envelope");
+  }
+  if (envelope.installationId !== installationId) {
+    throw new Error("Graph snapshot envelope installation does not match the request");
+  }
+  if (envelope.sequence !== expectedSequence + 1) {
+    throw new Error("Graph snapshot envelope sequence does not match the compare-and-set request");
+  }
+  let ciphertextByteLength: number;
+  try {
+    ciphertextByteLength = fromBase64url(envelope.ciphertext).byteLength;
+  } catch {
+    throw new Error("Invalid graph snapshot ciphertext");
+  }
+  if (ciphertextByteLength < 1 || ciphertextByteLength > MAX_SNAPSHOT_BYTES) {
     throw new Error("Invalid snapshot byte length");
   }
+  return {
+    installationId,
+    sequence: envelope.sequence,
+    graphId: input.graphId,
+    keyId: envelope.keyId,
+    envelope,
+    byteLength: ciphertextByteLength,
+    createdAt: envelope.createdAt,
+  };
 }
 
 export class SnapshotRepository {
@@ -47,19 +89,8 @@ export class SnapshotRepository {
     snapshot: GraphSnapshotInput,
   ): Promise<GraphSnapshotRecord | null> {
     assertText(installationId, "installation ID");
-    assertSnapshot(snapshot);
-    if (!Number.isSafeInteger(expectedSequence) || expectedSequence < 0) {
-      throw new Error("Invalid expected snapshot sequence");
-    }
-    const next: GraphSnapshotRecord = {
-      installationId,
-      sequence: expectedSequence + 1,
-      graphId: snapshot.graphId,
-      keyId: snapshot.keyId,
-      envelope: snapshot.envelope,
-      byteLength: snapshot.byteLength,
-      createdAt: snapshot.createdAt,
-    };
+    validateExpectedSequence(expectedSequence);
+    const next = deriveSnapshotRecord(installationId, expectedSequence, snapshot);
     return (await this.store.compareAndSetSnapshot({ installationId, expectedSequence, next })) ? next : null;
   }
 

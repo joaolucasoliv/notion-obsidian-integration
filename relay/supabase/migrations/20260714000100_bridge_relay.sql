@@ -65,6 +65,9 @@ revoke all privileges on table synced_page_registry from public, anon, authentic
 revoke all privileges on table webhook_event from public, anon, authenticated;
 revoke all privileges on table graph_snapshot from public, anon, authenticated;
 revoke all privileges on all functions in schema public from public, anon, authenticated;
+alter default privileges in schema public revoke execute on functions from public;
+alter default privileges in schema public revoke execute on functions from anon;
+alter default privileges in schema public revoke execute on functions from authenticated;
 
 grant select, insert, update, delete on table bridge_installation to service_role;
 grant select, insert, update, delete on table synced_page_registry to service_role;
