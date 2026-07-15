@@ -247,4 +247,38 @@ describe("recovery and journal order", () => {
     expect(result).toMatchObject({ outcome: "recovery-required", writes: 0, errors: 0 });
     expect(harness.journal.completed.some((entry) => entry.id === intentId)).toBe(false);
   });
+
+  it("fails closed when no persisted pair claims a valid body-recovery page", async () => {
+    const harness = await BridgeHarness.create();
+    await harness.writeNote("UnclaimedRecovery.md", optedIn("common\n"));
+    await harness.apply();
+    const pair = Object.values(harness.state.value.pairs)[0];
+    if (pair === undefined) throw new Error("synthetic pair was not created");
+    const observed = await harness.notion.retrievePage(pair.notionPageId);
+    if (observed.kind !== "present") throw new Error("synthetic page disappeared");
+    harness.state.value = { ...harness.state.value, pairs: {} };
+    const intentId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    harness.journal.begun.push({
+      schemaVersion: 1,
+      id: intentId,
+      installationId: "11111111-1111-4111-8111-111111111111",
+      effectKind: "update-notion-body-exact",
+      relativePath: null,
+      remoteId: pair.notionPageId,
+      allocationId: null,
+      expectedByteHash: null,
+      expectedSemanticHash: observed.semanticHash,
+      resultByteHash: null,
+      resultSemanticHash: observed.semanticHash,
+      expectedRemoteEditedAt: pair.lastNotionEditedAt,
+      createdAt: "2026-07-14T12:34:56.000Z",
+    });
+    const beforeCreates = harness.notion.creates;
+
+    const result = await harness.apply();
+
+    expect(result).toMatchObject({ outcome: "recovery-required", writes: 0, errors: 0 });
+    expect(harness.journal.completed.some((entry) => entry.id === intentId)).toBe(false);
+    expect(harness.notion.creates).toBe(beforeCreates);
+  });
 });

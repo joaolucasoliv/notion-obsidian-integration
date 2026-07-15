@@ -221,13 +221,21 @@ function asRemoteRecoveryObserver(
       try {
         const observed = await notion.retrievePage(intent.remoteId);
         if (intent.effectKind !== "update-notion-body-exact") return Object.freeze({ kind: "unprovable" as const });
-        const persisted = Object.values(state.pairs).find((pair) => pair.notionPageId === intent.remoteId);
+        const claims = Object.entries(state.pairs).filter(([, pair]) => pair.notionPageId === intent.remoteId);
+        const claim = claims[0];
+        if (claims.length !== 1 || claim === undefined) {
+          return Object.freeze({ kind: "unprovable" as const });
+        }
+        const [persistedKey, persisted] = claim;
         if (
+          persistedKey !== persisted.bridgeId ||
+          persisted.notionPageId !== intent.remoteId ||
+          !UUID_PATTERN.test(persisted.bridgeId) ||
           observed.kind !== "present" ||
           observed.pageId !== intent.remoteId ||
           typeof observed.bridgeId !== "string" ||
           !UUID_PATTERN.test(observed.bridgeId) ||
-          (persisted !== undefined && observed.bridgeId !== persisted.bridgeId) ||
+          observed.bridgeId !== persisted.bridgeId ||
           !observed.complete ||
           !Array.isArray(observed.unsupportedKinds) ||
           observed.unsupportedKinds.length !== 0 ||
