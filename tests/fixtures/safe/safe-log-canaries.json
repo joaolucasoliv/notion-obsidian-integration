@@ -1,0 +1,11 @@
+{
+  "credential": "secret_fixture-credential",
+  "providerToken": "ntn_fixture-notion",
+  "sourceHeader": "github_pat_fixture-source",
+  "cliHeader": "gho_fixture-cli",
+  "authorization": "Bearer fixture-authorization",
+  "pairingCode": "pairing=fixture-code",
+  "cookie": "session=fixture-cookie",
+  "timestampCanary": "secret_fixture-timestamp",
+  "timestamp": "2026-07-14T12:00:00.000Z-secret_fixture-timestamp"
+}

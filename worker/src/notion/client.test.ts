@@ -19,7 +19,16 @@ const BRIDGE_ID = "22222222-2222-4222-8222-222222222222";
 const PAGE_ID = "33333333-3333-4333-8333-333333333333";
 const OTHER_PAGE_ID = "44444444-4444-4444-8444-444444444444";
 const EDITED_AT = "2026-07-14T12:00:00.000Z";
-const TOKEN = ["nt", "n_task6_client_canary"].join("");
+const TEST_CREDENTIALS = JSON.parse(
+  readFileSync(new URL("../../../tests/fixtures/safe/notion-credentials.json", import.meta.url), "utf8"),
+) as Readonly<{
+  token: string;
+  authorization: string;
+  networkError: string;
+  bodyMessage: string;
+  providerException: string;
+}>;
+const TOKEN = TEST_CREDENTIALS.token;
 const SEMANTIC_HASH = "a".repeat(64);
 
 function fixture<T>(name: string): T {
@@ -121,7 +130,7 @@ function emptyMarkdown(): Record<string, unknown> {
 
 function commonHeaders(hasBody = false): Record<string, string> {
   return {
-    Authorization: `Bearer ${TOKEN}`,
+    Authorization: TEST_CREDENTIALS.authorization,
     Accept: "application/json",
     "Notion-Version": "2026-03-11",
     ...(hasBody ? { "Content-Type": "application/json" } : {}),
@@ -275,7 +284,7 @@ describe("NotionClient retries and fixed errors", () => {
   });
 
   it("retries timeout and network transport failures without retaining their provider text", async () => {
-    for (const failure of [new NotionTransportError("timeout"), new Error(`network ${TOKEN}`)]) {
+    for (const failure of [new NotionTransportError("timeout"), new Error(TEST_CREDENTIALS.networkError)]) {
       const transport = new RecordingTransport([failure, failure, failure, failure]);
       const { value, clock } = client(transport);
       const error = await value.verifyConnection().catch((caught) => caught);
@@ -521,12 +530,12 @@ describe("NotionClient compare and update safety", () => {
 
 describe("NotionClient redaction", () => {
   it("never retains the test token from provider body, headers, or exception text in a client error", async () => {
-    const responseToken = response({ message: `body ${TOKEN}` }, 403, { "x-provider-token": TOKEN });
+    const responseToken = response({ message: TEST_CREDENTIALS.bodyMessage }, 403, { "x-provider-token": TOKEN });
     const httpTransport = new RecordingTransport([responseToken]);
     const httpError = await client(httpTransport).value.verifyConnection().catch((caught) => caught);
     expectSafeClientError(httpError, "authorization-failed", false);
 
-    const thrown = new Error(`provider exception ${TOKEN}`);
+    const thrown = new Error(TEST_CREDENTIALS.providerException);
     const thrownTransport = new RecordingTransport([thrown]);
     const thrownError = await client(thrownTransport).value.verifyConnection().catch((caught) => caught);
     expectSafeClientError(thrownError, "network-failed", true);

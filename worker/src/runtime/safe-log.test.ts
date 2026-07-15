@@ -1,4 +1,4 @@
-import { writeSync } from "node:fs";
+import { readFileSync, writeSync } from "node:fs";
 import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
@@ -8,6 +8,19 @@ import { redactSensitiveOutput, SafeFileLogger } from "./safe-log.js";
 const INSTALLATION_ID = "11111111-1111-4111-8111-111111111111";
 const RUN_ID = "22222222-2222-4222-8222-222222222222";
 const NOW = new Date("2026-07-14T12:00:00.000Z");
+const SAFE_LOG_CANARIES = JSON.parse(
+  readFileSync(new URL("../../../tests/fixtures/safe/safe-log-canaries.json", import.meta.url), "utf8"),
+) as Readonly<{
+  credential: string;
+  providerToken: string;
+  sourceHeader: string;
+  cliHeader: string;
+  authorization: string;
+  pairingCode: string;
+  cookie: string;
+  timestampCanary: string;
+  timestamp: string;
+}>;
 
 async function temporaryLogPath(): Promise<string> {
   const root = await realpath(await mkdtemp(join(tmpdir(), "grandbox-log-")));
@@ -206,13 +219,13 @@ describe("SafeFileLogger", () => {
 
   it("redacts synthetic credential, pairing, authorization, header, and cookie canaries", () => {
     const canaries = [
-      ["sec", "ret_fixture-credential"].join(""),
-      ["nt", "n_fixture-notion"].join(""),
-      ["github", "pat_fixture-source"].join("_"),
-      ["gh", "o_fixture-cli"].join(""),
-      ["Bear", "er fixture-authorization"].join(""),
-      ["pairing", "fixture-code"].join("="),
-      ["session", "fixture-cookie"].join("="),
+      SAFE_LOG_CANARIES.credential,
+      SAFE_LOG_CANARIES.providerToken,
+      SAFE_LOG_CANARIES.sourceHeader,
+      SAFE_LOG_CANARIES.cliHeader,
+      SAFE_LOG_CANARIES.authorization,
+      SAFE_LOG_CANARIES.pairingCode,
+      SAFE_LOG_CANARIES.cookie,
     ];
     const serialized = JSON.stringify({
       credential: canaries[0],
@@ -234,10 +247,10 @@ describe("SafeFileLogger", () => {
 
   it("passes the serialized safe line through the redactor before writing", async () => {
     const logPath = await temporaryLogPath();
-    const timestampCanary = ["sec", "ret_fixture-timestamp"].join("");
+    const timestampCanary = SAFE_LOG_CANARIES.timestampCanary;
     const injectedTimestamp = new Date(NOW);
     Object.defineProperty(injectedTimestamp, "toISOString", {
-      value: () => `2026-07-14T12:00:00.000Z-${timestampCanary}`,
+      value: () => SAFE_LOG_CANARIES.timestamp,
     });
 
     new SafeFileLogger(logPath, { now: () => injectedTimestamp }).write({

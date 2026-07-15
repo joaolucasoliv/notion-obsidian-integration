@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import {
   FetchNotionTransport,
@@ -5,14 +6,23 @@ import {
   NotionTransportError,
 } from "./transport.js";
 
-const TOKEN = ["nt", "n_task6_transport_canary"].join("");
+const TEST_CREDENTIALS = JSON.parse(
+  readFileSync(new URL("../../../tests/fixtures/safe/notion-credentials.json", import.meta.url), "utf8"),
+) as Readonly<{
+  token: string;
+  authorization: string;
+  sessionCookie: string;
+  invalidJson: string;
+  providerSaid: string;
+}>;
+const TOKEN = TEST_CREDENTIALS.token;
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8" };
 
 function request(overrides: Partial<Parameters<FetchNotionTransport["request"]>[0]> = {}) {
   return {
     method: "POST" as const,
     path: "/v1/pages",
-    headers: { Authorization: `Bearer ${TOKEN}`, Accept: "application/json" },
+    headers: { Authorization: TEST_CREDENTIALS.authorization, Accept: "application/json" },
     body: { title: "Alpha" },
     timeoutMs: 100,
     maxBytes: 1_024,
@@ -47,7 +57,7 @@ describe("FetchNotionTransport", () => {
     const [url, init] = fetch.mock.calls[0] as [string, RequestInit];
     expect(url).toBe("https://api.notion.com/v1/pages");
     expect(init).toMatchObject({ method: "POST", redirect: "error", body: JSON.stringify({ title: "Alpha" }) });
-    expect(new Headers(init.headers).get("authorization")).toBe(`Bearer ${TOKEN}`);
+    expect(new Headers(init.headers).get("authorization")).toBe(TEST_CREDENTIALS.authorization);
     expect(new Headers(init.headers).get("content-type")).toBe("application/json");
   });
 
@@ -65,9 +75,9 @@ describe("FetchNotionTransport", () => {
         {
           ...JSON_HEADERS,
           "rEtRy-AfTeR": "2",
-          Authorization: `Bearer ${TOKEN}`,
+          Authorization: TEST_CREDENTIALS.authorization,
           "x-reflected-token": TOKEN,
-          "set-cookie": `session=${TOKEN}`,
+          "set-cookie": TEST_CREDENTIALS.sessionCookie,
         },
       ),
     });
@@ -125,7 +135,7 @@ describe("FetchNotionTransport", () => {
     const cases: readonly [string, Response, string][] = [
       ["redirect", redirect, "invalid-response"],
       ["non-json", new Response(TOKEN, { headers: { "content-type": "text/plain" } }), "invalid-response"],
-      ["invalid JSON", new Response(`{${TOKEN}`, { headers: JSON_HEADERS }), "invalid-response"],
+      ["invalid JSON", new Response(TEST_CREDENTIALS.invalidJson, { headers: JSON_HEADERS }), "invalid-response"],
       [
         "response cap",
         new Response(JSON.stringify({ provider_message: "x".repeat(2_048) }), { headers: JSON_HEADERS }),
@@ -150,7 +160,7 @@ describe("FetchNotionTransport", () => {
     const timeoutError = await timeoutTransport.request(request({ timeoutMs: 1 })).catch((caught) => caught);
 
     const networkTransport = new FetchNotionTransport({
-      fetch: async () => { throw new Error(`provider said ${TOKEN}`); },
+      fetch: async () => { throw new Error(TEST_CREDENTIALS.providerSaid); },
     });
     const networkError = await networkTransport.request(request()).catch((caught) => caught);
 
