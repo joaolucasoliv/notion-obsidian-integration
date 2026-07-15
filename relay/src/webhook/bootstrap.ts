@@ -68,6 +68,9 @@ function isPublicRsaOaepJwk(value: JsonWebKey): boolean {
  * extras so no event data is accidentally interpreted as a verification token.
  */
 export function parseBootstrapVerificationToken(rawBody: Uint8Array): string | null {
+  if (rawBody[0] === 0xef && rawBody[1] === 0xbb && rawBody[2] === 0xbf) {
+    return null;
+  }
   let body: string;
   try {
     body = decoder.decode(rawBody);

@@ -379,6 +379,11 @@ describe("handleNotionWebhook", () => {
     expect((await handleNotionWebhook(activeRequest(duplicate, null), deps)).status).toBe(400);
     const nonJsonWhitespace = utf8('{\u00a0"verification_token":"fixture-verification-value"}');
     expect((await handleNotionWebhook(activeRequest(nonJsonWhitespace, null), deps)).status).toBe(400);
+    const validBootstrap = utf8('{"verification_token":"fixture-verification-value"}');
+    const bomPrefixedBootstrap = new Uint8Array(validBootstrap.byteLength + 3);
+    bomPrefixedBootstrap.set([0xef, 0xbb, 0xbf]);
+    bomPrefixedBootstrap.set(validBootstrap, 3);
+    expect((await handleNotionWebhook(activeRequest(bomPrefixedBootstrap, null), deps)).status).toBe(400);
     expect(installations.pendingCiphertexts).toEqual([]);
     expect(events.enqueueCalls).toEqual([]);
   });
