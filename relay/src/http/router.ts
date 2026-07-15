@@ -9,7 +9,8 @@ export type BridgeApiRoute =
   | "bootstrap-webhook-token"
   | "bootstrap-activate"
   | "snapshot-upload"
-  | "graph-read";
+  | "graph-read"
+  | "graph-read-invalid";
 
 export interface BridgeApiRouteDefinition {
   readonly route: BridgeApiRoute;
@@ -38,6 +39,7 @@ export function bridgeApiRoute(request: Request): BridgeApiRouteDefinition | nul
     const graph = CANONICAL_GRAPH_PATH.exec(pathname);
     const graphId = graph?.[1];
     if (graphId !== undefined) return { route: "graph-read", method: "GET", graphId };
+    if (pathname.startsWith("/v1/graph/")) return { route: "graph-read-invalid", method: "GET" };
     return ROUTES[pathname] ?? null;
   } catch {
     return null;

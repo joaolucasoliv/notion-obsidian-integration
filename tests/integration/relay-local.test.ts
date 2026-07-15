@@ -64,6 +64,7 @@ async function storeGraphSnapshot(
     readonly sequence: number;
     readonly envelope: Record<string, unknown>;
     readonly createdAt: string;
+    readonly byteLength?: number;
   },
 ): Promise<boolean> {
   const response = await service.rpc("bridge_store_graph_snapshot_if_newer", {
@@ -72,7 +73,7 @@ async function storeGraphSnapshot(
     p_sequence: input.sequence,
     p_key_id: "local-fixture-key",
     p_envelope: input.envelope,
-    p_byte_length: 16,
+    p_byte_length: input.byteLength ?? 16,
     p_created_at: input.createdAt,
   });
   expect(response.error).toBeNull();
@@ -189,5 +190,112 @@ describe("local relay database", () => {
       });
       expect(response.ok, `${functionName} must not be callable without the service role`).toBe(false);
     }
+  });
+
+  it("rejects malformed direct-RPC envelopes without changing the stored graph snapshot", async () => {
+    const url = requiredEnvironment(relayUrl, "SUPABASE_URL");
+    const serviceRole = requiredEnvironment(serviceRoleKey, "SUPABASE_SERVICE_ROLE_KEY");
+    const service = createClient(url, serviceRole, { auth: { autoRefreshToken: false, persistSession: false } });
+    const installationId = crypto.randomUUID();
+    const graphId = crypto.randomUUID();
+    const createdAt = "2026-07-15T16:00:00.000Z";
+    const envelope7 = graphEnvelope(installationId, 7, createdAt);
+
+    expect((await service.from("bridge_installation").insert({
+      id: installationId,
+      graph_id: graphId,
+      relay_token_hash: "synthetic-hash-only",
+      graph_key_id: "initial-key",
+    })).error).toBeNull();
+    await expect(storeGraphSnapshot(service, {
+      installationId,
+      graphId,
+      sequence: 7,
+      envelope: envelope7,
+      createdAt,
+    })).resolves.toBe(true);
+
+    const malformedWrites = [
+      {
+        sequence: 8,
+        envelope: { installationId, keyId: "local-fixture-key", sequence: 8 },
+        createdAt,
+      },
+      {
+        sequence: 8,
+        envelope: graphEnvelope(installationId, 8, "2026-07-15T16:00:01.000Z"),
+        createdAt,
+      },
+      {
+        sequence: 8,
+        envelope: graphEnvelope(installationId, 8, "2026-02-30T16:00:00Z"),
+        createdAt,
+      },
+      {
+        sequence: 8,
+        envelope: graphEnvelope(installationId, 8, createdAt),
+        createdAt,
+        byteLength: 15,
+      },
+      {
+        sequence: Number.MAX_SAFE_INTEGER + 1,
+        envelope: graphEnvelope(installationId, Number.MAX_SAFE_INTEGER + 1, createdAt),
+        createdAt,
+      },
+    ] as const;
+
+    for (const malformed of malformedWrites) {
+      await expect(storeGraphSnapshot(service, {
+        installationId,
+        graphId,
+        sequence: malformed.sequence,
+        envelope: malformed.envelope,
+        createdAt: malformed.createdAt,
+        byteLength: malformed.byteLength,
+      })).resolves.toBe(false);
+
+      const installation = await service.from("bridge_installation")
+        .select("graph_key_id, snapshot_sequence, graph_rate_count")
+        .eq("id", installationId)
+        .single();
+      expect(installation.error).toBeNull();
+      expect(installation.data).toEqual({ graph_key_id: "local-fixture-key", snapshot_sequence: 7, graph_rate_count: 0 });
+
+      const snapshot = await service.rpc("bridge_read_installation_snapshot", { p_installation_id: installationId });
+      expect(snapshot.error).toBeNull();
+      expect(snapshot.data).toEqual([expect.objectContaining({
+        installation_id: installationId,
+        graph_id: graphId,
+        sequence: 7,
+        key_id: "local-fixture-key",
+        envelope: envelope7,
+        byte_length: 16,
+      })]);
+    }
+
+    expect(await readGraphSnapshot(service, graphId)).toMatchObject({ allowed: true, envelope: envelope7 });
+  });
+
+  it("accepts a valid GraphEnvelopeV1 timestamp with an ISO offset at the RPC boundary", async () => {
+    const url = requiredEnvironment(relayUrl, "SUPABASE_URL");
+    const serviceRole = requiredEnvironment(serviceRoleKey, "SUPABASE_SERVICE_ROLE_KEY");
+    const service = createClient(url, serviceRole, { auth: { autoRefreshToken: false, persistSession: false } });
+    const installationId = crypto.randomUUID();
+    const graphId = crypto.randomUUID();
+    const createdAt = "2026-07-15T13:00:00.000-03:00";
+
+    expect((await service.from("bridge_installation").insert({
+      id: installationId,
+      graph_id: graphId,
+      relay_token_hash: "synthetic-hash-only",
+      graph_key_id: "initial-key",
+    })).error).toBeNull();
+    await expect(storeGraphSnapshot(service, {
+      installationId,
+      graphId,
+      sequence: 1,
+      envelope: graphEnvelope(installationId, 1, createdAt),
+      createdAt,
+    })).resolves.toBe(true);
   });
 });

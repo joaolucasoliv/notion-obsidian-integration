@@ -170,6 +170,10 @@ function publicNoStore(response: Response): Response {
   return response;
 }
 
+export function publicGraphNotFound(): Response {
+  return publicNoStore(notFound());
+}
+
 /** Receives a bounded, authenticated envelope without accepting a caller-selected graph ID. */
 export async function handleAuthenticatedSnapshotUpload(
   request: Request,
@@ -210,7 +214,7 @@ export async function handleAuthenticatedSnapshotUpload(
 export async function handlePublicGraphRead(request: Request, graphId: string, deps: SnapshotApiDependencies): Promise<Response> {
   try {
     if (request.method !== "GET") return publicNoStore(methodNotAllowed("GET"));
-    if (!isCanonicalGraphId(graphId)) return publicNoStore(notFound());
+    if (!isCanonicalGraphId(graphId)) return publicGraphNotFound();
     const now = deps.clock.now();
     if (!Number.isFinite(now.getTime())) throw new Error("Invalid injected clock");
 

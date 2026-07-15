@@ -14,6 +14,10 @@ class RecordingProcessAdapter implements IntegrationProcessAdapter {
   readonly secrets = ["local-anon-secret", "local-service-secret", "local-jwt-secret"];
   statusCode = 1;
   partialStatus = false;
+  stoppedServices: string[] = [];
+  healthFailureService: string | null = null;
+  startFailsUntilStopped = false;
+  private stoppedBeforeStart = false;
   failStart = false;
   failReset = false;
   failVitest = false;
@@ -52,7 +56,12 @@ class RecordingProcessAdapter implements IntegrationProcessAdapter {
             ? "API_URL=http://127.0.0.1:54321\n"
             : "API_URL=http://127.0.0.1:54321\nANON_KEY=local-anon-secret\nSERVICE_ROLE_KEY=local-service-secret\nJWT_SECRET=local-jwt-secret\n"
           : "",
-        stderr: this.statusCode === 0 ? "" : "not running",
+        stderr: this.statusCode === 0
+          ? [
+            this.stoppedServices.length === 0 ? "" : `Stopped services: [${this.stoppedServices.join(" ")}]`,
+            this.healthFailureService === null ? "" : `failed to inspect container health: No such container: ${this.healthFailureService}`,
+          ].filter(Boolean).join("\n")
+          : "not running",
       };
     }
     const operation = args.includes("start") ? "start" : args.includes("db") && args.includes("reset") ? "reset" : null;
@@ -70,11 +79,29 @@ class RecordingProcessAdapter implements IntegrationProcessAdapter {
       });
     }
     if (args.includes("start")) {
+      if (this.startFailsUntilStopped && !this.stoppedBeforeStart) {
+        return { code: 1, stdout: "", stderr: "partial stack must be stopped first" };
+      }
       if (!this.failStart) {
         this.statusCode = 0;
         this.partialStatus = false;
+        this.stoppedServices = [];
+        this.healthFailureService = null;
       }
       return { code: this.failStart ? 1 : 0, stdout: "", stderr: this.failStart ? "start failed" : "" };
+    }
+    if (args.includes("stop")) {
+      this.stoppedBeforeStart = true;
+      this.statusCode = 0;
+      this.stoppedServices = [
+        "supabase_auth_relay",
+        "supabase_db_relay",
+        "supabase_edge_runtime_relay",
+        "supabase_kong_relay",
+        "supabase_rest_relay",
+      ];
+      this.healthFailureService = "supabase_db_relay";
+      return { code: 0, stdout: "", stderr: "" };
     }
     if (args.includes("db") && args.includes("reset")) {
       return { code: this.failReset ? 1 : 0, stdout: "", stderr: this.failReset ? "reset failed" : "" };
@@ -148,7 +175,57 @@ describe("local relay integration runner", () => {
     await runIntegrationTests([], runnerOptions(adapter));
 
     expect(supabaseCalls(adapter).some((call) => call.args.includes("start"))).toBe(true);
-    expect(supabaseCalls(adapter).filter((call) => call.args.includes("stop"))).toHaveLength(1);
+    expect(supabaseCalls(adapter).filter((call) => call.args.includes("stop"))).toHaveLength(2);
+  });
+
+  it("starts and owns a stack when status has a full environment but a required service is stopped", async () => {
+    const adapter = new RecordingProcessAdapter();
+    adapter.statusCode = 0;
+    adapter.stoppedServices = ["supabase_edge_runtime_relay"];
+
+    await runIntegrationTests([], runnerOptions(adapter));
+
+    expect(supabaseCalls(adapter).some((call) => call.args.includes("start"))).toBe(true);
+    expect(supabaseCalls(adapter).filter((call) => call.args.includes("stop"))).toHaveLength(2);
+  });
+
+  it("starts and owns a stack when status reports a missing database container despite a full environment", async () => {
+    const adapter = new RecordingProcessAdapter();
+    adapter.statusCode = 0;
+    adapter.healthFailureService = "supabase_db_relay";
+
+    await runIntegrationTests([], runnerOptions(adapter));
+
+    expect(supabaseCalls(adapter).some((call) => call.args.includes("start"))).toBe(true);
+    expect(supabaseCalls(adapter).filter((call) => call.args.includes("stop"))).toHaveLength(2);
+  });
+
+  it("stops a partially healthy local stack before restarting and owning it", async () => {
+    const adapter = new RecordingProcessAdapter();
+    adapter.statusCode = 0;
+    adapter.stoppedServices = ["supabase_edge_runtime_relay"];
+    adapter.startFailsUntilStopped = true;
+
+    await runIntegrationTests([], runnerOptions(adapter));
+
+    const calls = supabaseCalls(adapter);
+    const firstStop = calls.findIndex((call) => call.args.includes("stop"));
+    const start = calls.findIndex((call) => call.args.includes("start"));
+    expect(firstStop).toBeGreaterThanOrEqual(0);
+    expect(start).toBeGreaterThan(firstStop);
+  });
+
+  it("recovers a status-command failure by stopping before it starts an owned stack", async () => {
+    const adapter = new RecordingProcessAdapter();
+    adapter.startFailsUntilStopped = true;
+
+    await runIntegrationTests([], runnerOptions(adapter));
+
+    const calls = supabaseCalls(adapter);
+    const firstStop = calls.findIndex((call) => call.args.includes("stop"));
+    const start = calls.findIndex((call) => call.args.includes("start"));
+    expect(firstStop).toBeGreaterThanOrEqual(0);
+    expect(start).toBeGreaterThan(firstStop);
   });
 
   it.each([
@@ -159,7 +236,7 @@ describe("local relay integration runner", () => {
     configure(adapter);
 
     await expect(runIntegrationTests([], runnerOptions(adapter))).rejects.toBeInstanceOf(IntegrationRunnerError);
-    expect(supabaseCalls(adapter).filter((call) => call.args.includes("stop"))).toHaveLength(1);
+    expect(supabaseCalls(adapter).filter((call) => call.args.includes("stop"))).toHaveLength(2);
   });
 
   it("cleans up a local stack after startup itself fails", async () => {
@@ -167,15 +244,15 @@ describe("local relay integration runner", () => {
     adapter.failStart = true;
 
     await expect(runIntegrationTests([], runnerOptions(adapter))).rejects.toBeInstanceOf(IntegrationRunnerError);
-    expect(supabaseCalls(adapter).filter((call) => call.args.includes("stop"))).toHaveLength(1);
+    expect(supabaseCalls(adapter).filter((call) => call.args.includes("stop"))).toHaveLength(2);
   });
 
-  it("cleans up exactly once when a signal arrives during tests", async () => {
+  it("adds exactly one cleanup stop after recovery when a signal arrives during tests", async () => {
     const adapter = new RecordingProcessAdapter();
     adapter.invokeSignalDuringVitest = "SIGINT";
 
     await expect(runIntegrationTests([], runnerOptions(adapter))).rejects.toThrow(/SIGINT/i);
-    expect(supabaseCalls(adapter).filter((call) => call.args.includes("stop"))).toHaveLength(1);
+    expect(supabaseCalls(adapter).filter((call) => call.args.includes("stop"))).toHaveLength(2);
   });
 
   it("waits for an active start to settle before signal cleanup", async () => {
@@ -185,11 +262,11 @@ describe("local relay integration runner", () => {
 
     await adapter.pauseReached;
     adapter.signalHandlers.get("SIGINT")?.();
-    expect(supabaseCalls(adapter).filter((call) => call.args.includes("stop"))).toHaveLength(0);
+    expect(supabaseCalls(adapter).filter((call) => call.args.includes("stop"))).toHaveLength(1);
 
     adapter.releasePaused();
     await expect(running).rejects.toThrow(/SIGINT/i);
-    expect(supabaseCalls(adapter).filter((call) => call.args.includes("stop"))).toHaveLength(1);
+    expect(supabaseCalls(adapter).filter((call) => call.args.includes("stop"))).toHaveLength(2);
   });
 
   it("waits for an output-capped reset to settle before owned cleanup", async () => {
@@ -201,11 +278,11 @@ describe("local relay integration runner", () => {
     await adapter.pauseReached;
     await Promise.resolve();
     await Promise.resolve();
-    expect(supabaseCalls(adapter).filter((call) => call.args.includes("stop"))).toHaveLength(0);
+    expect(supabaseCalls(adapter).filter((call) => call.args.includes("stop"))).toHaveLength(1);
 
     adapter.settleActiveChild();
     await expect(running).rejects.toThrow(/output exceeded/i);
-    expect(supabaseCalls(adapter).filter((call) => call.args.includes("stop"))).toHaveLength(1);
+    expect(supabaseCalls(adapter).filter((call) => call.args.includes("stop"))).toHaveLength(2);
   });
 
   it.each(["--linked", "--project-ref", "--remote", "--unknown"]) ("rejects unsafe runner flag %s before spawning", async (flag) => {

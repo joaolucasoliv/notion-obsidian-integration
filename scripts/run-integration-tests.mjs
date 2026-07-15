@@ -17,6 +17,15 @@ const UNSAFE_ENVIRONMENT_NAMES = Object.freeze([
   "SUPABASE_REMOTE_URL",
 ]);
 const SAFE_LOCAL_TEMPORARY_STATE = new Set(["cli-latest"]);
+const REQUIRED_LOCAL_SERVICE_NAMES = Object.freeze([
+  "supabase_auth_relay",
+  "supabase_db_relay",
+  "supabase_edge_runtime_relay",
+  "supabase_kong_relay",
+  "supabase_rest_relay",
+]);
+const LOCAL_STATUS_POLL_INTERVAL_MS = 250;
+const LOCAL_STATUS_TIMEOUT_MS = 10_000;
 
 export class IntegrationRunnerError extends Error {}
 
@@ -129,6 +138,44 @@ function statusValue(values, names) {
 function hasRequiredLocalEnvironment(statusOutput) {
   const values = parseStatusEnvironment(statusOutput);
   return Object.values(LOCAL_ENVIRONMENT_NAMES).every((names) => names.some((name) => typeof values[name] === "string" && values[name].length > 0));
+}
+
+function stoppedLocalServices(status) {
+  const services = new Set();
+  const output = `${status.stdout}\n${status.stderr}`;
+  const matches = output.matchAll(/Stopped services:\s*\[([^\]]*)\]/giu);
+  for (const match of matches) {
+    for (const service of match[1].trim().split(/\s+/u)) {
+      if (service) services.add(service);
+    }
+  }
+  return services;
+}
+
+function hasMissingRequiredLocalService(status) {
+  const output = `${status.stdout}\n${status.stderr}`;
+  return REQUIRED_LOCAL_SERVICE_NAMES.some((service) => output.includes(`No such container: ${service}`));
+}
+
+function isHealthyLocalStatus(status) {
+  if (status.code !== 0 || !hasRequiredLocalEnvironment(status.stdout) || hasMissingRequiredLocalService(status)) return false;
+  const stopped = stoppedLocalServices(status);
+  return REQUIRED_LOCAL_SERVICE_NAMES.every((service) => !stopped.has(service));
+}
+
+function isFullyStoppedLocalStatus(status) {
+  if (status.code !== 0) return true;
+  const stopped = stoppedLocalServices(status);
+  return REQUIRED_LOCAL_SERVICE_NAMES.every((service) => stopped.has(service));
+}
+
+function isStoppedLocalStatus(status) {
+  return isFullyStoppedLocalStatus(status)
+    || `${status.stdout}\n${status.stderr}`.includes("No such container: supabase_db_relay");
+}
+
+function wait(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
 function localVitestEnvironment(statusOutput, environment) {
@@ -250,11 +297,30 @@ export async function runIntegrationTests(argv = [], options = {}) {
     vitest: await resolveLocalBinary(cwd, "vitest"),
   };
   const adapter = options.adapter ?? nodeProcessAdapter();
+  const waitForPoll = options.waitForPoll ?? wait;
   const commandOptions = Object.freeze({ cwd, shell: false, maxOutputBytes: MAX_SUBPROCESS_OUTPUT_BYTES });
   let startedHere = false;
   let startAttemptedHere = false;
   let stopPromise = null;
   let receivedSignal = null;
+
+  const readLocalStatus = () => adapter.run(
+    localBinaries.supabase,
+    ["--workdir", "relay", "status", "--output", "env"],
+    commandOptions,
+  );
+  const waitForLocalStatus = async (description, predicate) => {
+    const deadline = Date.now() + LOCAL_STATUS_TIMEOUT_MS;
+    let status = await readLocalStatus();
+    while (!predicate(status)) {
+      if (Date.now() >= deadline) {
+        throw runnerError(`Timed out waiting for local Supabase ${description}`);
+      }
+      await waitForPoll(LOCAL_STATUS_POLL_INTERVAL_MS);
+      status = await readLocalStatus();
+    }
+    return status;
+  };
 
   const stopIfOwned = async () => {
     if (!startedHere && !startAttemptedHere) {
@@ -264,13 +330,14 @@ export async function runIntegrationTests(argv = [], options = {}) {
       if (typeof adapter.waitForActiveChild === "function") {
         await adapter.waitForActiveChild();
       }
-      return runChecked(
+      await runChecked(
         adapter,
         localBinaries.supabase,
         ["--workdir", "relay", "stop", "--no-backup"],
         commandOptions,
         "Local Supabase stop",
       );
+      await waitForLocalStatus("to stop", isStoppedLocalStatus);
     })();
     await stopPromise;
   };
@@ -286,24 +353,23 @@ export async function runIntegrationTests(argv = [], options = {}) {
 
   let primaryError = null;
   try {
-    let status = await adapter.run(
-      localBinaries.supabase,
-      ["--workdir", "relay", "status", "--output", "env"],
-      commandOptions,
-    );
+    let status = await readLocalStatus();
     throwIfSignalled();
-    if (status.code !== 0 || !hasRequiredLocalEnvironment(status.stdout)) {
+    if (!isHealthyLocalStatus(status)) {
       startAttemptedHere = true;
+      await runChecked(
+        adapter,
+        localBinaries.supabase,
+        ["--workdir", "relay", "stop", "--no-backup"],
+        commandOptions,
+        "Local Supabase recovery stop",
+      );
+      await waitForLocalStatus("to stop before restart", isStoppedLocalStatus);
+      throwIfSignalled();
       await runChecked(adapter, localBinaries.supabase, ["--workdir", "relay", "start"], commandOptions, "Local Supabase start");
       startedHere = true;
       throwIfSignalled();
-      status = await runChecked(
-        adapter,
-        localBinaries.supabase,
-        ["--workdir", "relay", "status", "--output", "env"],
-        commandOptions,
-        "Local Supabase status",
-      );
+      status = await waitForLocalStatus("to become healthy", isHealthyLocalStatus);
       throwIfSignalled();
     }
     const vitestEnvironment = localVitestEnvironment(status.stdout, environment);

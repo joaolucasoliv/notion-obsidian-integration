@@ -13,21 +13,100 @@ language plpgsql
 security invoker
 set search_path = public, pg_temp
 as $$
+declare
+  envelope_created_at text;
+  envelope_nonce text;
+  envelope_ciphertext text;
+  decoded_nonce bytea;
+  decoded_ciphertext bytea;
+  canonical_nonce text;
+  canonical_ciphertext text;
 begin
   if (
     p_sequence <= 0
+    or p_sequence > 9007199254740991
     or p_key_id is null
     or length(p_key_id) = 0
     or length(p_key_id) > 256
-    or p_envelope is null
-    or jsonb_typeof(p_envelope) <> 'object'
-    or p_envelope ->> 'installationId' is distinct from p_installation_id::text
-    or p_envelope ->> 'keyId' is distinct from p_key_id
-    or p_envelope ->> 'sequence' is distinct from p_sequence::text
+    or p_installation_id::text !~ '^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+    or p_graph_id::text !~ '^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
     or p_byte_length is null
     or p_byte_length not between 1 and 8388608
     or p_created_at is null
+    or (p_expected_sequence is not null and (p_expected_sequence < 0 or p_expected_sequence >= 9007199254740991))
   ) then
+    return false;
+  end if;
+
+  if p_envelope is null or jsonb_typeof(p_envelope) <> 'object' then
+    return false;
+  end if;
+
+  if (
+    (select count(*) from jsonb_object_keys(p_envelope)) <> 8
+    or not (p_envelope ?& array['version', 'algorithm', 'installationId', 'keyId', 'sequence', 'createdAt', 'nonce', 'ciphertext'])
+    or jsonb_typeof(p_envelope -> 'version') <> 'number'
+    or p_envelope ->> 'version' <> '1'
+    or jsonb_typeof(p_envelope -> 'algorithm') <> 'string'
+    or p_envelope ->> 'algorithm' <> 'A256GCM'
+    or jsonb_typeof(p_envelope -> 'installationId') <> 'string'
+    or p_envelope ->> 'installationId' <> p_installation_id::text
+    or jsonb_typeof(p_envelope -> 'keyId') <> 'string'
+    or p_envelope ->> 'keyId' <> p_key_id
+    or jsonb_typeof(p_envelope -> 'sequence') <> 'number'
+    or p_envelope ->> 'sequence' <> p_sequence::text
+    or jsonb_typeof(p_envelope -> 'createdAt') <> 'string'
+    or jsonb_typeof(p_envelope -> 'nonce') <> 'string'
+    or jsonb_typeof(p_envelope -> 'ciphertext') <> 'string'
+  ) then
+    return false;
+  end if;
+
+  envelope_created_at := p_envelope ->> 'createdAt';
+  if length(envelope_created_at) > 64
+    or envelope_created_at !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T(?:[01][0-9]|2[0-3]):[0-5][0-9](?::[0-5][0-9](?:[.][0-9]+)?)?(?:Z|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9])$' then
+    return false;
+  end if;
+  begin
+    if envelope_created_at::timestamptz <> p_created_at then
+      return false;
+    end if;
+  exception when others then
+    return false;
+  end;
+
+  envelope_nonce := p_envelope ->> 'nonce';
+  if envelope_nonce !~ '^[A-Za-z0-9_-]{16}$' then
+    return false;
+  end if;
+  begin
+    decoded_nonce := decode(translate(envelope_nonce, '-_', '+/'), 'base64');
+  exception when others then
+    return false;
+  end;
+  canonical_nonce := regexp_replace(translate(replace(encode(decoded_nonce, 'base64'), E'\n', ''), '+/', '-_'), '=+$', '');
+  if octet_length(decoded_nonce) <> 12 or canonical_nonce <> envelope_nonce then
+    return false;
+  end if;
+
+  envelope_ciphertext := p_envelope ->> 'ciphertext';
+  if (
+    envelope_ciphertext !~ '^[A-Za-z0-9_-]+$'
+    or length(envelope_ciphertext) % 4 = 1
+    or length(envelope_ciphertext) > 8388608
+  ) then
+    return false;
+  end if;
+  begin
+    decoded_ciphertext := decode(
+      translate(envelope_ciphertext, '-_', '+/') || repeat('=', (4 - length(envelope_ciphertext) % 4) % 4),
+      'base64'
+    );
+  exception when others then
+    return false;
+  end;
+  canonical_ciphertext := regexp_replace(translate(replace(encode(decoded_ciphertext, 'base64'), E'\n', ''), '+/', '-_'), '=+$', '');
+  if canonical_ciphertext <> envelope_ciphertext or octet_length(decoded_ciphertext) <> p_byte_length then
     return false;
   end if;
 

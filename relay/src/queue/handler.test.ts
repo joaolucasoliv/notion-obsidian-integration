@@ -504,7 +504,14 @@ describe("handleBridgeApi", () => {
     expect(publicGraph.status).toBe(200);
     expect(publicGraph.headers.get("cache-control")).toBe("no-store");
     expect(await publicGraph.json()).toEqual(graphEnvelope);
-    expect((await handleBridgeApi(new Request(`https://fixture.invalid/v1/graph/${GRAPH_ID.toUpperCase()}`), fixture.deps)).status).toBe(404);
+    for (const path of [
+      `/v1/graph/${GRAPH_ID.toUpperCase()}`,
+      `/v1/graph/${GRAPH_ID}/`,
+    ]) {
+      const malformedPublicGraph = await handleBridgeApi(new Request(`https://fixture.invalid${path}`), fixture.deps);
+      expect(malformedPublicGraph.status).toBe(404);
+      expect(malformedPublicGraph.headers.get("cache-control")).toBe("no-store");
+    }
   });
 
   it("scopes claims and acknowledgements to the bearer-token installation", async () => {

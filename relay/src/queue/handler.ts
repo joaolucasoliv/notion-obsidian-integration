@@ -21,6 +21,7 @@ import { EventRepository, type StoredWebhookEvent } from "./repository.js";
 import {
   handleAuthenticatedSnapshotUpload,
   handlePublicGraphRead,
+  publicGraphNotFound,
   type SafeSnapshotLogCode,
   type SnapshotApiDependencies,
 } from "../snapshot/handler.js";
@@ -112,7 +113,7 @@ interface AuthenticatedInstallation {
   readonly tokenHashBytes: Uint8Array;
 }
 
-type AuthenticatedBridgeApiRoute = Exclude<BridgeApiRoute, "graph-read">;
+type AuthenticatedBridgeApiRoute = Exclude<BridgeApiRoute, "graph-read" | "graph-read-invalid">;
 
 interface ClaimInput {
   readonly workerId: string;
@@ -591,6 +592,7 @@ export async function handleBridgeApi(request: Request, deps: BridgeApiDependenc
   try {
     const definition = bridgeApiRoute(request);
     if (definition === null) return notFound();
+    if (definition.route === "graph-read-invalid") return publicGraphNotFound();
     if (definition.route === "graph-read") {
       if (definition.graphId === undefined) return notFound();
       return handlePublicGraphRead(request, definition.graphId, snapshotDependencies(deps));
