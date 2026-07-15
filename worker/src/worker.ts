@@ -433,13 +433,23 @@ export class GrandboxBridgeWorker implements BridgeWorker {
     }, reconciled.failures.length);
     const counts = executed.counts;
     const runSummary = summary(input, startedAt, counts, outcomeFor(counts, input.mode), this.dependencies.clock);
-    const nextState: BridgeStateV1 = {
+    const stateWithoutRun: BridgeStateV1 = {
       ...executed.state,
       lastFullReconciliationAt: input.reason === "reconciliation" && counts.errors === 0
         ? runSummary.completedAt
         : executed.state.lastFullReconciliationAt,
-      lastRun: runSummary,
     };
+    const trueSemanticNoop =
+      counts.planned === 0 &&
+      counts.writes === 0 &&
+      counts.pushed === 0 &&
+      counts.pulled === 0 &&
+      counts.conflicts === 0 &&
+      counts.errors === 0 &&
+      sameDurableState(context.state, stateWithoutRun);
+    const nextState: BridgeStateV1 = trueSemanticNoop
+      ? stateWithoutRun
+      : { ...stateWithoutRun, lastRun: runSummary };
     if (!sameDurableState(context.state, nextState)) {
       if (stateFence === null) {
         stateFence = stateCommitIntent(context.config.installationId, this.dependencies.uuid, this.dependencies.clock);

@@ -319,6 +319,7 @@ export class BridgeHarness {
       corruptCreateBridgeResult?: boolean;
       corruptBodyResult?: boolean;
       corruptManagedStatusResult?: boolean;
+      clock?: Clock;
     }>,
   ) {
     this.state = new MemoryStateStore(initialState(), options.stateSaveFailures ?? 0);
@@ -354,7 +355,7 @@ export class BridgeHarness {
           return operation();
         },
       },
-      clock: new FixedClock(),
+      clock: options.clock ?? new FixedClock(),
       uuid: this.uuid,
       logger: this.logger,
       canonicalizeVault: async () => options.vaultFingerprintMismatch === true
@@ -375,6 +376,7 @@ export class BridgeHarness {
       corruptCreateBridgeResult?: boolean;
       corruptBodyResult?: boolean;
       corruptManagedStatusResult?: boolean;
+      clock?: Clock;
     }> = {},
   ): Promise<BridgeHarness> {
     const directory = await realpath(await mkdtemp(join(tmpdir(), "grandbox-task8-")));

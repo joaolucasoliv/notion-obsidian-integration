@@ -388,18 +388,21 @@ function isDiscardedAccess(node: ts.Expression): boolean {
     const parent = current.parent;
     if (
       ts.isBinaryExpression(parent) &&
-      parent.operatorToken.kind === ts.SyntaxKind.CommaToken &&
-      (parent.left === current || parent.right === current)
+      parent.operatorToken.kind === ts.SyntaxKind.CommaToken
     ) {
-      current = unwrapTransparentExpression(parent);
-      continue;
+      if (parent.left === current) return true;
+      if (parent.right === current) {
+        current = unwrapTransparentExpression(parent);
+        continue;
+      }
     }
-    if (
-      ts.isCommaListExpression(parent) &&
-      parent.elements.includes(current)
-    ) {
-      current = unwrapTransparentExpression(parent);
-      continue;
+    if (ts.isCommaListExpression(parent)) {
+      const index = parent.elements.indexOf(current);
+      if (index !== -1) {
+        if (index < parent.elements.length - 1) return true;
+        current = unwrapTransparentExpression(parent);
+        continue;
+      }
     }
     return false;
   }
@@ -558,6 +561,10 @@ describe("credential fixture hygiene", () => {
     ["used only in a discarded expression", "void fixture.token;"],
     ["used only in a left comma operand", "void (fixture.token, 0);"],
     ["used only in a middle comma operand", "void (0, fixture.token, 1);"],
+    ["used only in a left comma operand passed to a call", "consume((fixture.token, 0));"],
+    ["used only in a middle comma operand passed to a call", "consume((0, fixture.token, 1));"],
+    ["used only in a left comma operand assigned to a value", "result = (fixture.token, 0);"],
+    ["used only in a middle comma operand assigned to a value", "result = (0, fixture.token, 1);"],
   ])("rejects a safe fixture read that is %s", (_label, replacement) => {
     const unusedFixture = SAFE_FIXTURE_READ.replace("const loaded = fixture.token;", replacement);
 
