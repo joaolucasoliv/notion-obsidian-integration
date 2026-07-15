@@ -1,5 +1,5 @@
 import { sha256Hex } from "@grandbox-bridge/shared";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { BridgeHarness, optedIn } from "../fakes/bridge-harness.js";
 
 describe("recovery and journal order", () => {
@@ -173,5 +173,78 @@ describe("recovery and journal order", () => {
     expect(harness.journal.completed.some((entry) => entry.id === "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee")).toBe(true);
     expect(harness.notion.bodyUpdates).toBe(beforeBodyUpdates);
     await expect(harness.note(pair.localPath)).resolves.toContain("remote post");
+  });
+
+  it("fails closed when body recovery receives a forged page and declared semantic hash", async () => {
+    const harness = await BridgeHarness.create();
+    await harness.writeNote("ForgedRecovery.md", optedIn("common\n"));
+    await harness.apply();
+    const pair = Object.values(harness.state.value.pairs)[0];
+    if (pair === undefined) throw new Error("synthetic pair was not created");
+    const observed = await harness.notion.retrievePage(pair.notionPageId);
+    if (observed.kind !== "present") throw new Error("synthetic page disappeared");
+    const intentId = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+    harness.journal.begun.push({
+      schemaVersion: 1,
+      id: intentId,
+      installationId: "11111111-1111-4111-8111-111111111111",
+      effectKind: "update-notion-body-exact",
+      relativePath: null,
+      remoteId: pair.notionPageId,
+      allocationId: null,
+      expectedByteHash: null,
+      expectedSemanticHash: observed.semanticHash,
+      resultByteHash: null,
+      resultSemanticHash: observed.semanticHash,
+      expectedRemoteEditedAt: pair.lastNotionEditedAt,
+      createdAt: "2026-07-14T12:34:56.000Z",
+    });
+    vi.spyOn(harness.notion, "retrievePage").mockResolvedValueOnce({
+      ...observed,
+      pageId: "99999999-9999-4999-8999-999999999999",
+      semantic: { ...observed.semantic, bodyMarkdown: "forged body\n" },
+      semanticHash: observed.semanticHash,
+    });
+
+    const result = await harness.apply();
+
+    expect(result).toMatchObject({ outcome: "recovery-required", writes: 0, errors: 0 });
+    expect(harness.journal.completed.some((entry) => entry.id === intentId)).toBe(false);
+  });
+
+  it("fails closed when a matching page declares a semantic hash for different content", async () => {
+    const harness = await BridgeHarness.create();
+    await harness.writeNote("ForgedHashRecovery.md", optedIn("common\n"));
+    await harness.apply();
+    const pair = Object.values(harness.state.value.pairs)[0];
+    if (pair === undefined) throw new Error("synthetic pair was not created");
+    const observed = await harness.notion.retrievePage(pair.notionPageId);
+    if (observed.kind !== "present") throw new Error("synthetic page disappeared");
+    const intentId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    harness.journal.begun.push({
+      schemaVersion: 1,
+      id: intentId,
+      installationId: "11111111-1111-4111-8111-111111111111",
+      effectKind: "update-notion-body-exact",
+      relativePath: null,
+      remoteId: pair.notionPageId,
+      allocationId: null,
+      expectedByteHash: null,
+      expectedSemanticHash: observed.semanticHash,
+      resultByteHash: null,
+      resultSemanticHash: observed.semanticHash,
+      expectedRemoteEditedAt: pair.lastNotionEditedAt,
+      createdAt: "2026-07-14T12:34:56.000Z",
+    });
+    vi.spyOn(harness.notion, "retrievePage").mockResolvedValueOnce({
+      ...observed,
+      semantic: { ...observed.semantic, bodyMarkdown: "forged body\n" },
+      semanticHash: observed.semanticHash,
+    });
+
+    const result = await harness.apply();
+
+    expect(result).toMatchObject({ outcome: "recovery-required", writes: 0, errors: 0 });
+    expect(harness.journal.completed.some((entry) => entry.id === intentId)).toBe(false);
   });
 });

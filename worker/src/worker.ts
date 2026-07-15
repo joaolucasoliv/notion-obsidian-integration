@@ -25,6 +25,7 @@ import { planPair, validatePlanningBatch } from "./sync/planner.js";
 import { scanVaultNotes } from "./vault/scanner.js";
 import { type CanonicalVaultRoot } from "./vault/safety.js";
 import { AtomicVaultWriter, type VaultWriter } from "./vault/writer.js";
+import { semanticHash } from "./markdown/normalize.js";
 
 export type WorkerRunInput = {
   readonly mode: "preview" | "apply";
@@ -85,6 +86,7 @@ function safeTimestamp(clock: Clock): string {
 }
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+const HASH_PATTERN = /^[0-9a-f]{64}$/u;
 
 function nextJournalId(uuid: UuidSource): string {
   try {
@@ -201,7 +203,11 @@ function outcomeFor(
   return "success";
 }
 
-function asRemoteRecoveryObserver(notion: NotionApi, clock: Clock): RemoteRecoveryObserver {
+function asRemoteRecoveryObserver(
+  notion: NotionApi,
+  clock: Clock,
+  state: Readonly<Pick<ParsedBridgeStateV1, "pairs">>,
+): RemoteRecoveryObserver {
   return {
     classify: async (intent) => {
       if (
@@ -214,22 +220,39 @@ function asRemoteRecoveryObserver(notion: NotionApi, clock: Clock): RemoteRecove
       }
       try {
         const observed = await notion.retrievePage(intent.remoteId);
-        if (observed.kind !== "present") return Object.freeze({ kind: "unprovable" as const });
         if (intent.effectKind !== "update-notion-body-exact") return Object.freeze({ kind: "unprovable" as const });
+        const persisted = Object.values(state.pairs).find((pair) => pair.notionPageId === intent.remoteId);
+        if (
+          observed.kind !== "present" ||
+          observed.pageId !== intent.remoteId ||
+          typeof observed.bridgeId !== "string" ||
+          !UUID_PATTERN.test(observed.bridgeId) ||
+          (persisted !== undefined && observed.bridgeId !== persisted.bridgeId) ||
+          !observed.complete ||
+          !Array.isArray(observed.unsupportedKinds) ||
+          observed.unsupportedKinds.length !== 0 ||
+          !HASH_PATTERN.test(observed.semanticHash)
+        ) {
+          return Object.freeze({ kind: "unprovable" as const });
+        }
+        const computedSemanticHash = await semanticHash(observed.semantic);
+        if (computedSemanticHash !== observed.semanticHash) {
+          return Object.freeze({ kind: "unprovable" as const });
+        }
         const completedAt = safeTimestamp(clock);
         const evidence = {
           schemaVersion: 1 as const,
           resultByteHash: null,
-          resultSemanticHash: observed.semanticHash,
+          resultSemanticHash: computedSemanticHash,
           resultRemoteId: observed.pageId,
           allocatedBridgeId: null,
           observedRemoteEditedAt: observed.editedAt,
           completedAt,
         };
-        if (intent.resultSemanticHash !== null && observed.semanticHash === intent.resultSemanticHash) {
+        if (intent.resultSemanticHash !== null && computedSemanticHash === intent.resultSemanticHash) {
           return Object.freeze({ kind: "post" as const, evidence });
         }
-        if (intent.expectedSemanticHash !== null && observed.semanticHash === intent.expectedSemanticHash) {
+        if (intent.expectedSemanticHash !== null && computedSemanticHash === intent.expectedSemanticHash) {
           return Object.freeze({ kind: "pre" as const, evidence });
         }
         return Object.freeze({ kind: "unprovable" as const });
@@ -313,7 +336,7 @@ export class GrandboxBridgeWorker implements BridgeWorker {
           localObserver: { observe: async (intent) => intent.relativePath === null
             ? Object.freeze({ kind: "missing" as const })
             : localRecoveryObservation(context.root, intent.relativePath) },
-          remoteObserver: asRemoteRecoveryObserver(notion, this.dependencies.clock),
+          remoteObserver: asRemoteRecoveryObserver(notion, this.dependencies.clock, context.state),
           now: () => safeTimestamp(this.dependencies.clock),
         });
         if (recovery.status === "recovery-required") {
