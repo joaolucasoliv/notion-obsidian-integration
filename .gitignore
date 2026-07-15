@@ -6,6 +6,7 @@ dist/
 !.env.example
 .DS_Store
 .superpowers/
+.worktrees/
 .vercel/
 .supabase/
 
