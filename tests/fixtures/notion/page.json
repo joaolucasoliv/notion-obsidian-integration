@@ -1,0 +1,33 @@
+{
+  "object": "page",
+  "id": "33333333-3333-4333-8333-333333333333",
+  "url": "https://www.notion.so/Alpha-33333333333343338333333333333333",
+  "last_edited_time": "2026-07-14T12:00:00.000Z",
+  "properties": {
+    "Name": {
+      "id": "title",
+      "type": "title",
+      "title": [{ "type": "text", "plain_text": "Alpha", "text": { "content": "Alpha" } }]
+    },
+    "Bridge ID": {
+      "id": "bridge",
+      "type": "rich_text",
+      "rich_text": [{ "type": "text", "plain_text": "22222222-2222-4222-8222-222222222222", "text": { "content": "22222222-2222-4222-8222-222222222222" } }]
+    },
+    "Obsidian Path": {
+      "id": "path",
+      "type": "rich_text",
+      "rich_text": [{ "type": "text", "plain_text": "Notes/Alpha.md", "text": { "content": "Notes/Alpha.md" } }]
+    },
+    "Tags": {
+      "id": "tags",
+      "type": "multi_select",
+      "multi_select": [{ "id": "tag-alpha", "name": "alpha", "color": "blue" }, { "id": "tag-zeta", "name": "zeta", "color": "gray" }]
+    },
+    "Sync Status": {
+      "id": "status",
+      "type": "select",
+      "select": { "id": "synced", "name": "Synced", "color": "green" }
+    }
+  }
+}

@@ -1,0 +1,154 @@
+import { describe, expect, it, vi } from "vitest";
+import {
+  FetchNotionTransport,
+  NOTION_REQUEST_MAX_BYTES,
+  NotionTransportError,
+} from "./transport.js";
+
+const TOKEN = ["nt", "n_task6_transport_canary"].join("");
+const JSON_HEADERS = { "content-type": "application/json; charset=utf-8" };
+
+function request(overrides: Partial<Parameters<FetchNotionTransport["request"]>[0]> = {}) {
+  return {
+    method: "POST" as const,
+    path: "/v1/pages",
+    headers: { Authorization: `Bearer ${TOKEN}`, Accept: "application/json" },
+    body: { title: "Alpha" },
+    timeoutMs: 100,
+    maxBytes: 1_024,
+    ...overrides,
+  };
+}
+
+function jsonResponse(value: unknown, status = 200, headers: Record<string, string> = JSON_HEADERS): Response {
+  return new Response(JSON.stringify(value), { status, headers });
+}
+
+function expectSafeError(error: unknown, code: string): void {
+  expect(error).toBeInstanceOf(NotionTransportError);
+  expect((error as NotionTransportError).code).toBe(code);
+  const rendered = `${String(error)} ${JSON.stringify(error)} ${Object.values(error as object).join(" ")}`;
+  expect(rendered).not.toContain(TOKEN);
+  expect(rendered).not.toContain("Bearer");
+}
+
+describe("FetchNotionTransport", () => {
+  it("uses the fixed API base, error redirect policy, and JSON request encoding", async () => {
+    const fetch = vi.fn(async () => jsonResponse({ object: "page" }));
+    const transport = new FetchNotionTransport({ fetch });
+
+    await expect(transport.request(request())).resolves.toEqual({
+      status: 200,
+      headers: expect.any(Object),
+      data: { object: "page" },
+    });
+
+    expect(fetch).toHaveBeenCalledOnce();
+    const [url, init] = fetch.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("https://api.notion.com/v1/pages");
+    expect(init).toMatchObject({ method: "POST", redirect: "error", body: JSON.stringify({ title: "Alpha" }) });
+    expect(new Headers(init.headers).get("authorization")).toBe(`Bearer ${TOKEN}`);
+    expect(new Headers(init.headers).get("content-type")).toBe("application/json");
+  });
+
+  it("accepts an application/json response with an optional charset", async () => {
+    const transport = new FetchNotionTransport({ fetch: async () => jsonResponse({ ok: true }) });
+
+    await expect(transport.request(request())).resolves.toMatchObject({ data: { ok: true } });
+  });
+
+  it.each([
+    "https://api.notion.com/v1/users/me",
+    "//api.notion.com/v1/users/me",
+    "/v1/users/me?token=x",
+    "/v1/users/me#fragment",
+    "/v1/users/../me",
+    "/v2/users/me",
+  ])("rejects unsafe raw path %s before calling fetch", async (path) => {
+    const fetch = vi.fn();
+    const transport = new FetchNotionTransport({ fetch });
+
+    const error = await transport.request(request({ method: "GET", path, body: undefined })).catch((caught) => caught);
+
+    expectSafeError(error, "invalid-response");
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("rejects non-finite timeouts and response caps before calling fetch", async () => {
+    const fetch = vi.fn();
+    const transport = new FetchNotionTransport({ fetch });
+
+    const timeoutError = await transport.request(request({ timeoutMs: Number.NaN })).catch((caught) => caught);
+    const capError = await transport.request(request({ maxBytes: Number.POSITIVE_INFINITY })).catch((caught) => caught);
+
+    expectSafeError(timeoutError, "invalid-response");
+    expectSafeError(capError, "invalid-response");
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("rejects an oversized UTF-8 JSON request before sending headers or body", async () => {
+    const fetch = vi.fn();
+    const transport = new FetchNotionTransport({ fetch });
+    const error = await transport
+      .request(request({ body: { markdown: "x".repeat(NOTION_REQUEST_MAX_BYTES) } }))
+      .catch((caught) => caught);
+
+    expectSafeError(error, "request-too-large");
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("rejects redirects, non-JSON bodies, invalid JSON, and oversized responses without exposing response data", async () => {
+    const redirect = jsonResponse({ provider_message: TOKEN }, 302);
+    Object.defineProperty(redirect, "redirected", { value: true });
+    const cases: readonly [string, Response, string][] = [
+      ["redirect", redirect, "invalid-response"],
+      ["non-json", new Response(TOKEN, { headers: { "content-type": "text/plain" } }), "invalid-response"],
+      ["invalid JSON", new Response(`{${TOKEN}`, { headers: JSON_HEADERS }), "invalid-response"],
+      [
+        "response cap",
+        new Response(JSON.stringify({ provider_message: "x".repeat(2_048) }), { headers: JSON_HEADERS }),
+        "response-too-large",
+      ],
+    ];
+
+    for (const [_label, response, code] of cases) {
+      const transport = new FetchNotionTransport({ fetch: async () => response });
+      const error = await transport.request(request({ maxBytes: 64 })).catch((caught) => caught);
+      expectSafeError(error, code);
+    }
+  });
+
+  it("maps an aborted fetch to a fixed timeout error and a network failure to a fixed network error", async () => {
+    const timeoutTransport = new FetchNotionTransport({
+      fetch: async (_url, init) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(new DOMException("provider body", "AbortError")));
+        }),
+    });
+    const timeoutError = await timeoutTransport.request(request({ timeoutMs: 1 })).catch((caught) => caught);
+
+    const networkTransport = new FetchNotionTransport({
+      fetch: async () => { throw new Error(`provider said ${TOKEN}`); },
+    });
+    const networkError = await networkTransport.request(request()).catch((caught) => caught);
+
+    expectSafeError(timeoutError, "timeout");
+    expectSafeError(networkError, "network-failed");
+  });
+
+  it("keeps the timeout active while a JSON response stream is still being read", async () => {
+    const transport = new FetchNotionTransport({
+      fetch: async (_url, init) => new Response(new ReadableStream<Uint8Array>({
+        start(controller) {
+          init?.signal?.addEventListener("abort", () => controller.error(new DOMException("provider body", "AbortError")));
+        },
+      }), { headers: JSON_HEADERS }),
+    });
+    const error = await Promise.race([
+      transport.request(request({ timeoutMs: 1 })).catch((caught) => caught),
+      new Promise<Error>((resolve) => setTimeout(() => resolve(new Error("transport did not timeout")), 50)),
+    ]);
+
+    expectSafeError(error, "timeout");
+  });
+});

@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@grandbox-bridge/shared": "0.1.0",
+    "@notionhq/client": "5.23.1",
     "micromark-util-decode-string": "2.0.1",
     "remark-gfm": "4.0.1",
     "remark-parse": "11.0.0",
