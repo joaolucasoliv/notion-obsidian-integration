@@ -1,6 +1,6 @@
-import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, stat, symlink, unlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rename, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { installIntoVault } from "./install-vault.mjs";
 
@@ -187,6 +187,39 @@ describe("installIntoVault", () => {
     expect(await readFile(join(target, ".technical"), "utf8")).toBe("technical");
   });
 
+  it("rejects concurrent preserved data and technical changes before target replacement", async () => {
+    const stagingDirectory = await createStagingDirectory();
+    const vaultRoot = await temporaryDirectory("grandbox-vault-");
+    const homeDirectory = await temporaryDirectory("grandbox-home-");
+    const target = pluginDirectory(vaultRoot);
+    await mkdir(target, { recursive: true, mode: 0o700 });
+    await Promise.all([
+      writeFile(join(target, "main.js"), "old main", { mode: 0o600 }),
+      writeFile(join(target, "data.json"), '{"revision":"before"}', { mode: 0o600 }),
+      writeFile(join(target, ".technical"), "before technical metadata", { mode: 0o600 }),
+    ]);
+
+    await expect(installIntoVault({
+      stagingDirectory,
+      vaultRoot,
+      homeDirectory,
+      testHooks: {
+        beforeActivation: async () => {
+          await Promise.all([
+            writeFile(join(target, "data.json"), '{"revision":"newer"}', { mode: 0o600 }),
+            unlink(join(target, ".technical")),
+            writeFile(join(target, ".technical-added"), "new technical metadata", { mode: 0o600 }),
+          ]);
+        },
+      },
+    })).rejects.toThrow(/unsafe vault install path/i);
+
+    expect(await readFile(join(target, "main.js"), "utf8")).toBe("old main");
+    expect(await readFile(join(target, "data.json"), "utf8")).toBe('{"revision":"newer"}');
+    await expect(lstat(join(target, ".technical"))).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await readFile(join(target, ".technical-added"), "utf8")).toBe("new technical metadata");
+  });
+
   it("restores the old target if activation fails after its atomic backup move", async () => {
     const stagingDirectory = await createStagingDirectory();
     const vaultRoot = await temporaryDirectory("grandbox-vault-");
@@ -209,6 +242,98 @@ describe("installIntoVault", () => {
     expect(await readFile(join(target, "main.js"), "utf8")).toBe("old main");
     expect(await readFile(join(target, "data.json"), "utf8")).toBe('{"keep":true}');
     expect(await readFile(join(target, ".technical"), "utf8")).toBe("technical");
+  });
+
+  it("recovers a missing target from one valid crash backup before installing", async () => {
+    const stagingDirectory = await createStagingDirectory();
+    const vaultRoot = await temporaryDirectory("grandbox-vault-");
+    const homeDirectory = await temporaryDirectory("grandbox-home-");
+    const target = pluginDirectory(vaultRoot);
+    const backup = join(dirname(target), ".grandbox-bridge.backup.22222222-2222-4222-8222-222222222222");
+    const staleStaging = join(dirname(target), ".grandbox-bridge.staging.33333333-3333-4333-8333-333333333333");
+    await mkdir(target, { recursive: true, mode: 0o700 });
+    await Promise.all([
+      writeFile(join(target, "main.js"), "old main", { mode: 0o600 }),
+      writeFile(join(target, "data.json"), '{"recovered":true}', { mode: 0o600 }),
+      writeFile(join(target, ".technical"), "recovered technical metadata", { mode: 0o600 }),
+    ]);
+    await rename(target, backup);
+    await mkdir(staleStaging, { mode: 0o700 });
+    await writeFile(join(staleStaging, "partial-copy"), "partial", { mode: 0o600 });
+
+    await installIntoVault({ stagingDirectory, vaultRoot, homeDirectory });
+
+    expect(await readFile(join(target, "main.js"), "utf8")).toBe("main.js-public-content");
+    expect(await readFile(join(target, "data.json"), "utf8")).toBe('{"recovered":true}');
+    expect(await readFile(join(target, ".technical"), "utf8")).toBe("recovered technical metadata");
+    await expect(lstat(backup)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(lstat(staleStaging)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("rejects ambiguous crash recovery state without replacing the current target", async () => {
+    const stagingDirectory = await createStagingDirectory();
+    const vaultRoot = await temporaryDirectory("grandbox-vault-");
+    const homeDirectory = await temporaryDirectory("grandbox-home-");
+    const target = pluginDirectory(vaultRoot);
+    const backup = join(dirname(target), ".grandbox-bridge.backup.22222222-2222-4222-8222-222222222222");
+    await mkdir(target, { recursive: true, mode: 0o700 });
+    await mkdir(backup, { recursive: true, mode: 0o700 });
+    await Promise.all([
+      writeFile(join(target, "main.js"), "old main", { mode: 0o600 }),
+      writeFile(join(target, "data.json"), '{"keep":true}', { mode: 0o600 }),
+      writeFile(join(backup, "data.json"), '{"backup":true}', { mode: 0o600 }),
+    ]);
+
+    await expect(installIntoVault({ stagingDirectory, vaultRoot, homeDirectory })).rejects.toThrow(/unsafe vault install path/i);
+
+    expect(await readFile(join(target, "main.js"), "utf8")).toBe("old main");
+    expect(await readFile(join(target, "data.json"), "utf8")).toBe('{"keep":true}');
+    expect(await readFile(join(backup, "data.json"), "utf8")).toBe('{"backup":true}');
+  });
+
+  it("rejects unsafe crash recovery staging without moving the backup", async () => {
+    const stagingDirectory = await createStagingDirectory();
+    const vaultRoot = await temporaryDirectory("grandbox-vault-");
+    const homeDirectory = await temporaryDirectory("grandbox-home-");
+    const outside = await temporaryDirectory("grandbox-outside-");
+    const target = pluginDirectory(vaultRoot);
+    const backup = join(dirname(target), ".grandbox-bridge.backup.22222222-2222-4222-8222-222222222222");
+    const staleStaging = join(dirname(target), ".grandbox-bridge.staging.33333333-3333-4333-8333-333333333333");
+    await mkdir(target, { recursive: true, mode: 0o700 });
+    await Promise.all([
+      writeFile(join(target, "data.json"), '{"backup":true}', { mode: 0o600 }),
+      writeFile(join(outside, "protected"), "outside content", { mode: 0o600 }),
+    ]);
+    await rename(target, backup);
+    await symlink(outside, staleStaging);
+
+    await expect(installIntoVault({ stagingDirectory, vaultRoot, homeDirectory })).rejects.toThrow(/unsafe vault install path/i);
+
+    await expect(lstat(target)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await readFile(join(backup, "data.json"), "utf8")).toBe('{"backup":true}');
+    expect(await readFile(join(outside, "protected"), "utf8")).toBe("outside content");
+  });
+
+  it("fails before target replacement when private staging synchronization cannot complete", async () => {
+    const stagingDirectory = await createStagingDirectory();
+    const vaultRoot = await temporaryDirectory("grandbox-vault-");
+    const homeDirectory = await temporaryDirectory("grandbox-home-");
+    const target = pluginDirectory(vaultRoot);
+    await mkdir(target, { recursive: true, mode: 0o700 });
+    await Promise.all([
+      writeFile(join(target, "main.js"), "old main", { mode: 0o600 }),
+      writeFile(join(target, "data.json"), '{"keep":true}', { mode: 0o600 }),
+    ]);
+
+    await expect(installIntoVault({
+      stagingDirectory,
+      vaultRoot,
+      homeDirectory,
+      testHooks: { beforeStagingSync: async () => { throw new Error("injected staging sync failure"); } },
+    })).rejects.toThrow(/vault install failed/i);
+
+    expect(await readFile(join(target, "main.js"), "utf8")).toBe("old main");
+    expect(await readFile(join(target, "data.json"), "utf8")).toBe('{"keep":true}');
   });
 
   it.each([

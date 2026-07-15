@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import {
   chmod,
@@ -20,6 +20,9 @@ const PRIVATE_FILE_MODE = 0o600;
 const MAX_ARTIFACT_BYTES = 32 * 1024 * 1024;
 const MAX_TREE_ENTRIES = 10_000;
 const MAX_TREE_DEPTH = 32;
+const UUID_SUFFIX_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const BACKUP_NAME_PREFIX = `.${PLUGIN_ID}.backup.`;
+const STAGING_NAME_PREFIX = `.${PLUGIN_ID}.staging.`;
 
 class InstallerError extends Error {}
 
@@ -243,6 +246,134 @@ async function inspectDirectoryTree(directoryPath, rootPath, budget, errorFactor
   }
 }
 
+function snapshotDirectoryEntry(entry) {
+  return Object.freeze({
+    kind: "directory",
+    dev: entry.dev,
+    ino: entry.ino,
+    mode: entry.mode & 0o777,
+    mtimeMs: entry.mtimeMs,
+    ctimeMs: entry.ctimeMs,
+  });
+}
+
+async function snapshotRegularFile(filePath, errorFactory) {
+  let handle;
+  try {
+    const before = await assertExistingRegularFile(filePath, errorFactory);
+    handle = await open(filePath, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const opened = await handle.stat();
+    if (!opened.isFile() || !sameIdentity(opened, before) || opened.size > MAX_ARTIFACT_BYTES) {
+      throw errorFactory();
+    }
+    const contents = await handle.readFile();
+    const afterRead = await handle.stat();
+    if (
+      contents.byteLength !== opened.size ||
+      !afterRead.isFile() ||
+      !sameIdentity(afterRead, before) ||
+      afterRead.size !== opened.size
+    ) {
+      throw errorFactory();
+    }
+    return Object.freeze({
+      kind: "file",
+      dev: opened.dev,
+      ino: opened.ino,
+      mode: opened.mode & 0o777,
+      size: opened.size,
+      mtimeMs: opened.mtimeMs,
+      ctimeMs: opened.ctimeMs,
+      sha256: createHash("sha256").update(contents).digest("hex"),
+    });
+  } catch (caught) {
+    if (caught instanceof InstallerError) throw caught;
+    throw errorFactory();
+  } finally {
+    if (handle !== undefined) await handle.close().catch(() => undefined);
+  }
+}
+
+async function snapshotPreservedTechnicalTree(
+  directoryPath,
+  rootPath,
+  budget,
+  entries = new Map(),
+  relativeDirectory = "",
+  depth = 0,
+) {
+  if (depth > MAX_TREE_DEPTH || budget.entries > MAX_TREE_ENTRIES) {
+    throw unsafeVaultInstallPathError();
+  }
+  let names;
+  try {
+    names = (await readdir(directoryPath)).sort();
+  } catch {
+    throw unsafeVaultInstallPathError();
+  }
+  for (const name of names) {
+    assertChildName(name, unsafeVaultInstallPathError);
+    if (relativeDirectory === "" && REQUIRED_ARTIFACT_SET.has(name)) {
+      continue;
+    }
+    budget.entries += 1;
+    if (budget.entries > MAX_TREE_ENTRIES) {
+      throw unsafeVaultInstallPathError();
+    }
+    const relativePath = relativeDirectory === "" ? name : `${relativeDirectory}/${name}`;
+    const entryPath = join(directoryPath, name);
+    if (!isBeneath(rootPath, entryPath)) {
+      throw unsafeVaultInstallPathError();
+    }
+    let entry;
+    try {
+      entry = await lstat(entryPath);
+    } catch {
+      throw unsafeVaultInstallPathError();
+    }
+    if (entry.isSymbolicLink()) {
+      throw unsafeVaultInstallPathError();
+    }
+    if (entry.isDirectory()) {
+      const canonical = await realpath(entryPath).catch(() => null);
+      if (canonical !== entryPath) {
+        throw unsafeVaultInstallPathError();
+      }
+      entries.set(relativePath, snapshotDirectoryEntry(entry));
+      await snapshotPreservedTechnicalTree(entryPath, rootPath, budget, entries, relativePath, depth + 1);
+      continue;
+    }
+    if (!entry.isFile()) {
+      throw unsafeVaultInstallPathError();
+    }
+    entries.set(relativePath, await snapshotRegularFile(entryPath, unsafeVaultInstallPathError));
+  }
+  return entries;
+}
+
+function samePreservedSnapshot(left, right) {
+  if (left.size !== right.size) return false;
+  for (const [path, expected] of left) {
+    const observed = right.get(path);
+    if (observed === undefined || expected.kind !== observed.kind) return false;
+    if (
+      expected.dev !== observed.dev ||
+      expected.ino !== observed.ino ||
+      expected.mode !== observed.mode ||
+      expected.mtimeMs !== observed.mtimeMs ||
+      expected.ctimeMs !== observed.ctimeMs
+    ) {
+      return false;
+    }
+    if (expected.kind === "file" && (
+      expected.size !== observed.size || expected.sha256 !== observed.sha256
+    )) {
+      return false;
+    }
+  }
+  return true;
+}
+
 async function inspectExistingTarget(targetPath) {
   try {
     const target = await lstat(targetPath);
@@ -254,10 +385,11 @@ async function inspectExistingTarget(targetPath) {
       throw unsafeVaultInstallPathError();
     }
     await inspectDirectoryTree(targetPath, targetPath, { entries: 0 }, unsafeVaultInstallPathError);
-    return Object.freeze({ exists: true, identity: { dev: target.dev, ino: target.ino } });
+    const preserved = await snapshotPreservedTechnicalTree(targetPath, targetPath, { entries: 0 });
+    return Object.freeze({ exists: true, identity: { dev: target.dev, ino: target.ino }, preserved });
   } catch (caught) {
     if (isMissing(caught)) {
-      return Object.freeze({ exists: false, identity: null });
+      return Object.freeze({ exists: false, identity: null, preserved: new Map() });
     }
     if (caught instanceof InstallerError) throw caught;
     throw unsafeVaultInstallPathError();
@@ -275,7 +407,11 @@ async function assertTargetUnchanged(targetPath, expected) {
     throw unsafeVaultInstallPathError();
   }
   const current = await inspectExistingTarget(targetPath);
-  if (!current.exists || !sameIdentity(current.identity, expected.identity)) {
+  if (
+    !current.exists ||
+    !sameIdentity(current.identity, expected.identity) ||
+    !samePreservedSnapshot(expected.preserved, current.preserved)
+  ) {
     throw unsafeVaultInstallPathError();
   }
 }
@@ -398,6 +534,151 @@ async function createTemporaryTarget(parentPath) {
   }
 }
 
+async function verifyPrivateStagingTree(
+  directoryPath,
+  rootPath,
+  budget,
+  synchronizeDirectories,
+  errorFactory = vaultInstallError,
+  depth = 0,
+) {
+  if (depth > MAX_TREE_DEPTH || budget.entries > MAX_TREE_ENTRIES) {
+    throw errorFactory();
+  }
+  let directory;
+  try {
+    directory = await lstat(directoryPath);
+  } catch {
+    throw errorFactory();
+  }
+  if (
+    directory.isSymbolicLink() ||
+    !directory.isDirectory() ||
+    (directory.mode & 0o777) !== PRIVATE_DIRECTORY_MODE ||
+    await realpath(directoryPath).catch(() => null) !== directoryPath
+  ) {
+    throw errorFactory();
+  }
+  let names;
+  try {
+    names = (await readdir(directoryPath)).sort();
+  } catch {
+    throw errorFactory();
+  }
+  for (const name of names) {
+    budget.entries += 1;
+    if (budget.entries > MAX_TREE_ENTRIES) {
+      throw errorFactory();
+    }
+    assertChildName(name, errorFactory);
+    const childPath = join(directoryPath, name);
+    if (!isBeneath(rootPath, childPath)) {
+      throw errorFactory();
+    }
+    let child;
+    try {
+      child = await lstat(childPath);
+    } catch {
+      throw errorFactory();
+    }
+    if (child.isSymbolicLink()) {
+      throw errorFactory();
+    }
+    if (child.isDirectory()) {
+      await verifyPrivateStagingTree(childPath, rootPath, budget, synchronizeDirectories, errorFactory, depth + 1);
+      continue;
+    }
+    if (
+      !child.isFile() ||
+      (child.mode & 0o777) !== PRIVATE_FILE_MODE ||
+      child.size > MAX_ARTIFACT_BYTES ||
+      await realpath(childPath).catch(() => null) !== childPath
+    ) {
+      throw errorFactory();
+    }
+  }
+  if (synchronizeDirectories) {
+    await syncDirectory(directoryPath);
+  }
+}
+
+async function synchronizePrivateStagingTree(directoryPath) {
+  await verifyPrivateStagingTree(directoryPath, directoryPath, { entries: 0 }, true);
+}
+
+async function recoveryCandidates(parentPath) {
+  let names;
+  try {
+    names = (await readdir(parentPath)).sort();
+  } catch {
+    throw unsafeVaultInstallPathError();
+  }
+  const backups = [];
+  const staging = [];
+  for (const name of names) {
+    assertChildName(name, unsafeVaultInstallPathError);
+    const isBackup = name.startsWith(BACKUP_NAME_PREFIX);
+    const isStaging = name.startsWith(STAGING_NAME_PREFIX);
+    if (!isBackup && !isStaging) continue;
+    const prefix = isBackup ? BACKUP_NAME_PREFIX : STAGING_NAME_PREFIX;
+    if (!UUID_SUFFIX_PATTERN.test(name.slice(prefix.length))) {
+      throw unsafeVaultInstallPathError();
+    }
+    const candidatePath = join(parentPath, name);
+    if (!isBeneath(parentPath, candidatePath)) {
+      throw unsafeVaultInstallPathError();
+    }
+    (isBackup ? backups : staging).push(candidatePath);
+  }
+  return Object.freeze({ backups, staging });
+}
+
+async function assertTargetAbsent(targetPath) {
+  try {
+    await lstat(targetPath);
+  } catch (caught) {
+    if (isMissing(caught)) return;
+    throw unsafeVaultInstallPathError();
+  }
+  throw unsafeVaultInstallPathError();
+}
+
+async function recoverInterruptedReplacement(parentPath, targetPath) {
+  const candidates = await recoveryCandidates(parentPath);
+  if (candidates.backups.length === 0 && candidates.staging.length === 0) {
+    return;
+  }
+  const currentTarget = await inspectExistingTarget(targetPath);
+  if (currentTarget.exists || candidates.backups.length !== 1 || candidates.staging.length > 1) {
+    throw unsafeVaultInstallPathError();
+  }
+
+  const backupPath = candidates.backups[0];
+  if (backupPath === undefined) {
+    throw unsafeVaultInstallPathError();
+  }
+  const backup = await inspectExistingTarget(backupPath);
+  if (!backup.exists) {
+    throw unsafeVaultInstallPathError();
+  }
+  for (const stagingPath of candidates.staging) {
+    await verifyPrivateStagingTree(stagingPath, stagingPath, { entries: 0 }, false, unsafeVaultInstallPathError);
+  }
+
+  await assertTargetAbsent(targetPath);
+  for (const stagingPath of candidates.staging) {
+    await rm(stagingPath, { recursive: true, force: false, maxRetries: 1 });
+    await syncDirectory(parentPath);
+  }
+  const finalBackup = await inspectExistingTarget(backupPath);
+  if (!finalBackup.exists) {
+    throw unsafeVaultInstallPathError();
+  }
+  await assertTargetAbsent(targetPath);
+  await rename(backupPath, targetPath);
+  await syncDirectory(parentPath);
+}
+
 async function removeTemporary(path) {
   await rm(path, { recursive: true, force: true, maxRetries: 1 }).catch(() => undefined);
 }
@@ -464,6 +745,7 @@ async function activateTarget({ targetPath, expectedTarget, temporaryPath, befor
   let backupPath = null;
   let oldTargetMoved = false;
   let activated = false;
+  const parentPath = dirname(targetPath);
   try {
     await assertTargetUnchanged(targetPath, expectedTarget);
     await beforeActivation?.();
@@ -478,6 +760,7 @@ async function activateTarget({ targetPath, expectedTarget, temporaryPath, befor
       }
       await rename(targetPath, backupPath);
       oldTargetMoved = true;
+      await syncDirectory(parentPath);
       await afterBackupRename?.();
     }
     const staged = await lstat(temporaryPath);
@@ -486,7 +769,7 @@ async function activateTarget({ targetPath, expectedTarget, temporaryPath, befor
     }
     await rename(temporaryPath, targetPath);
     activated = true;
-    await syncDirectory(dirname(targetPath));
+    await syncDirectory(parentPath);
   } catch (caught) {
     if (!activated && oldTargetMoved && backupPath !== null) {
       try {
@@ -494,6 +777,7 @@ async function activateTarget({ targetPath, expectedTarget, temporaryPath, befor
       } catch (targetError) {
         if (isMissing(targetError)) {
           await rename(backupPath, targetPath).catch(() => undefined);
+          await syncDirectory(parentPath).catch(() => undefined);
         }
       }
     }
@@ -503,7 +787,8 @@ async function activateTarget({ targetPath, expectedTarget, temporaryPath, befor
   if (backupPath !== null) {
     const backup = await lstat(backupPath).catch(() => null);
     if (backup !== null && !backup.isSymbolicLink() && backup.isDirectory()) {
-      await rm(backupPath, { recursive: true, force: true, maxRetries: 1 }).catch(() => undefined);
+      await rm(backupPath, { recursive: true, force: true, maxRetries: 1 });
+      await syncDirectory(parentPath);
     }
   }
 }
@@ -523,13 +808,22 @@ function validateInput(input) {
   }
   const beforeActivation = hooks?.beforeActivation;
   const afterBackupRename = hooks?.afterBackupRename;
+  const beforeStagingSync = hooks?.beforeStagingSync;
   if (
     (beforeActivation !== undefined && typeof beforeActivation !== "function") ||
-    (afterBackupRename !== undefined && typeof afterBackupRename !== "function")
+    (afterBackupRename !== undefined && typeof afterBackupRename !== "function") ||
+    (beforeStagingSync !== undefined && typeof beforeStagingSync !== "function")
   ) {
     throw unsafeInstallPathError();
   }
-  return Object.freeze({ stagingDirectory, vaultRoot, homeDirectory, beforeActivation, afterBackupRename });
+  return Object.freeze({
+    stagingDirectory,
+    vaultRoot,
+    homeDirectory,
+    beforeActivation,
+    afterBackupRename,
+    beforeStagingSync,
+  });
 }
 
 /**
@@ -554,6 +848,7 @@ export async function installIntoVault(input) {
       errorFactory: unsafeVaultInstallPathError,
     });
     const targetPath = join(pluginsDirectory, PLUGIN_ID);
+    await recoverInterruptedReplacement(pluginsDirectory, targetPath);
     const expectedTarget = await inspectExistingTarget(targetPath);
     const logs = await ensurePrivateLog(validated.homeDirectory);
 
@@ -564,6 +859,8 @@ export async function installIntoVault(input) {
     for (const artifact of REQUIRED_ARTIFACTS) {
       await copyRegularFile(artifacts.get(artifact), join(temporaryPath, artifact), unsafeArtifactsError);
     }
+    await validated.beforeStagingSync?.();
+    await synchronizePrivateStagingTree(temporaryPath);
 
     await activateTarget({
       targetPath,

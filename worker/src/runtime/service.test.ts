@@ -193,4 +193,28 @@ describe("LaunchAgent service lifecycle", () => {
       failingCommand === "bootstrap" ? ["bootout", "bootstrap"] : ["bootout", "bootstrap", "print"],
     );
   });
+
+  it.each([
+    ["bootout", ["bootout"]],
+    ["print", ["bootout", "print"]],
+  ] as const)("does not treat an unexpected disable %s failure as service absence", async (failingCommand, expectedCalls) => {
+    const homeDirectory = await temporaryHome();
+    const commands: ServiceCommand[] = [];
+
+    await expect(disableService({
+      homeDirectory,
+      installationId: INSTALLATION_ID,
+      uid: 501,
+      runner: {
+        run: async (command: ServiceCommand) => {
+          commands.push(command);
+          return {
+            code: command.args[0] === failingCommand ? 1 : command.args[0] === "print" ? 113 : 0,
+          };
+        },
+      },
+    })).rejects.toThrow(/service command failed/i);
+
+    expect(commands.map((command) => command.args[0])).toEqual(expectedCalls);
+  });
 });

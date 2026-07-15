@@ -7,6 +7,8 @@ import { assertCanonicalRuntimePath, assertValidInstallationId } from "./paths.j
 const PRIVATE_DIRECTORY_MODE = 0o700;
 const PRIVATE_FILE_MODE = 0o600;
 const LAUNCHCTL_PATH = "/bin/launchctl";
+// `launchctl print gui/<uid>/<missing-label>` reports the explicit absent-service result as 113.
+const LAUNCHCTL_SERVICE_ABSENT_EXIT_CODE = 113;
 const SENSITIVE_PATH_FRAGMENT = /ntn_|relay-token|graph-key|secret_|bearer/i;
 
 export interface LaunchAgentInput {
@@ -325,9 +327,12 @@ export async function installService(input: InstallServiceInput): Promise<Servic
 export async function disableService(input: ServiceLocation): Promise<ServiceStatus> {
   const location = validateLocation(input);
   await assertSafeDirectory(location.homeDirectory);
-  await runLaunchctl(location.runner, ["bootout", `gui/${location.uid}`, location.plistPath]);
+  const bootout = await runLaunchctl(location.runner, ["bootout", `gui/${location.uid}`, location.plistPath]);
+  if (bootout.code !== 0 && bootout.code !== LAUNCHCTL_SERVICE_ABSENT_EXIT_CODE) {
+    throw serviceCommandError();
+  }
   const printed = await runLaunchctl(location.runner, ["print", `gui/${location.uid}/${location.label}`]);
-  if (printed.code === 0) {
+  if (printed.code !== LAUNCHCTL_SERVICE_ABSENT_EXIT_CODE) {
     throw serviceCommandError();
   }
   return Object.freeze({ label: location.label, plistPath: location.plistPath, enabled: false });
