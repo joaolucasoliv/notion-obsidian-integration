@@ -294,6 +294,12 @@ function rawRecord(metadata: PageMetadata, markdown: PageMarkdown): Readonly<Raw
   });
 }
 
+function sameTagSet(observed: readonly string[], expected: readonly string[]): boolean {
+  if (observed.length !== expected.length) return false;
+  const observedSet = new Set(observed);
+  return observedSet.size === observed.length && expected.every((tag) => observedSet.has(tag));
+}
+
 function isDecodedObservation(value: unknown, source: Readonly<RawNotionPageRecord>): value is Extract<NotionObservation, { kind: "present" }> {
   if (!isRecord(value) || value.kind !== "present") return false;
   if (
@@ -311,6 +317,7 @@ function isDecodedObservation(value: unknown, source: Readonly<RawNotionPageReco
   }
   if (!isRecord(value.semantic) || typeof value.semantic.bodyMarkdown !== "string" || !Array.isArray(value.semantic.tags)) return false;
   if (!value.semantic.tags.every((tag) => isBoundedText(tag, MAX_TAG_BYTES))) return false;
+  if (!sameTagSet(value.semantic.tags, source.managed.tags)) return false;
   return (
     typeof value.semanticHash === "string" &&
     HASH_PATTERN.test(value.semanticHash) &&

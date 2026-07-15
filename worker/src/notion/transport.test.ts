@@ -57,6 +57,28 @@ describe("FetchNotionTransport", () => {
     await expect(transport.request(request())).resolves.toMatchObject({ data: { ok: true } });
   });
 
+  it("returns only normalized safe retry metadata from a successful upstream response", async () => {
+    const transport = new FetchNotionTransport({
+      fetch: async () => jsonResponse(
+        { ok: true },
+        200,
+        {
+          ...JSON_HEADERS,
+          "rEtRy-AfTeR": "2",
+          Authorization: `Bearer ${TOKEN}`,
+          "x-reflected-token": TOKEN,
+          "set-cookie": `session=${TOKEN}`,
+        },
+      ),
+    });
+
+    const result = await transport.request(request());
+
+    expect(result).toEqual({ status: 200, headers: { "retry-after": "2" }, data: { ok: true } });
+    expect(JSON.stringify(result)).not.toContain(TOKEN);
+    expect(JSON.stringify(result)).not.toContain("Authorization");
+  });
+
   it.each([
     "https://api.notion.com/v1/users/me",
     "//api.notion.com/v1/users/me",
@@ -150,5 +172,32 @@ describe("FetchNotionTransport", () => {
     ]);
 
     expectSafeError(error, "timeout");
+  });
+
+  it("times out and cancels a non-cooperative never-resolving response stream", async () => {
+    let cancellations = 0;
+    const reader = {
+      read: () => new Promise<ReadableStreamReadResult<Uint8Array>>(() => undefined),
+      cancel: () => {
+        cancellations += 1;
+        return Promise.resolve();
+      },
+      releaseLock: () => undefined,
+    };
+    const response = {
+      redirected: false,
+      type: "default",
+      status: 200,
+      headers: new Headers(JSON_HEADERS),
+      body: { getReader: () => reader },
+    } as unknown as Response;
+    const transport = new FetchNotionTransport({ fetch: async () => response });
+    const error = await Promise.race([
+      transport.request(request({ timeoutMs: 1 })).catch((caught) => caught),
+      new Promise<Error>((resolve) => setTimeout(() => resolve(new Error("transport did not timeout")), 50)),
+    ]);
+
+    expectSafeError(error, "timeout");
+    expect(cancellations).toBe(1);
   });
 });

@@ -371,6 +371,34 @@ describe("NotionClient raw page validation and decoder boundary", () => {
     }
   });
 
+  it.each([
+    ["forged", ["alpha", "forged"]],
+    ["lost", ["alpha"]],
+    ["duplicated", ["alpha", "alpha"]],
+  ] as const)("rejects decoder semantic tags that are %s instead of the managed tag set", async (_label, tags) => {
+    const transport = new RecordingTransport([response(page()), response(markdown())]);
+    const changedTags = decoder((record) => observationFromDecoder(record, {
+      semantic: { bodyMarkdown: "decoder-owned body", tags: [...tags] },
+    }));
+    const error = await client(transport, changedTags).value.retrievePage(PAGE_ID).catch((caught) => caught);
+
+    expectSafeClientError(error, "invalid-response", false);
+  });
+
+  it("permits canonical decoder tag reordering while preserving the managed tag set", async () => {
+    const source = page() as Record<string, any>;
+    source.properties.Tags.multi_select.reverse();
+    const sortedTags = decoder((record) => observationFromDecoder(record, {
+      semantic: { bodyMarkdown: "decoder-owned body", tags: [...record.managed.tags].sort() },
+    }));
+    const result = await client(
+      new RecordingTransport([response(source), response(markdown())]),
+      sortedTags,
+    ).value.retrievePage(PAGE_ID);
+
+    expect(result.semantic.tags).toEqual(["alpha", "zeta"]);
+  });
+
   it("only returns incomplete content through the decoder path for truncation or unknown blocks", async () => {
     for (const [field, value] of [
       ["truncated", true],

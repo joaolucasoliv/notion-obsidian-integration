@@ -5,6 +5,7 @@ export const NOTION_REQUEST_MAX_BYTES = 512_000;
 export const NOTION_RESPONSE_MAX_BYTES = 2 * 1024 * 1024;
 
 const MAX_TIMEOUT_MS = 300_000;
+const MAX_RETRY_AFTER_SECONDS = 300n;
 const RELATIVE_NOTION_PATH = /^\/v1(?:\/[A-Za-z0-9_-]+)+$/u;
 const JSON_CONTENT_TYPE = /^application\/json(?:\s*;\s*charset\s*=\s*[^;\s]+)?\s*$/iu;
 
@@ -138,9 +139,10 @@ function responseContentType(response: Response): string | null {
 
 function responseHeaders(response: Response): Readonly<Record<string, string>> {
   try {
-    const headers: Record<string, string> = {};
-    response.headers.forEach((value, name) => { headers[name] = value; });
-    return Object.freeze(headers);
+    const retryAfter = response.headers.get("retry-after");
+    if (retryAfter === null || !/^\d+$/u.test(retryAfter)) return Object.freeze({});
+    const seconds = BigInt(retryAfter);
+    return Object.freeze({ "retry-after": (seconds > MAX_RETRY_AFTER_SECONDS ? MAX_RETRY_AFTER_SECONDS : seconds).toString() });
   } catch {
     throw transportFailure("invalid-response");
   }
@@ -155,7 +157,15 @@ function declaredResponseLength(response: Response): number | null {
   return parsed;
 }
 
-async function boundedResponseBytes(response: Response, maxBytes: number): Promise<Uint8Array> {
+function cancelReader(reader: ReadableStreamDefaultReader<Uint8Array>): void {
+  try {
+    void reader.cancel().catch(() => undefined);
+  } catch {
+    // The transport always returns the fixed timeout/size error instead of a stream-specific failure.
+  }
+}
+
+async function boundedResponseBytes(response: Response, maxBytes: number, deadline: Promise<never>): Promise<Uint8Array> {
   try {
     const declaredLength = declaredResponseLength(response);
     if (declaredLength !== null && declaredLength > maxBytes) throw transportFailure("response-too-large");
@@ -166,18 +176,28 @@ async function boundedResponseBytes(response: Response, maxBytes: number): Promi
     let size = 0;
     try {
       while (true) {
-        const next = await reader.read();
+        let next: ReadableStreamReadResult<Uint8Array>;
+        try {
+          next = await Promise.race([reader.read(), deadline]);
+        } catch (caught) {
+          if (caught instanceof NotionTransportError && caught.code === "timeout") cancelReader(reader);
+          throw caught;
+        }
         if (next.done) break;
         if (!(next.value instanceof Uint8Array)) throw transportFailure("invalid-response");
         size += next.value.byteLength;
         if (size > maxBytes) {
-          await reader.cancel().catch(() => undefined);
+          cancelReader(reader);
           throw transportFailure("response-too-large");
         }
         chunks.push(next.value);
       }
     } finally {
-      reader.releaseLock();
+      try {
+        reader.releaseLock();
+      } catch {
+        // A pending non-cooperative read can retain the lock after the request has timed out.
+      }
     }
 
     const bytes = new Uint8Array(size);
@@ -213,24 +233,29 @@ export class FetchNotionTransport implements NotionTransport {
     if (!isRequestInput(input)) throw transportFailure("invalid-response");
     const body = jsonBody(input);
     const controller = new AbortController();
-    let timedOut = false;
+    let rejectDeadline: (reason: unknown) => void = () => undefined;
+    const deadline = new Promise<never>((_resolve, reject) => { rejectDeadline = reject; });
     const timer = setTimeout(() => {
-      timedOut = true;
       controller.abort();
+      rejectDeadline(transportFailure("timeout"));
     }, input.timeoutMs);
 
     try {
       let response: Response;
       try {
-        response = await this.fetchImpl(requestUrl(input.path), {
-          method: input.method,
-          headers: requestHeaders(input, body),
-          ...(body === undefined ? {} : { body }),
-          redirect: "error",
-          signal: controller.signal,
-        });
-      } catch {
-        if (timedOut || controller.signal.aborted) throw transportFailure("timeout");
+        response = await Promise.race([
+          this.fetchImpl(requestUrl(input.path), {
+            method: input.method,
+            headers: requestHeaders(input, body),
+            ...(body === undefined ? {} : { body }),
+            redirect: "error",
+            signal: controller.signal,
+          }),
+          deadline,
+        ]);
+      } catch (caught) {
+        if (caught instanceof NotionTransportError) throw caught;
+        if (controller.signal.aborted) throw transportFailure("timeout");
         throw transportFailure("network-failed");
       }
 
@@ -247,10 +272,10 @@ export class FetchNotionTransport implements NotionTransport {
         }
         const contentType = responseContentType(response);
         if (contentType === null || !JSON_CONTENT_TYPE.test(contentType)) throw transportFailure("invalid-response");
-        const data = parseJson(await boundedResponseBytes(response, input.maxBytes)) as T;
+        const data = parseJson(await boundedResponseBytes(response, input.maxBytes, deadline)) as T;
         return Object.freeze({ status: response.status, headers: responseHeaders(response), data });
       } catch (caught) {
-        if (timedOut || controller.signal.aborted) throw transportFailure("timeout");
+        if (controller.signal.aborted) throw transportFailure("timeout");
         if (caught instanceof NotionTransportError) throw caught;
         throw transportFailure("invalid-response");
       }
