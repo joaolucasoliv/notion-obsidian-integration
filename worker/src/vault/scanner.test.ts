@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { canonicalVaultRoot } from "./safety.js";
-import { observeSafeVaultNoteBytes, scanVaultNotes } from "./scanner.js";
+import { observeSafeVaultNoteBytes, scanVaultNotes, scanVaultNotesWithStatus } from "./scanner.js";
 
 const INSTALLATION_ID = "11111111-1111-4111-8111-111111111111";
 
@@ -122,7 +122,25 @@ describe("scanVaultNotes", () => {
 
     const scanned = await scanVaultNotes(root, { maximumCandidates: 1, includePaths: ["Z.md"] });
 
-    expect(scanned.map((entry) => entry.path)).toEqual(["A.md", "Z.md"]);
+    expect(scanned).toHaveLength(2);
+    expect(scanned.map((entry) => entry.path)).toContain("Z.md");
+    expect(scanned.map((entry) => entry.path)).toContainEqual(expect.stringMatching(/^[AB]\.md$/u));
+  });
+
+  it("exposes incomplete bounded traversal rather than claiming an unseen vault complete", async () => {
+    const vault = await temporaryVault();
+    await put(vault, "A/one.txt", "not markdown");
+    await put(vault, "B/two.txt", "not markdown");
+    await put(vault, "C/note.md", "---\nnotion_sync: true\n---\nC");
+    const root = await canonicalVaultRoot(vault, INSTALLATION_ID, { mode: "bootstrap" });
+
+    const result = await scanVaultNotesWithStatus(root, {
+      maximumCandidates: 3,
+      maximumTraversalEntries: 1,
+    });
+
+    expect(result.complete).toBe(false);
+    expect(result.entries.length).toBeLessThanOrEqual(1);
   });
 
   it("reads a conflict artifact through the same bounded no-follow vault path checks used by scanning", async () => {

@@ -1,5 +1,5 @@
 import { constants } from "node:fs";
-import { lstat, open, readdir, realpath, stat } from "node:fs/promises";
+import { lstat, opendir, open, readdir, realpath, stat } from "node:fs/promises";
 import { join } from "node:path";
 import {
   LocalNoteParseError,
@@ -87,14 +87,12 @@ async function assertCanonicalRoot(root: CanonicalVaultRoot): Promise<void> {
   }
 }
 
-async function collectMarkdownCandidates(
+async function collectAllMarkdownCandidates(
   root: CanonicalVaultRoot,
   directory: string,
   parentSegments: readonly string[],
   candidates: string[],
-  maximumCandidates: number,
 ): Promise<void> {
-  if (candidates.length >= maximumCandidates) return;
   let entries;
   try {
     entries = await readdir(directory, { withFileTypes: true });
@@ -104,7 +102,6 @@ async function collectMarkdownCandidates(
   entries.sort((left, right) => compareNames(left.name, right.name));
 
   for (const entry of entries) {
-    if (candidates.length >= maximumCandidates) return;
     const segments = [...parentSegments, entry.name];
     const fullPath = join(root.canonicalRealPath, ...segments);
 
@@ -124,12 +121,70 @@ async function collectMarkdownCandidates(
       } catch {
         continue;
       }
-      await collectMarkdownCandidates(root, fullPath, segments, candidates, maximumCandidates);
+      await collectAllMarkdownCandidates(root, fullPath, segments, candidates);
       continue;
     }
     if (entry.isFile() && /\.md$/i.test(entry.name)) {
       candidates.push(segments.join("/"));
     }
+  }
+}
+
+interface TraversalBudget {
+  readonly maximumCandidates: number;
+  remainingEntries: number;
+}
+
+/**
+ * Partial scans stream directory entries and stop before descending further
+ * once their global traversal or candidate budget is exhausted. The resulting
+ * selection need not be lexicographic; callers use `complete` to defer any
+ * decision that would require proving an unseen note absent.
+ */
+async function collectBoundedMarkdownCandidates(
+  root: CanonicalVaultRoot,
+  directory: string,
+  parentSegments: readonly string[],
+  candidates: string[],
+  budget: TraversalBudget,
+): Promise<boolean> {
+  let handle;
+  try {
+    handle = await opendir(directory, { bufferSize: 1 });
+  } catch {
+    throw invalidCandidate();
+  }
+  try {
+    for (;;) {
+      if (budget.remainingEntries <= 0 || candidates.length >= budget.maximumCandidates) return false;
+      let entry;
+      try {
+        entry = await handle.read();
+      } catch {
+        throw invalidCandidate();
+      }
+      if (entry === null) return true;
+      budget.remainingEntries -= 1;
+      const segments = [...parentSegments, entry.name];
+      const fullPath = join(root.canonicalRealPath, ...segments);
+
+      if (entry.isSymbolicLink()) continue;
+      if (entry.isDirectory()) {
+        if (isTechnicalSegment(entry.name)) continue;
+        try {
+          const directoryStats = await lstat(fullPath);
+          const canonicalDirectory = await realpath(fullPath);
+          if (!directoryStats.isDirectory() || directoryStats.isSymbolicLink() || canonicalDirectory !== fullPath) continue;
+        } catch {
+          continue;
+        }
+        if (!(await collectBoundedMarkdownCandidates(root, fullPath, segments, candidates, budget))) return false;
+        continue;
+      }
+      if (entry.isFile() && /\.md$/i.test(entry.name)) candidates.push(segments.join("/"));
+    }
+  } finally {
+    await handle?.close().catch(() => undefined);
   }
 }
 
@@ -247,14 +302,29 @@ function invalidFrontmatterEntry(path: string): ScannedVaultNote {
 export interface VaultScanOptions {
   /** Caps discovered Markdown candidates; explicit paths remain independently bounded by their caller. */
   readonly maximumCandidates?: number;
+  /** Caps streamed directory entries during a partial discovery walk. */
+  readonly maximumTraversalEntries?: number;
   /** Known state paths that must be observed even when discovery is capped. */
   readonly includePaths?: readonly string[];
+}
+
+export interface VaultScanResult {
+  readonly entries: readonly ScannedVaultNote[];
+  /** False means discovery stopped at a caller-supplied traversal or candidate budget. */
+  readonly complete: boolean;
 }
 
 function maximumCandidates(options: Readonly<VaultScanOptions> | undefined): number {
   const value = options?.maximumCandidates;
   if (value === undefined) return Number.MAX_SAFE_INTEGER;
   if (!Number.isSafeInteger(value) || value < 0 || value > 100_000) throw invalidCandidate();
+  return value;
+}
+
+function maximumTraversalEntries(options: Readonly<VaultScanOptions> | undefined): number | undefined {
+  const value = options?.maximumTraversalEntries;
+  if (value === undefined) return undefined;
+  if (!Number.isSafeInteger(value) || value < 1 || value > 1_000_000) throw invalidCandidate();
   return value;
 }
 
@@ -314,14 +384,28 @@ async function scanCandidate(root: CanonicalVaultRoot, path: string): Promise<Sc
   }
 }
 
-export async function scanVaultNotes(
+export async function scanVaultNotesWithStatus(
   root: CanonicalVaultRoot,
   options?: Readonly<VaultScanOptions>,
-): Promise<readonly ScannedVaultNote[]> {
+): Promise<VaultScanResult> {
   await assertCanonicalRoot(root);
   const explicit = includedPaths(options);
   const candidates: string[] = [];
-  await collectMarkdownCandidates(root, root.canonicalRealPath, [], candidates, maximumCandidates(options));
+  const candidateLimit = maximumCandidates(options);
+  const traversalLimit = maximumTraversalEntries(options);
+  const bounded = options?.maximumCandidates !== undefined || traversalLimit !== undefined;
+  let complete = true;
+  if (bounded) {
+    complete = await collectBoundedMarkdownCandidates(
+      root,
+      root.canonicalRealPath,
+      [],
+      candidates,
+      { maximumCandidates: candidateLimit, remainingEntries: traversalLimit ?? 100_000 },
+    );
+  } else {
+    await collectAllMarkdownCandidates(root, root.canonicalRealPath, [], candidates);
+  }
   const paths = new Set(candidates);
   for (const path of explicit) {
     if (await explicitPathExists(root, path)) paths.add(path);
@@ -332,5 +416,12 @@ export async function scanVaultNotes(
     scanned.push(await scanCandidate(root, path));
   }
 
-  return Object.freeze(scanned);
+  return Object.freeze({ entries: Object.freeze(scanned), complete });
+}
+
+export async function scanVaultNotes(
+  root: CanonicalVaultRoot,
+  options?: Readonly<VaultScanOptions>,
+): Promise<readonly ScannedVaultNote[]> {
+  return (await scanVaultNotesWithStatus(root, options)).entries;
 }

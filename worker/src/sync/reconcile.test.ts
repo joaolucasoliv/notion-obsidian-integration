@@ -2,8 +2,9 @@ import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
+import type { NotionApi } from "@grandbox-bridge/shared";
 import { canonicalVaultRoot } from "../vault/safety.js";
-import { localRecoveryObservation, persistedLinkMapping, ReconciliationError, safeErrorFrom } from "./reconcile.js";
+import { localRecoveryObservation, persistedLinkMapping, reconcilePairs, ReconciliationError, safeErrorFrom } from "./reconcile.js";
 
 const INSTALLATION_ID = "11111111-1111-4111-8111-111111111111";
 
@@ -53,5 +54,47 @@ describe("safe reconciliation errors", () => {
       code: "identity-collision",
       retryable: false,
     });
+  });
+});
+
+describe("bounded reconciliation", () => {
+  it("defers a selected pair when a truncated scan cannot prove a moved note absent", async () => {
+    const vault = await mkdtemp(join(tmpdir(), "grandbox-reconcile-"));
+    const root = await canonicalVaultRoot(vault, INSTALLATION_ID, { mode: "bootstrap" });
+    const bridgeId = "22222222-2222-4222-8222-222222222222";
+    const pageId = "33333333-3333-4333-8333-333333333333";
+    let retrieves = 0;
+    const result = await reconcilePairs({
+      pairs: {
+        [bridgeId]: {
+          bridgeId,
+          localPath: "Original.md",
+          notionPageId: pageId,
+          status: "synced",
+          lastLocalSemanticHash: "a".repeat(64),
+          lastNotionSemanticHash: "a".repeat(64),
+          lastCommonSemanticHash: "a".repeat(64),
+          lastCommonLocalByteHash: "a".repeat(64),
+          lastNotionEditedAt: "2026-07-14T12:34:56.000Z",
+          lastSyncedAt: "2026-07-14T12:34:56.000Z",
+        },
+      },
+    }, {
+      root,
+      clock: { now: () => new Date("2026-07-15T12:00:00.000Z"), sleep: async () => undefined },
+      notion: {
+        retrievePage: async () => {
+          retrieves += 1;
+          throw new Error("must not retrieve a deferred pair");
+        },
+      } as unknown as NotionApi,
+      maximumPairs: 3,
+      maximumCandidates: 3,
+      maximumTraversalEntries: 3,
+      scan: async () => Object.freeze({ entries: Object.freeze([]), complete: false }),
+    });
+
+    expect(result).toEqual({ inputs: [], failures: [] });
+    expect(retrieves).toBe(0);
   });
 });

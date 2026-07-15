@@ -29,7 +29,7 @@ import type { StateStore } from "./persistence/state-store.js";
 import { safeErrorFrom, localRecoveryObservation, reconcilePairs, type ReconciliationResult } from "./sync/reconcile.js";
 import { executePlans, type PlannedPair } from "./sync/executor.js";
 import { planPair, validatePlanningBatch } from "./sync/planner.js";
-import { observeSafeVaultNoteBytes, scanVaultNotes } from "./vault/scanner.js";
+import { observeSafeVaultNoteBytes, scanVaultNotesWithStatus } from "./vault/scanner.js";
 import { type CanonicalVaultRoot } from "./vault/safety.js";
 import { AtomicVaultWriter, type VaultWriter } from "./vault/writer.js";
 import { semanticHash } from "./markdown/normalize.js";
@@ -83,6 +83,12 @@ interface RelayRunContext {
   readonly client: RelayClient;
   readonly source: RelayEventSource;
   readonly graphKey: Uint8Array;
+}
+
+interface ValidatedClaimedEvents {
+  readonly prioritizedPageIds: ReadonlySet<string>;
+  /** Only registered relay pages require a matching reconciled pair before acknowledgement. */
+  readonly matchedPageIds: ReadonlyMap<string, string>;
 }
 
 class WorkerFailure extends Error {
@@ -248,6 +254,7 @@ const GRAPH_KEY_BYTES = 32;
 const FULL_RECONCILIATION_INTERVAL_MS = 24 * 60 * 60 * 1_000;
 const PARTIAL_RECONCILIATION_PAIR_LIMIT = 3;
 const PARTIAL_RECONCILIATION_CANDIDATE_LIMIT = 3;
+const PARTIAL_RECONCILIATION_TRAVERSAL_LIMIT = 128;
 
 function validateRelayToken(value: string | null): string {
   const token = validateCredential(value);
@@ -489,24 +496,29 @@ export class GrandboxBridgeWorker implements BridgeWorker {
     notion: NotionApi,
     state: Readonly<ParsedBridgeStateV1>,
     events: readonly RelayEvent[],
-  ): Promise<ReadonlySet<string>> {
+  ): Promise<ValidatedClaimedEvents> {
     const registeredPages = new Set(
       Object.values(state.pairs)
         .filter(isRetainedRelayPair)
         .map((pair) => pair.notionPageId),
     );
     const prioritizedPages = new Set<string>();
+    const matchedPageIds = new Map<string, string>();
     for (const event of events) {
       if (registeredPages.has(event.entityId)) {
         prioritizedPages.add(event.entityId);
+        matchedPageIds.set(event.id, event.entityId);
         continue;
       }
       const pageId = await notion.resolveEventPage(event.entityId, 16);
       // Unknown pages are deliberately acknowledged only after the complete
       // reconciliation succeeds; they never authorize a local mutation.
-      if (pageId !== null && registeredPages.has(pageId)) prioritizedPages.add(pageId);
+      if (pageId !== null && registeredPages.has(pageId)) {
+        prioritizedPages.add(pageId);
+        matchedPageIds.set(event.id, pageId);
+      }
     }
-    return prioritizedPages;
+    return Object.freeze({ prioritizedPageIds: prioritizedPages, matchedPageIds });
   }
 
   private async graphProjection(
@@ -514,18 +526,22 @@ export class GrandboxBridgeWorker implements BridgeWorker {
     config: Readonly<ParsedBridgeConfigV1>,
     state: Readonly<BridgeStateV1>,
     maximumCandidates: number | undefined,
+    maximumTraversalEntries: number | undefined,
   ) {
     if (config.graph === null) throw new WorkerFailure(fixedError("invalid-config"));
-    const scanned = await scanVaultNotes(
+    const scanned = await scanVaultNotesWithStatus(
       root,
       maximumCandidates === undefined
         ? undefined
-        : { maximumCandidates: maximumCandidates + 1 },
+        : {
+            maximumCandidates,
+            ...(maximumTraversalEntries === undefined ? {} : { maximumTraversalEntries }),
+          },
     );
     // A partial run never publishes a truncated graph. It defers graph work to
     // the next full reconciliation when the bounded discovery probe overflows.
-    if (maximumCandidates !== undefined && scanned.length > maximumCandidates) return null;
-    const notes: GraphSourceNote[] = scanned.flatMap((entry) => entry.note === undefined
+    if (!scanned.complete) return null;
+    const notes: GraphSourceNote[] = scanned.entries.flatMap((entry) => entry.note === undefined
       ? []
       : [{
           path: entry.note.path,
@@ -606,6 +622,7 @@ export class GrandboxBridgeWorker implements BridgeWorker {
       let relay: RelayRunContext | null = null;
       let claimedEvents: readonly RelayEvent[] = [];
       let prioritizedEventPages: ReadonlySet<string> = new Set();
+      let matchedEventPages: ReadonlyMap<string, string> = new Map();
       const fullReconciliation = fullReconciliationDue(context.state.lastFullReconciliationAt, this.dependencies.clock);
       if (input.mode === "apply" && context.relay !== null) {
         const rotationRecovery = await recoverPendingRelayTokenRotation({
@@ -627,7 +644,9 @@ export class GrandboxBridgeWorker implements BridgeWorker {
         const source = new RelayEventSource(client);
         const claim = await source.claim(context.config.installationId, 50);
         claimedEvents = claim.events;
-        prioritizedEventPages = await this.validateClaimedEvents(notion, context.state, claimedEvents);
+        const validatedEvents = await this.validateClaimedEvents(notion, context.state, claimedEvents);
+        prioritizedEventPages = validatedEvents.prioritizedPageIds;
+        matchedEventPages = validatedEvents.matchedPageIds;
         relay = Object.freeze({ client, source, graphKey: context.relay.graphKey });
       }
 
@@ -655,6 +674,7 @@ export class GrandboxBridgeWorker implements BridgeWorker {
         : {
             maximumPairs: PARTIAL_RECONCILIATION_PAIR_LIMIT,
             maximumCandidates: PARTIAL_RECONCILIATION_CANDIDATE_LIMIT,
+            maximumTraversalEntries: PARTIAL_RECONCILIATION_TRAVERSAL_LIMIT,
           };
       const reconciled = await reconcilePairs(context.state, {
         root: context.root,
@@ -663,7 +683,17 @@ export class GrandboxBridgeWorker implements BridgeWorker {
         priorityPageIds: prioritizedEventPages,
         ...reconciliationScope,
       });
-      return this.finishReconciliation(input, startedAt, context, notion, reconciled, relay, claimedEvents, fullReconciliation);
+      return this.finishReconciliation(
+        input,
+        startedAt,
+        context,
+        notion,
+        reconciled,
+        relay,
+        claimedEvents,
+        matchedEventPages,
+        fullReconciliation,
+      );
     } catch (caught) {
       const error = caught instanceof WorkerFailure ? caught.error : safeRelayError(caught) ?? safeErrorFrom(caught);
       safeLog(this.dependencies.logger, {
@@ -692,6 +722,7 @@ export class GrandboxBridgeWorker implements BridgeWorker {
     reconciled: ReconciliationResult,
     relay: RelayRunContext | null,
     claimedEvents: readonly RelayEvent[],
+    matchedEventPages: ReadonlyMap<string, string>,
     fullReconciliation: boolean,
   ): Promise<BridgeRunSummary> {
     const validation = validatePlanningBatch(reconciled.inputs);
@@ -748,6 +779,7 @@ export class GrandboxBridgeWorker implements BridgeWorker {
           context.config,
           executed.state,
           fullReconciliation ? undefined : PARTIAL_RECONCILIATION_CANDIDATE_LIMIT,
+          fullReconciliation ? undefined : PARTIAL_RECONCILIATION_TRAVERSAL_LIMIT,
         );
         if (projection !== null) {
           const sink = new RelaySnapshotSink(relay.client);
@@ -807,7 +839,16 @@ export class GrandboxBridgeWorker implements BridgeWorker {
       await this.dependencies.journal.complete(stateFence.id, stateCommitCompletion(this.dependencies.clock));
     }
     if (relay !== null && claimedEvents.length > 0 && counts.errors === 0) {
-      await relay.source.acknowledge(context.config.installationId, claimedEvents.map((event) => event.id));
+      const reconciledPages = new Set(
+        reconciled.inputs.flatMap((planningInput) => planningInput.prior === null ? [] : [planningInput.prior.notionPageId]),
+      );
+      const acknowledged = claimedEvents.filter((event) => {
+        const matchedPageId = matchedEventPages.get(event.id);
+        return matchedPageId === undefined || reconciledPages.has(matchedPageId);
+      });
+      if (acknowledged.length > 0) {
+        await relay.source.acknowledge(context.config.installationId, acknowledged.map((event) => event.id));
+      }
     }
     safeLog(this.dependencies.logger, {
       level: "info",

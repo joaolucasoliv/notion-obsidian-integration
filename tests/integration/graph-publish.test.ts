@@ -5,6 +5,7 @@ import {
   mkdtemp,
   readFile,
   realpath,
+  rename,
   unlink,
   writeFile,
 } from "node:fs/promises";
@@ -513,6 +514,44 @@ describe("encrypted graph publisher and local relay client", () => {
     expect(relay.acknowledgedEvents).toEqual([]);
   });
 
+  it("honors a server Retry-After beyond one HTTP attempt deadline", async () => {
+    vi.useFakeTimers();
+    try {
+      let calls = 0;
+      const client = new RelayClient({
+        baseUrl: "https://relay.example.test",
+        token: ACTIVE_TOKEN,
+        clock: {
+          now: () => new Date("2026-07-15T12:00:00.000Z"),
+          sleep: async (milliseconds: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, milliseconds)),
+        },
+        fetch: async () => {
+          calls += 1;
+          return calls === 1
+            ? empty(429, { "retry-after": "60" })
+            : json({ events: [], leaseSeconds: 60 });
+        },
+      });
+      let result: unknown = null;
+      let failure: unknown = null;
+      void client.claimEvents("worker-1", 1).then(
+        (claim) => { result = claim; },
+        (caught: unknown) => { failure = caught; },
+      );
+
+      await vi.advanceTimersByTimeAsync(5_001);
+      expect(failure).toBeNull();
+      expect(result).toBeNull();
+
+      await vi.advanceTimersByTimeAsync(55_000);
+      expect(failure).toBeNull();
+      expect(result).toMatchObject({ events: [], leaseSeconds: 60 });
+      expect(calls).toBe(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("uses an authorization header only and refuses insecure remote relay URLs", async () => {
     const clock = new TestClock();
     const relay = new MemoryRelay(clock);
@@ -533,10 +572,20 @@ describe("encrypted graph publisher and local relay client", () => {
     vi.useFakeTimers();
     try {
       const neverEndingBody = new ReadableStream<Uint8Array>({ pull: () => new Promise<void>(() => undefined) });
+      let calls = 0;
+      let firstSignal: AbortSignal | null = null;
       const client = new RelayClient({
         baseUrl: "https://relay.example.test",
         token: ACTIVE_TOKEN,
-        fetch: async () => new Response(neverEndingBody, { status: 200, headers: { "content-type": "application/json" } }),
+        jitter: { delayMs: () => 0 },
+        fetch: async (_input, init) => {
+          calls += 1;
+          if (calls === 1) {
+            firstSignal = init?.signal instanceof AbortSignal ? init.signal : null;
+            return new Response(neverEndingBody, { status: 200, headers: { "content-type": "application/json" } });
+          }
+          return empty(400);
+        },
       });
       let failure: unknown = null;
       void client.claimEvents("worker-1", 1).then(
@@ -546,7 +595,9 @@ describe("encrypted graph publisher and local relay client", () => {
 
       await vi.advanceTimersByTimeAsync(5_001);
 
-      expect(failure).toMatchObject({ code: "timeout", retryable: true });
+      expect(firstSignal?.aborted).toBe(true);
+      expect(calls).toBe(2);
+      expect(failure).toMatchObject({ code: "invalid-response", retryable: false });
     } finally {
       vi.useRealTimers();
     }
@@ -703,6 +754,52 @@ describe("worker graph relay orchestration", () => {
     harness.clock.advance(24 * 60 * 60 * 1_000 + 1);
     await harness.run();
     expect(retrieve).toHaveBeenCalledTimes(4);
+  });
+
+  it("leaves matching relay events leased when their pair falls outside the partial reconciliation budget", async () => {
+    const harness = await WorkerGraphHarness.create();
+    await Promise.all([
+      harness.write("A.md", optedIn("A\n")),
+      harness.write("B.md", optedIn("B\n")),
+      harness.write("C.md", optedIn("C\n")),
+      harness.write("D.md", optedIn("D\n")),
+    ]);
+    await harness.run();
+    const pairs = Object.values(harness.state.value.pairs)
+      .sort((left, right) => left.localPath.localeCompare(right.localPath));
+    const events = pairs.map((pair) => ({ id: randomUUID(), pageId: pair.notionPageId }));
+    for (const event of events) harness.enqueueEvent(event.id, event.pageId);
+
+    await harness.run();
+
+    expect(harness.relay.acknowledgedEvents).toHaveLength(3);
+    expect(harness.relay.acknowledgedEvents).not.toContain(events[3]?.id);
+  });
+
+  it("defers a prioritized moved pair when bounded discovery cannot prove its local absence", async () => {
+    const harness = await WorkerGraphHarness.create();
+    await Promise.all([
+      harness.write("A.md", optedIn("A\n")),
+      harness.write("B.md", optedIn("B\n")),
+      harness.write("C.md", optedIn("C\n")),
+      harness.write("Z.md", optedIn("Z\n")),
+    ]);
+    await harness.run();
+    const moved = Object.values(harness.state.value.pairs).find((pair) => pair.localPath === "Z.md");
+    expect(moved).toBeDefined();
+    if (moved === undefined) throw new Error("expected the initially synchronized Z.md pair");
+    const eventId = randomUUID();
+    await rename(
+      join(harness.root.canonicalRealPath, "Z.md"),
+      join(harness.root.canonicalRealPath, "ZZ moved.md"),
+    );
+    harness.enqueueEvent(eventId, moved.notionPageId);
+
+    await harness.run();
+
+    const movedState = harness.state.value.pairs[moved.bridgeId];
+    expect(movedState).toMatchObject({ status: "synced" });
+    expect(["Z.md", "ZZ moved.md"]).toContain(movedState?.localPath);
   });
 
   it("defers graph publication rather than uploading a truncated partial discovery", async () => {

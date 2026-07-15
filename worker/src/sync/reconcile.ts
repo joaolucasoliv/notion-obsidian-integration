@@ -17,9 +17,10 @@ import { parseMarkdown } from "../markdown/parse.js";
 import { renderLocalNote } from "../markdown/render.js";
 import {
   observeSafeVaultNoteBytes,
-  scanVaultNotes,
+  scanVaultNotesWithStatus,
   type ScannedVaultNote,
   type VaultScanOptions,
+  type VaultScanResult,
 } from "../vault/scanner.js";
 import type { CanonicalVaultRoot } from "../vault/safety.js";
 import { deriveAllocationId } from "./planner.js";
@@ -41,12 +42,20 @@ export interface ReconciliationDependencies {
   readonly maximumPairs?: number;
   /** Limits newly discovered vault candidates during a partial reconciliation. */
   readonly maximumCandidates?: number;
+  /** Limits directory entries visited while discovering partial-run candidates. */
+  readonly maximumTraversalEntries?: number;
   /** Claimed relay pages are selected first, without exceeding maximumPairs. */
   readonly priorityPageIds?: ReadonlySet<string>;
   readonly scan?: (
     root: CanonicalVaultRoot,
     options?: Readonly<VaultScanOptions>,
-  ) => Promise<readonly ScannedVaultNote[]>;
+  ) => Promise<Readonly<VaultScanResult> | readonly ScannedVaultNote[]>;
+}
+
+function isLegacyScan(
+  value: Readonly<VaultScanResult> | readonly ScannedVaultNote[],
+): value is readonly ScannedVaultNote[] {
+  return Array.isArray(value);
 }
 
 export class ReconciliationError extends Error {
@@ -320,13 +329,21 @@ export async function reconcilePairs(
       return byPath === 0 ? compareStrings(left.bridgeId, right.bridgeId) : byPath;
     });
     const priors = reconciliationPriors(state.pairs, dependencies.maximumPairs, dependencies.priorityPageIds);
-    const scopedScan = dependencies.maximumPairs === undefined && dependencies.maximumCandidates === undefined
+    const scopedScan = dependencies.maximumPairs === undefined && dependencies.maximumCandidates === undefined && dependencies.maximumTraversalEntries === undefined
       ? undefined
       : Object.freeze({
           ...(dependencies.maximumCandidates === undefined ? {} : { maximumCandidates: dependencies.maximumCandidates }),
+          ...(dependencies.maximumTraversalEntries === undefined ? {} : { maximumTraversalEntries: dependencies.maximumTraversalEntries }),
           includePaths: priors.map((pair) => pair.localPath),
         });
-    const scanned = await (dependencies.scan ?? scanVaultNotes)(dependencies.root, scopedScan);
+    const rawScan = await (dependencies.scan ?? scanVaultNotesWithStatus)(dependencies.root, scopedScan);
+    // Keep injected scanners written against the former array-only seam
+    // compatible: they have no way to signal truncation, so retain the old
+    // complete-scan behavior. The production scanner always reports status.
+    const scanResult: Readonly<VaultScanResult> = isLegacyScan(rawScan)
+      ? Object.freeze({ entries: rawScan, complete: true })
+      : rawScan;
+    const scanned = scanResult.entries;
     const byPath = new Map<string, ScannedVaultNote>();
     const byBridgeId = new Map<string, ScannedVaultNote>();
     for (const entry of scanned) {
@@ -348,6 +365,9 @@ export async function reconcilePairs(
     const pairedPaths = new Set<string>();
     for (const pair of priors) {
       const entry = byBridgeId.get(pair.bridgeId) ?? byPath.get(pair.localPath);
+      // A partial traversal can prove a present note but cannot prove an
+      // unseen bridge-id rename absent. Defer that pair to a complete pass.
+      if (entry === undefined && !scanResult.complete) continue;
       if (entry !== undefined) pairedPaths.add(entry.path);
       const observed = await observationForState(pair, entry, dependencies.notion);
       if (asFailure(observed)) {
