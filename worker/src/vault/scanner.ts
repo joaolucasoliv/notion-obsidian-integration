@@ -46,6 +46,23 @@ function isTechnicalSegment(segment: string): boolean {
   return segment.startsWith(".") || segment.toLowerCase() === "templates";
 }
 
+function safeRelativeSegments(relativePath: string): readonly string[] {
+  const segments = relativePath.split("/");
+  if (
+    relativePath.length === 0 ||
+    Buffer.byteLength(relativePath, "utf8") > 1_024 ||
+    relativePath.startsWith("/") ||
+    /^[A-Za-z]:/u.test(relativePath) ||
+    relativePath.includes("\\") ||
+    relativePath.includes("\0") ||
+    /[\r\n]/u.test(relativePath) ||
+    segments.some((segment) => segment.length === 0 || segment === "." || segment === "..")
+  ) {
+    throw invalidCandidate();
+  }
+  return segments;
+}
+
 function isSameIdentity(
   left: { readonly dev: number | bigint; readonly ino: number | bigint },
   right: { readonly dev: number | bigint; readonly ino: number | bigint },
@@ -180,6 +197,40 @@ async function readBoundedNote(root: CanonicalVaultRoot, relativePath: string): 
   } finally {
     await handle?.close().catch(() => undefined);
   }
+}
+
+export type SafeVaultNoteBytes =
+  | { readonly kind: "missing" }
+  | { readonly kind: "present"; readonly bytes: string };
+
+/**
+ * Classifies one journal target without collapsing an unsafe path/root into
+ * absence.  An explicit absence is retryable for a conflict create; an unsafe
+ * tree is deliberately left as an error for recovery to fail closed.
+ */
+export async function observeSafeVaultNoteBytes(
+  root: CanonicalVaultRoot,
+  relativePath: string,
+): Promise<SafeVaultNoteBytes> {
+  const segments = safeRelativeSegments(relativePath);
+  await assertCanonicalRoot(root);
+  let current = root.canonicalRealPath;
+  for (const [index, segment] of segments.entries()) {
+    current = join(current, segment);
+    let entry;
+    try {
+      entry = await lstat(current);
+    } catch (caught) {
+      if ((caught as NodeJS.ErrnoException).code === "ENOENT") {
+        return Object.freeze({ kind: "missing" as const });
+      }
+      throw invalidCandidate();
+    }
+    if (entry.isSymbolicLink() || (index < segments.length - 1 && !entry.isDirectory()) || (index === segments.length - 1 && !entry.isFile())) {
+      throw invalidCandidate();
+    }
+  }
+  return Object.freeze({ kind: "present" as const, bytes: await readBoundedNote(root, relativePath) });
 }
 
 function freezeEntry(entry: ScannedVaultNote): ScannedVaultNote {

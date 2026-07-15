@@ -6,7 +6,7 @@
   "scripts": {
     "test": "vitest run src",
     "typecheck": "tsc --noEmit",
-    "build": "tsc -b"
+    "build": "tsc -b && node esbuild.config.mjs"
   },
   "dependencies": {
     "@grandbox-bridge/shared": "0.1.0",

@@ -148,6 +148,29 @@ describe("recoverIncompleteJournal", () => {
     expect(journal.completed).toEqual([{ id: INTENT_A, evidence: evidence(HASH_A) }]);
   });
 
+  it("marks an initialize-pair crash before the frontmatter write as retryable instead of treating it as a remote operation", async () => {
+    const journal = new MemoryJournalStore([
+      intent(INTENT_A, "initialize-pair", {
+        relativePath: "Notes/Bridge.md",
+        expectedByteHash: HASH_A,
+        resultByteHash: HASH_B,
+      }),
+    ]);
+
+    const result = await recoverIncompleteJournal({
+      journal,
+      localObserver: local({ kind: "present", byteHash: HASH_A, semanticHash: HASH_C }),
+      remoteObserver: remote({ kind: "unprovable" }),
+      now: () => TIMESTAMP,
+    });
+
+    expect(result).toMatchObject({ status: "retryable", retryable: 1, reconciled: 0 });
+    expect(journal.completed).toEqual([{
+      id: INTENT_A,
+      evidence: { ...evidence(HASH_A), resultSemanticHash: HASH_C },
+    }]);
+  });
+
   it("reconciles a write crash after atomic rename but before journal completion", async () => {
     const journal = new MemoryJournalStore([intent(INTENT_A)]);
 

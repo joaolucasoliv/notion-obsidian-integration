@@ -140,7 +140,7 @@ async function classifyLocal(
   if (
     intent.relativePath === null ||
     intent.resultByteHash === null ||
-    (intent.effectKind === "write-local" && intent.expectedByteHash === null) ||
+    ((intent.effectKind === "initialize-pair" || intent.effectKind === "write-local") && intent.expectedByteHash === null) ||
     (intent.effectKind === "create-conflict" &&
       (intent.expectedByteHash !== null || intent.expectedSemanticHash !== null))
   ) {
@@ -154,7 +154,7 @@ async function classifyLocal(
     });
   }
   if (
-    (intent.effectKind === "write-local" &&
+    ((intent.effectKind === "write-local" || intent.effectKind === "initialize-pair") &&
       observation.kind === "present" &&
       observation.byteHash === intent.expectedByteHash) ||
     (intent.effectKind === "create-conflict" && observation.kind === "missing")
@@ -212,7 +212,11 @@ export async function recoverIncompleteJournal(dependencies: RecoveryDependencie
   for (const intent of intents) {
     try {
       let resolved: { readonly kind: ResolvedKind; readonly evidence: JournalCompletionV1 } | null;
-      if (intent.effectKind === "write-local" || intent.effectKind === "create-conflict") {
+      if (
+        intent.effectKind === "initialize-pair" ||
+        intent.effectKind === "write-local" ||
+        intent.effectKind === "create-conflict"
+      ) {
         resolved = await classifyLocal(intent, dependencies.localObserver, completionTime(dependencies.now));
       } else {
         const classification = parseRemoteClassification(await dependencies.remoteObserver.classify(intent));

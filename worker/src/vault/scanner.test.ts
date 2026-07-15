@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { canonicalVaultRoot } from "./safety.js";
-import { scanVaultNotes } from "./scanner.js";
+import { observeSafeVaultNoteBytes, scanVaultNotes } from "./scanner.js";
 
 const INSTALLATION_ID = "11111111-1111-4111-8111-111111111111";
 
@@ -111,6 +111,18 @@ describe("scanVaultNotes", () => {
 
     expect(scanned.map((entry) => entry.path)).toEqual(["safe.md"]);
     expect(scanned[0]?.note?.body).toBe("Safe");
+  });
+
+  it("reads a conflict artifact through the same bounded no-follow vault path checks used by scanning", async () => {
+    const vault = await temporaryVault();
+    await put(vault, "Bridge Conflicts/safe.bridge-conflict.md", "synthetic conflict artifact\n");
+    const root = await canonicalVaultRoot(vault, INSTALLATION_ID, { mode: "bootstrap" });
+
+    await expect(observeSafeVaultNoteBytes(root, "Bridge Conflicts/safe.bridge-conflict.md")).resolves.toEqual({
+      kind: "present",
+      bytes: "synthetic conflict artifact\n",
+    });
+    await expect(observeSafeVaultNoteBytes(root, "../outside.md")).rejects.toThrow();
   });
 
   it("fails closed per candidate on unsafe Windows-style names, oversized bytes, and invalid UTF-8", async () => {
