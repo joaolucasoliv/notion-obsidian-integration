@@ -256,12 +256,21 @@ class MemoryInstallations implements BridgeApiInstallations {
     readonly expectedActiveTokenHash: string;
     readonly pendingTokenHash: string;
     readonly expiresAt: string;
-  }): Promise<boolean> {
+    readonly now: Date;
+  }): Promise<"prepared" | "idempotent" | "conflict"> {
     const installation = this.installations.get(input.installationId);
-    if (installation === undefined || installation.relayTokenHash !== input.expectedActiveTokenHash) return false;
+    if (installation === undefined || installation.relayTokenHash !== input.expectedActiveTokenHash) return "conflict";
+    const hasPending = installation.pendingRelayTokenHash !== null || installation.pendingRelayTokenExpiresAt !== null;
+    if (hasPending) {
+      const expiresAt = installation.pendingRelayTokenExpiresAt === null ? Number.NaN : new Date(installation.pendingRelayTokenExpiresAt).getTime();
+      if (!Number.isFinite(expiresAt)) return "conflict";
+      if (expiresAt > input.now.getTime()) {
+        return installation.pendingRelayTokenHash === input.pendingTokenHash ? "idempotent" : "conflict";
+      }
+    }
     installation.pendingRelayTokenHash = input.pendingTokenHash;
     installation.pendingRelayTokenExpiresAt = input.expiresAt;
-    return true;
+    return "prepared";
   }
 
   async commitRelayTokenRotation(input: {
@@ -287,9 +296,19 @@ class MemoryInstallations implements BridgeApiInstallations {
   async cancelRelayTokenRotation(input: {
     readonly installationId: string;
     readonly expectedActiveTokenHash: string;
+    readonly expectedPendingTokenHash: string;
+    readonly now: Date;
   }): Promise<boolean> {
     const installation = this.installations.get(input.installationId);
-    if (installation === undefined || installation.relayTokenHash !== input.expectedActiveTokenHash) return false;
+    if (
+      installation === undefined ||
+      installation.relayTokenHash !== input.expectedActiveTokenHash ||
+      installation.pendingRelayTokenHash !== input.expectedPendingTokenHash ||
+      installation.pendingRelayTokenExpiresAt === null ||
+      new Date(installation.pendingRelayTokenExpiresAt).getTime() <= input.now.getTime()
+    ) {
+      return false;
+    }
     installation.pendingRelayTokenHash = null;
     installation.pendingRelayTokenExpiresAt = null;
     return true;
@@ -566,7 +585,10 @@ describe("handleBridgeApi", () => {
     ).toBe(204);
     expect(
       (
-        await handleBridgeApi(apiRequest("/v1/auth/rotate/cancel", NEXT_RELAY_TOKEN, {}), fixture.deps)
+        await handleBridgeApi(
+          apiRequest("/v1/auth/rotate/cancel", NEXT_RELAY_TOKEN, { pendingToken: token(4) }),
+          fixture.deps,
+        )
       ).status,
     ).toBe(204);
     expect(
@@ -574,6 +596,115 @@ describe("handleBridgeApi", () => {
         await handleBridgeApi(apiRequest("/v1/events/claim", token(4), { workerId: "worker-a", limit: 1 }), fixture.deps)
       ).status,
     ).toBe(401);
+  });
+
+  it("preserves the intended pending rotation across delayed prepare and cancel requests", async () => {
+    const fixture = await harness();
+    const firstPending = NEXT_RELAY_TOKEN;
+    const laterPending = token(4);
+
+    expect(
+      (
+        await handleBridgeApi(
+          apiRequest("/v1/auth/rotate/prepare", RELAY_TOKEN, { newToken: firstPending }),
+          fixture.deps,
+        )
+      ).status,
+    ).toBe(204);
+    expect(
+      (
+        await handleBridgeApi(
+          apiRequest("/v1/auth/rotate/prepare", RELAY_TOKEN, { newToken: firstPending }),
+          fixture.deps,
+        )
+      ).status,
+    ).toBe(204);
+    expect(
+      (
+        await handleBridgeApi(
+          apiRequest("/v1/auth/rotate/prepare", RELAY_TOKEN, { newToken: laterPending }),
+          fixture.deps,
+        )
+      ).status,
+    ).toBe(409);
+    expect(
+      (
+        await handleBridgeApi(
+          apiRequest("/v1/auth/rotate/cancel", RELAY_TOKEN, { pendingToken: laterPending }),
+          fixture.deps,
+        )
+      ).status,
+    ).toBe(409);
+    expect(
+      (
+        await handleBridgeApi(apiRequest("/v1/auth/rotate/commit", firstPending, {}), fixture.deps)
+      ).status,
+    ).toBe(204);
+    expect(
+      (
+        await handleBridgeApi(apiRequest("/v1/events/claim", laterPending, { workerId: "worker-a", limit: 1 }), fixture.deps)
+      ).status,
+    ).toBe(401);
+  });
+
+  it("cancels only the matching unexpired pending rotation and fails closed after expiry", async () => {
+    const cancelled = await harness();
+    expect(
+      (
+        await handleBridgeApi(
+          apiRequest("/v1/auth/rotate/prepare", RELAY_TOKEN, { newToken: NEXT_RELAY_TOKEN }),
+          cancelled.deps,
+        )
+      ).status,
+    ).toBe(204);
+    expect(
+      (
+        await handleBridgeApi(
+          apiRequest("/v1/auth/rotate/cancel", RELAY_TOKEN, { pendingToken: NEXT_RELAY_TOKEN }),
+          cancelled.deps,
+        )
+      ).status,
+    ).toBe(204);
+    expect(
+      (
+        await handleBridgeApi(
+          apiRequest("/v1/events/claim", NEXT_RELAY_TOKEN, { workerId: "worker-a", limit: 1 }),
+          cancelled.deps,
+        )
+      ).status,
+    ).toBe(401);
+
+    const expired = await harness();
+    expect(
+      (
+        await handleBridgeApi(
+          apiRequest("/v1/auth/rotate/prepare", RELAY_TOKEN, { newToken: NEXT_RELAY_TOKEN }),
+          expired.deps,
+        )
+      ).status,
+    ).toBe(204);
+    expired.clock.set(plusSeconds(NOW, 600));
+    expect(
+      (
+        await handleBridgeApi(apiRequest("/v1/auth/rotate/commit", NEXT_RELAY_TOKEN, {}), expired.deps)
+      ).status,
+    ).toBe(401);
+    expect(
+      (
+        await handleBridgeApi(
+          apiRequest("/v1/auth/rotate/cancel", RELAY_TOKEN, { pendingToken: NEXT_RELAY_TOKEN }),
+          expired.deps,
+        )
+      ).status,
+    ).toBe(409);
+    expect(
+      (
+        await handleBridgeApi(
+          apiRequest("/v1/auth/rotate/prepare", RELAY_TOKEN, { newToken: token(4) }),
+          expired.deps,
+        )
+      ).status,
+    ).toBe(204);
   });
 
   it("returns only encrypted bootstrap material and clears it after an installation-bound proof", async () => {
@@ -657,6 +788,59 @@ describe("handleBridgeApi", () => {
     expect(
       (
         await handleBridgeApi(apiRequest("/v1/events/claim", RELAY_TOKEN, { workerId: "worker-a", limit: 1 }), fixture.deps)
+      ).status,
+    ).toBe(200);
+  });
+
+  it("counts every recognized authenticated route before method, content-type, or schema validation", async () => {
+    const invalidContentType = await harness();
+    await invalidContentType.events.enqueue(INSTALLATION_ID, SAFE_EVENT, NOW);
+    const contentStatuses = await Promise.all(
+      Array.from({ length: 120 }, () =>
+        handleBridgeApi(
+          apiRequest("/v1/events/claim", RELAY_TOKEN, { workerId: "worker-a", limit: 1 }, { contentType: "text/plain" }),
+          invalidContentType.deps,
+        ).then((response) => response.status),
+      ),
+    );
+    expect(contentStatuses).toEqual(Array.from({ length: 120 }, () => 415));
+    const contentLimited = await handleBridgeApi(
+      apiRequest("/v1/events/claim", RELAY_TOKEN, { workerId: "worker-a", limit: 1 }),
+      invalidContentType.deps,
+    );
+    expect(contentLimited.status).toBe(429);
+    expect(Number(contentLimited.headers.get("retry-after"))).toBeGreaterThanOrEqual(1);
+    expect(Number(contentLimited.headers.get("retry-after"))).toBeLessThanOrEqual(60);
+    expect((await invalidContentType.store.listEvents(INSTALLATION_ID))[0]?.leaseOwner).toBeNull();
+
+    const wrongMethod = await harness();
+    const methodStatuses = await Promise.all(
+      Array.from({ length: 120 }, () =>
+        handleBridgeApi(apiRequest("/v1/events/claim", RELAY_TOKEN, undefined, { method: "GET" }), wrongMethod.deps).then(
+          (response) => response.status,
+        ),
+      ),
+    );
+    expect(methodStatuses).toEqual(Array.from({ length: 120 }, () => 405));
+    expect(
+      (
+        await handleBridgeApi(apiRequest("/v1/events/claim", RELAY_TOKEN, { workerId: "worker-a", limit: 1 }), wrongMethod.deps)
+      ).status,
+    ).toBe(429);
+
+    const invalidBearer = await harness();
+    const invalidStatuses = await Promise.all(
+      Array.from({ length: 120 }, () =>
+        handleBridgeApi(
+          apiRequest("/v1/events/claim", token(9), { workerId: "worker-a", limit: 1 }, { contentType: "text/plain" }),
+          invalidBearer.deps,
+        ).then((response) => response.status),
+      ),
+    );
+    expect(invalidStatuses).toEqual(Array.from({ length: 120 }, () => 401));
+    expect(
+      (
+        await handleBridgeApi(apiRequest("/v1/events/claim", RELAY_TOKEN, { workerId: "worker-a", limit: 1 }), invalidBearer.deps)
       ).status,
     ).toBe(200);
   });

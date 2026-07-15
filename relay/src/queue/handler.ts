@@ -65,13 +65,19 @@ export interface BridgeApiInstallations {
     readonly expectedActiveTokenHash: string;
     readonly pendingTokenHash: string;
     readonly expiresAt: string;
-  }): Promise<boolean>;
+    readonly now: Date;
+  }): Promise<"prepared" | "idempotent" | "conflict">;
   commitRelayTokenRotation(input: {
     readonly installationId: string;
     readonly expectedPendingTokenHash: string;
     readonly now: Date;
   }): Promise<boolean>;
-  cancelRelayTokenRotation(input: { readonly installationId: string; readonly expectedActiveTokenHash: string }): Promise<boolean>;
+  cancelRelayTokenRotation(input: {
+    readonly installationId: string;
+    readonly expectedActiveTokenHash: string;
+    readonly expectedPendingTokenHash: string;
+    readonly now: Date;
+  }): Promise<boolean>;
   clearBootstrapMaterial(input: { readonly installationId: string; readonly expectedCiphertext: string }): Promise<boolean>;
 }
 
@@ -113,6 +119,10 @@ interface PageInput {
 
 interface RotationInput {
   readonly newToken: string;
+}
+
+interface CancelRotationInput {
+  readonly pendingToken: string;
 }
 
 interface ActivationInput {
@@ -305,6 +315,12 @@ function parseRotationInput(record: Record<string, unknown>): RotationInput | nu
   return newToken === null ? null : { newToken };
 }
 
+function parseCancelRotationInput(record: Record<string, unknown>): CancelRotationInput | null {
+  if (!hasExactKeys(record, ["pendingToken"])) return null;
+  const pendingToken = relayToken(record.pendingToken);
+  return pendingToken === null ? null : { pendingToken };
+}
+
 function parseActivationInput(record: Record<string, unknown>): ActivationInput | null {
   if (!hasExactKeys(record, ["proof"])) return null;
   const proof = relayToken(record.proof);
@@ -426,22 +442,23 @@ async function handleRotation(
     const parsed = parseRotationInput(input);
     if (parsed === null) return badRequest();
     const nextHashBytes = await hmacSha256(deps.relayTokenPepper, parsed.newToken, deps.crypto);
-    if (sameDigest(nextHashBytes, authenticated.installation.relayTokenHash) || sameDigest(nextHashBytes, authenticated.installation.pendingRelayTokenHash)) {
+    if (sameDigest(nextHashBytes, authenticated.installation.relayTokenHash)) {
       return conflict();
     }
-    const committed = await deps.installations.prepareRelayTokenRotation({
+    const prepared = await deps.installations.prepareRelayTokenRotation({
       installationId: authenticated.installation.id,
       expectedActiveTokenHash: authenticated.tokenHash,
       pendingTokenHash: base64url(nextHashBytes),
       expiresAt: new Date(now.getTime() + ROTATION_SECONDS * 1_000).toISOString(),
+      now,
     });
-    if (committed) return noContent();
+    if (prepared === "prepared" || prepared === "idempotent") return noContent();
     logSafely(deps.log, "api_state_conflict");
     return conflict();
   }
 
-  if (!parseEmptyInput(input)) return badRequest();
   if (route === "auth-rotate-commit") {
+    if (!parseEmptyInput(input)) return badRequest();
     if (authenticated.kind !== "pending") return forbidden();
     const committed = await deps.installations.commitRelayTokenRotation({
       installationId: authenticated.installation.id,
@@ -453,10 +470,15 @@ async function handleRotation(
     return conflict();
   }
 
+  const parsed = parseCancelRotationInput(input);
+  if (parsed === null) return badRequest();
   if (authenticated.kind !== "active") return forbidden();
+  const pendingTokenHash = base64url(await hmacSha256(deps.relayTokenPepper, parsed.pendingToken, deps.crypto));
   const cancelled = await deps.installations.cancelRelayTokenRotation({
     installationId: authenticated.installation.id,
     expectedActiveTokenHash: authenticated.tokenHash,
+    expectedPendingTokenHash: pendingTokenHash,
+    now,
   });
   if (cancelled) return noContent();
   logSafely(deps.log, "api_state_conflict");
@@ -546,8 +568,6 @@ export async function handleBridgeApi(request: Request, deps: BridgeApiDependenc
   try {
     const definition = bridgeApiRoute(request);
     if (definition === null) return notFound();
-    if (request.method !== definition.method) return methodNotAllowed(definition.method);
-    if (definition.method === "POST" && !isJsonContentType(request.headers.get("content-type"))) return unsupportedMediaType();
 
     const now = deps.clock.now();
     if (!Number.isFinite(now.getTime())) throw new Error("Invalid injected clock");
@@ -561,6 +581,8 @@ export async function handleBridgeApi(request: Request, deps: BridgeApiDependenc
 
     const limited = await enforceApiLimit(authenticated, now, deps);
     if (limited !== null) return limited;
+    if (request.method !== definition.method) return methodNotAllowed(definition.method);
+    if (definition.method === "POST" && !isJsonContentType(request.headers.get("content-type"))) return unsupportedMediaType();
     return handleAuthenticatedRoute(definition.route, request, authenticated, now, deps);
   } catch {
     logSafely(deps.log, "api_internal_error");
