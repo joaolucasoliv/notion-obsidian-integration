@@ -16,5 +16,8 @@ export default defineConfig({
   test: {
     include: ["tests/integration/**/*.test.ts"],
     exclude: ["tests/acceptance/**", "web/playwright/**"],
+    fileParallelism: false,
+    hookTimeout: 60_000,
+    testTimeout: 60_000,
   },
 });

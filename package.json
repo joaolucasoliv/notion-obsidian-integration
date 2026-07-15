@@ -7,13 +7,13 @@
   "license": "MIT",
   "type": "module",
   "engines": { "node": ">=22.12.0" },
-  "workspaces": ["shared", "worker", "plugin"],
+  "workspaces": ["shared", "worker", "plugin", "relay"],
   "scripts": {
     "test": "vitest run",
-    "test:integration": "vitest run --config vitest.integration.config.ts",
+    "test:integration": "node scripts/run-integration-tests.mjs",
     "test:coverage": "vitest run --coverage",
-    "typecheck": "tsc -b shared worker plugin",
-    "build": "npm run build -w @grandbox-bridge/shared && npm run build -w @grandbox-bridge/worker && npm run build -w @grandbox-bridge/plugin && npm run smoke:worker-development-export",
+    "typecheck": "tsc -b shared worker plugin relay",
+    "build": "npm run build -w @grandbox-bridge/shared && npm run build -w @grandbox-bridge/worker && npm run build -w @grandbox-bridge/plugin && npm run build -w @grandbox-bridge/relay && npm run smoke:worker-development-export",
     "smoke:worker-development-export": "node --conditions=development --input-type=module --eval \"await import('@grandbox-bridge/worker/runtime/service')\"",
     "check": "npm test && npm run typecheck && npm run build"
   },
@@ -21,6 +21,7 @@
     "@types/node": "26.1.1",
     "@vitest/coverage-v8": "4.1.10",
     "esbuild": "0.28.1",
+    "supabase": "2.109.1",
     "typescript": "5.9.3",
     "vitest": "4.1.10"
   }
