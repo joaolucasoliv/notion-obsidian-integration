@@ -13,10 +13,13 @@ import {
 } from "./handler.js";
 
 const INSTALLATION_ID = "11111111-1111-4111-8111-111111111111";
+const SECOND_INSTALLATION_ID = "12121212-1212-4121-8121-121212121212";
 const PAGE_ID = "22222222-2222-4222-8222-222222222222";
 const BLOCK_ID = "33333333-3333-4333-8333-333333333333";
 const FIXTURE_BEARER = "fixture-local-bearer-value";
+const SECOND_FIXTURE_BEARER = "fixture-second-local-bearer-value";
 const FIXTURE_VERIFICATION_TOKEN = "fixture-notion-verification-value";
+const SECOND_FIXTURE_VERIFICATION_TOKEN = "fixture-second-notion-verification-value";
 const NOW = new Date("2026-07-15T12:00:00.000Z");
 
 class FixtureClock implements Clock {
@@ -33,23 +36,54 @@ class FixtureClock implements Clock {
 
 class FixtureInstallations implements InstallationRepository {
   readonly pendingCiphertexts: string[] = [];
+  private readonly id: string;
+  private bootstrapPublicJwk: JsonWebKey | null;
 
   constructor(
-    private readonly installation: WebhookInstallation = {
+    installation: WebhookInstallation = {
       id: INSTALLATION_ID,
       bootstrapPublicJwk: null,
     },
+  ) {
+    this.id = installation.id;
+    this.bootstrapPublicJwk = installation.bootstrapPublicJwk;
+  }
+
+  async authenticate(bearer: string): Promise<WebhookInstallation | null> {
+    return bearer === FIXTURE_BEARER ? { id: this.id, bootstrapPublicJwk: this.bootstrapPublicJwk } : null;
+  }
+
+  async consumeBootstrapPublicJwkAndStorePendingWebhookTokenCiphertext(
+    installationId: string,
+    ciphertext: string,
+  ): Promise<boolean> {
+    if (installationId !== this.id || this.bootstrapPublicJwk === null) {
+      return false;
+    }
+    this.pendingCiphertexts.push(ciphertext);
+    this.bootstrapPublicJwk = null;
+    return true;
+  }
+}
+
+class TwoInstallationFixture implements InstallationRepository {
+  constructor(
+    private readonly first: WebhookInstallation,
+    private readonly second: WebhookInstallation,
   ) {}
 
   async authenticate(bearer: string): Promise<WebhookInstallation | null> {
-    return bearer === FIXTURE_BEARER ? this.installation : null;
+    if (bearer === FIXTURE_BEARER) {
+      return this.first;
+    }
+    if (bearer === SECOND_FIXTURE_BEARER) {
+      return this.second;
+    }
+    return null;
   }
 
-  async storePendingWebhookTokenCiphertext(installationId: string, ciphertext: string): Promise<void> {
-    if (installationId !== INSTALLATION_ID) {
-      throw new Error("fixture installation mismatch");
-    }
-    this.pendingCiphertexts.push(ciphertext);
+  async consumeBootstrapPublicJwkAndStorePendingWebhookTokenCiphertext(): Promise<boolean> {
+    return false;
   }
 }
 
@@ -219,6 +253,44 @@ describe("handleNotionWebhook", () => {
     expect(harness.events.enqueueCalls).toHaveLength(1);
   });
 
+  it("binds HMAC verification to the authenticated installation", async () => {
+    const installationLookups: Array<string | undefined> = [];
+    const installations = new TwoInstallationFixture(
+      { id: INSTALLATION_ID, bootstrapPublicJwk: null },
+      { id: SECOND_INSTALLATION_ID, bootstrapPublicJwk: null },
+    );
+    const events = new FixtureEvents();
+    const deps: WebhookDependencies = {
+      verificationToken: async (installationId?: string) => {
+        installationLookups.push(installationId);
+        return installationId === SECOND_INSTALLATION_ID
+          ? SECOND_FIXTURE_VERIFICATION_TOKEN
+          : FIXTURE_VERIFICATION_TOKEN;
+      },
+      installation: installations,
+      pages: new FixturePages(),
+      events,
+      clock: new FixtureClock(NOW),
+      crypto: globalThis.crypto,
+      log: new FixtureLogger(),
+    };
+    const raw = utf8(JSON.stringify(eventPayload()));
+    const firstSignature = await signNotionBody(raw, FIXTURE_VERIFICATION_TOKEN, globalThis.crypto);
+
+    expect((await handleNotionWebhook(activeRequest(raw, firstSignature), deps)).status).toBe(204);
+    expect(
+      (
+        await handleNotionWebhook(
+          activeRequest(raw, firstSignature, { authorization: "Bearer " + SECOND_FIXTURE_BEARER }),
+          deps,
+        )
+      ).status,
+    ).toBe(401);
+    expect(installationLookups).toEqual([INSTALLATION_ID, SECOND_INSTALLATION_ID]);
+    expect(events.enqueueCalls).toHaveLength(1);
+    expect(events.enqueueCalls[0]?.installationId).toBe(INSTALLATION_ID);
+  });
+
   it("encrypts the one-time verification token without logging or storing plaintext", async () => {
     const keyPair = (await globalThis.crypto.subtle.generateKey(
       { name: "RSA-OAEP", modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" },
@@ -252,6 +324,34 @@ describe("handleNotionWebhook", () => {
     expect(new TextDecoder().decode(decrypted)).toBe(bootstrapValue);
   });
 
+  it("atomically consumes a bootstrap JWK so a second bootstrap cannot persist another ciphertext", async () => {
+    const keyPair = (await globalThis.crypto.subtle.generateKey(
+      { name: "RSA-OAEP", modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" },
+      true,
+      ["encrypt", "decrypt"],
+    )) as CryptoKeyPair;
+    const publicJwk = await globalThis.crypto.subtle.exportKey("jwk", keyPair.publicKey);
+    const installations = new FixtureInstallations({ id: INSTALLATION_ID, bootstrapPublicJwk: publicJwk });
+    const deps: WebhookDependencies = {
+      verificationToken: async () => null,
+      installation: installations,
+      pages: new FixturePages(),
+      events: new FixtureEvents(),
+      clock: new FixtureClock(NOW),
+      crypto: globalThis.crypto,
+      log: new FixtureLogger(),
+    };
+    const raw = utf8(JSON.stringify({ verification_token: "fixture-verification-value" }));
+
+    const statuses = await Promise.all([
+      handleNotionWebhook(activeRequest(raw, null), deps).then((response) => response.status),
+      handleNotionWebhook(activeRequest(raw, null), deps).then((response) => response.status),
+    ]);
+    expect(statuses.sort()).toEqual([204, 400]);
+    expect(installations.pendingCiphertexts).toHaveLength(1);
+    expect((await handleNotionWebhook(activeRequest(raw, null), deps)).status).toBe(400);
+  });
+
   it("accepts only strict bootstrap bodies and never consumes a bootstrap body as a webhook event", async () => {
     const keyPair = (await globalThis.crypto.subtle.generateKey(
       { name: "RSA-OAEP", modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" },
@@ -273,6 +373,12 @@ describe("handleNotionWebhook", () => {
 
     const raw = utf8(JSON.stringify({ verification_token: "fixture-verification-value", title: "fixture-sensitive-title" }));
     expect((await handleNotionWebhook(activeRequest(raw, null), deps)).status).toBe(400);
+    const duplicate = utf8(
+      '{"verification_token":"fixture-first-verification-value","verification_token":"fixture-second-verification-value"}',
+    );
+    expect((await handleNotionWebhook(activeRequest(duplicate, null), deps)).status).toBe(400);
+    const nonJsonWhitespace = utf8('{\u00a0"verification_token":"fixture-verification-value"}');
+    expect((await handleNotionWebhook(activeRequest(nonJsonWhitespace, null), deps)).status).toBe(400);
     expect(installations.pendingCiphertexts).toEqual([]);
     expect(events.enqueueCalls).toEqual([]);
   });

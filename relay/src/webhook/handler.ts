@@ -48,7 +48,14 @@ export interface WebhookInstallation {
 }
 
 export interface InstallationRepository extends BearerAuthenticator<WebhookInstallation> {
-  storePendingWebhookTokenCiphertext(installationId: string, ciphertext: string): Promise<void>;
+  /**
+   * Atomically persists ciphertext and consumes the corresponding bootstrap
+   * public JWK only while that installation is still eligible to bootstrap.
+   */
+  consumeBootstrapPublicJwkAndStorePendingWebhookTokenCiphertext(
+    installationId: string,
+    ciphertext: string,
+  ): Promise<boolean>;
 }
 
 export interface PageRegistry {
@@ -71,7 +78,7 @@ export interface SafeLogger {
 }
 
 export interface WebhookDependencies {
-  verificationToken(): Promise<string | null>;
+  verificationToken(installationId: string): Promise<string | null>;
   installation: InstallationRepository;
   pages: PageRegistry;
   events: EventRepository;
@@ -187,8 +194,11 @@ async function handleBootstrap(
   }
   try {
     const ciphertext = await encryptBootstrapVerificationToken(verificationToken, installation.bootstrapPublicJwk, deps.crypto);
-    await deps.installation.storePendingWebhookTokenCiphertext(installation.id, ciphertext);
-    return noContent();
+    if (await deps.installation.consumeBootstrapPublicJwkAndStorePendingWebhookTokenCiphertext(installation.id, ciphertext)) {
+      return noContent();
+    }
+    logSafely(deps.log, "webhook_malformed");
+    return badRequest();
   } catch {
     logSafely(deps.log, "webhook_malformed");
     return badRequest();
@@ -224,7 +234,7 @@ export async function handleNotionWebhook(request: Request, deps: WebhookDepende
     if (!Number.isFinite(now.getTime())) {
       throw new Error("Invalid injected clock");
     }
-    const verificationToken = await deps.verificationToken();
+    const verificationToken = await deps.verificationToken(installation.id);
     if (verificationToken === null) {
       return handleBootstrap(rawBody, installation, now, deps);
     }

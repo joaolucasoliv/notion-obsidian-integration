@@ -8,8 +8,43 @@ function toWebArrayBuffer(bytes: Uint8Array): ArrayBuffer {
   return copy.buffer;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
+function isJsonWhitespace(value: string | undefined): boolean {
+  return value === " " || value === "\t" || value === "\n" || value === "\r";
+}
+
+function skipWhitespace(value: string, index: number): number {
+  let next = index;
+  while (isJsonWhitespace(value[next])) {
+    next += 1;
+  }
+  return next;
+}
+
+function readJsonString(value: string, start: number): { readonly value: string; readonly next: number } | null {
+  if (value[start] !== '"') {
+    return null;
+  }
+  let index = start + 1;
+  while (index < value.length) {
+    const character = value[index];
+    if (character === '"') {
+      try {
+        const parsed = JSON.parse(value.slice(start, index + 1));
+        return typeof parsed === "string" ? { value: parsed, next: index + 1 } : null;
+      } catch {
+        return null;
+      }
+    }
+    if (character === "\\") {
+      index += value[index + 1] === "u" ? 6 : 2;
+      continue;
+    }
+    if (character === undefined || character.charCodeAt(0) <= 0x1f) {
+      return null;
+    }
+    index += 1;
+  }
+  return null;
 }
 
 function base64url(bytes: Uint8Array): string {
@@ -33,20 +68,35 @@ function isPublicRsaOaepJwk(value: JsonWebKey): boolean {
  * extras so no event data is accidentally interpreted as a verification token.
  */
 export function parseBootstrapVerificationToken(rawBody: Uint8Array): string | null {
-  let value: unknown;
+  let body: string;
   try {
-    value = JSON.parse(decoder.decode(rawBody));
+    body = decoder.decode(rawBody);
   } catch {
     return null;
   }
-  if (!isRecord(value)) {
+  let index = skipWhitespace(body, 0);
+  if (body[index] !== "{") {
     return null;
   }
-  const keys = Object.keys(value);
-  if (keys.length !== 1 || keys[0] !== "verification_token" || typeof value.verification_token !== "string") {
+  const key = readJsonString(body, skipWhitespace(body, index + 1));
+  if (key === null || key.value !== "verification_token") {
     return null;
   }
-  return value.verification_token.length > 0 ? value.verification_token : null;
+  index = skipWhitespace(body, key.next);
+  if (body[index] !== ":") {
+    return null;
+  }
+  const verificationToken = readJsonString(body, skipWhitespace(body, index + 1));
+  if (verificationToken === null) {
+    return null;
+  }
+  index = skipWhitespace(body, verificationToken.next);
+  if (body[index] !== "}") {
+    return null;
+  }
+  return skipWhitespace(body, index + 1) === body.length && verificationToken.value.length > 0
+    ? verificationToken.value
+    : null;
 }
 
 /**
