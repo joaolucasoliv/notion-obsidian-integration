@@ -649,6 +649,19 @@ async function recoverInterruptedReplacement(parentPath, targetPath) {
     return;
   }
   const currentTarget = await inspectExistingTarget(targetPath);
+  if (candidates.backups.length === 0) {
+    if (candidates.staging.length !== 1) {
+      throw unsafeVaultInstallPathError();
+    }
+    const stagingPath = candidates.staging[0];
+    if (stagingPath === undefined) {
+      throw unsafeVaultInstallPathError();
+    }
+    await verifyPrivateStagingTree(stagingPath, stagingPath, { entries: 0 }, false, unsafeVaultInstallPathError);
+    await rm(stagingPath, { recursive: true, force: false, maxRetries: 1 });
+    await syncDirectory(parentPath);
+    return;
+  }
   if (currentTarget.exists || candidates.backups.length !== 1 || candidates.staging.length > 1) {
     throw unsafeVaultInstallPathError();
   }
