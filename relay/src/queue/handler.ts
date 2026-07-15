@@ -18,6 +18,13 @@ import {
 } from "../http/response.js";
 import { bridgeApiRoute, type BridgeApiRoute } from "../http/router.js";
 import { EventRepository, type StoredWebhookEvent } from "./repository.js";
+import {
+  handleAuthenticatedSnapshotUpload,
+  handlePublicGraphRead,
+  type SafeSnapshotLogCode,
+  type SnapshotApiDependencies,
+} from "../snapshot/handler.js";
+import { SnapshotRepository } from "../snapshot/repository.js";
 
 const API_BODY_BYTES = 16 * 1024;
 const API_RATE_LIMIT = 120;
@@ -37,7 +44,8 @@ export type SafeBridgeApiLogCode =
   | "api_rate_limited"
   | "api_ack_conflict"
   | "api_state_conflict"
-  | "api_internal_error";
+  | "api_internal_error"
+  | SafeSnapshotLogCode;
 
 export interface BridgeApiClock {
   now(): Date;
@@ -50,6 +58,7 @@ export interface BridgeApiClock {
  */
 export interface BridgeApiInstallation {
   readonly id: string;
+  readonly graphId: string;
   readonly relayTokenHash: string;
   readonly pendingRelayTokenHash: string | null;
   readonly pendingRelayTokenExpiresAt: string | null;
@@ -87,6 +96,7 @@ export interface SafeBridgeApiLogger {
 
 export interface BridgeApiDependencies {
   readonly events: EventRepository;
+  readonly snapshots: SnapshotRepository;
   readonly installations: BridgeApiInstallations;
   readonly verificationToken: (installationId: string) => Promise<string | null>;
   readonly relayTokenPepper: string;
@@ -101,6 +111,8 @@ interface AuthenticatedInstallation {
   readonly tokenHash: string;
   readonly tokenHashBytes: Uint8Array;
 }
+
+type AuthenticatedBridgeApiRoute = Exclude<BridgeApiRoute, "graph-read">;
 
 interface ClaimInput {
   readonly workerId: string;
@@ -148,6 +160,10 @@ function logSafely(log: SafeBridgeApiLogger, code: SafeBridgeApiLogCode): void {
   } catch {
     // Diagnostic output is never part of the API security boundary.
   }
+}
+
+function snapshotDependencies(deps: BridgeApiDependencies): SnapshotApiDependencies {
+  return { snapshots: deps.snapshots, clock: deps.clock, log: deps.log };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -517,12 +533,19 @@ async function handleBootstrap(
 }
 
 async function handleAuthenticatedRoute(
-  route: BridgeApiRoute,
+  route: AuthenticatedBridgeApiRoute,
   request: Request,
   authenticated: AuthenticatedInstallation,
   now: Date,
   deps: BridgeApiDependencies,
 ): Promise<Response> {
+  if (route === "snapshot-upload") {
+    return handleAuthenticatedSnapshotUpload(
+      request,
+      { installationId: authenticated.installation.id, graphId: authenticated.installation.graphId },
+      snapshotDependencies(deps),
+    );
+  }
   const isGet = route === "bootstrap-webhook-token";
   const parsedBody = isGet ? null : await readPostRecord(request);
   if (parsedBody?.kind === "too-large") {
@@ -568,6 +591,10 @@ export async function handleBridgeApi(request: Request, deps: BridgeApiDependenc
   try {
     const definition = bridgeApiRoute(request);
     if (definition === null) return notFound();
+    if (definition.route === "graph-read") {
+      if (definition.graphId === undefined) return notFound();
+      return handlePublicGraphRead(request, definition.graphId, snapshotDependencies(deps));
+    }
 
     const now = deps.clock.now();
     if (!Number.isFinite(now.getTime())) throw new Error("Invalid injected clock");
@@ -582,7 +609,9 @@ export async function handleBridgeApi(request: Request, deps: BridgeApiDependenc
     const limited = await enforceApiLimit(authenticated, now, deps);
     if (limited !== null) return limited;
     if (request.method !== definition.method) return methodNotAllowed(definition.method);
-    if (definition.method === "POST" && !isJsonContentType(request.headers.get("content-type"))) return unsupportedMediaType();
+    if ((definition.method === "POST" || definition.method === "PUT") && !isJsonContentType(request.headers.get("content-type"))) {
+      return unsupportedMediaType();
+    }
     return handleAuthenticatedRoute(definition.route, request, authenticated, now, deps);
   } catch {
     logSafely(deps.log, "api_internal_error");

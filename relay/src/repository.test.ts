@@ -10,6 +10,7 @@ import {
 } from "./queue/repository.js";
 import {
   SnapshotRepository,
+  SupabaseSnapshotRepositoryStore,
   type GraphSnapshotInput,
   type GraphSnapshotRecord,
   type SnapshotRepositoryStore,
@@ -212,9 +213,27 @@ class MemoryRelayStore implements EventRepositoryStore, SnapshotRepositoryStore 
     return true;
   }
 
+  async storeSnapshotIfNewer(input: { readonly installationId: string; readonly next: GraphSnapshotRecord }): Promise<boolean> {
+    const current = this.snapshots.get(input.installationId);
+    if ((current?.sequence ?? 0) >= input.next.sequence) {
+      return false;
+    }
+    this.snapshots.set(input.installationId, { ...input.next });
+    return true;
+  }
+
   async readSnapshot(installationId: string): Promise<GraphSnapshotRecord | null> {
     const current = this.snapshots.get(installationId);
     return current ? { ...current } : null;
+  }
+}
+
+class RecordingSnapshotRpc {
+  readonly calls: Array<{ readonly functionName: string; readonly args: Record<string, unknown> }> = [];
+
+  async rpc(functionName: string, args: Record<string, unknown>): Promise<{ readonly data: unknown; readonly error: unknown }> {
+    this.calls.push({ functionName, args });
+    return { data: true, error: null };
   }
 }
 
@@ -330,6 +349,26 @@ describe("relay repository contracts", () => {
     await expect(repo.snapshots.compareAndSet(INSTALLATION_ID, 1, snapshotInput(graphEnvelope(INSTALLATION_ID, 2, NEXT_CIPHERTEXT)))).resolves.toMatchObject({ sequence: 2 });
     await expect(repo.snapshots.current(INSTALLATION_ID)).resolves.toMatchObject({ sequence: 2, envelope: { ciphertext: NEXT_CIPHERTEXT } });
     await expect(repo.snapshots.current(OTHER_INSTALLATION_ID)).resolves.toBeNull();
+  });
+
+  it("delegates first high-sequence writes to the server-side strictly-newer primitive", async () => {
+    const rpc = new RecordingSnapshotRpc();
+    const snapshots = new SnapshotRepository(new SupabaseSnapshotRepositoryStore(rpc));
+
+    await expect(snapshots.storeIfNewer(INSTALLATION_ID, snapshotInput(graphEnvelope(INSTALLATION_ID, 7)))).resolves.toMatchObject({
+      sequence: 7,
+    });
+    expect(rpc.calls).toEqual([
+      expect.objectContaining({
+        functionName: "bridge_store_graph_snapshot_if_newer",
+        args: expect.objectContaining({
+          p_installation_id: INSTALLATION_ID,
+          p_graph_id: GRAPH_ID,
+          p_sequence: 7,
+          p_expected_sequence: null,
+        }),
+      }),
+    ]);
   });
 
   it("rejects arbitrary body-like snapshot JSON before it reaches the store", async () => {

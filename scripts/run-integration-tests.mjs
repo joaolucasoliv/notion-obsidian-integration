@@ -126,6 +126,11 @@ function statusValue(values, names) {
   throw runnerError("Local Supabase status did not provide the required test environment");
 }
 
+function hasRequiredLocalEnvironment(statusOutput) {
+  const values = parseStatusEnvironment(statusOutput);
+  return Object.values(LOCAL_ENVIRONMENT_NAMES).every((names) => names.some((name) => typeof values[name] === "string" && values[name].length > 0));
+}
+
 function localVitestEnvironment(statusOutput, environment) {
   const values = parseStatusEnvironment(statusOutput);
   return {
@@ -287,7 +292,7 @@ export async function runIntegrationTests(argv = [], options = {}) {
       commandOptions,
     );
     throwIfSignalled();
-    if (status.code !== 0) {
+    if (status.code !== 0 || !hasRequiredLocalEnvironment(status.stdout)) {
       startAttemptedHere = true;
       await runChecked(adapter, localBinaries.supabase, ["--workdir", "relay", "start"], commandOptions, "Local Supabase start");
       startedHere = true;

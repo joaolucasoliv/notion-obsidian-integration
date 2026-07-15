@@ -7,14 +7,19 @@ export type BridgeApiRoute =
   | "auth-rotate-commit"
   | "auth-rotate-cancel"
   | "bootstrap-webhook-token"
-  | "bootstrap-activate";
+  | "bootstrap-activate"
+  | "snapshot-upload"
+  | "graph-read";
 
-interface RouteDefinition {
+export interface BridgeApiRouteDefinition {
   readonly route: BridgeApiRoute;
-  readonly method: "GET" | "POST";
+  readonly method: "GET" | "POST" | "PUT";
+  readonly graphId?: string;
 }
 
-const ROUTES: Readonly<Record<string, RouteDefinition>> = {
+const CANONICAL_GRAPH_PATH = /^\/v1\/graph\/([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/;
+
+const ROUTES: Readonly<Record<string, BridgeApiRouteDefinition>> = {
   "/v1/events/claim": { route: "events-claim", method: "POST" },
   "/v1/events/ack": { route: "events-ack", method: "POST" },
   "/v1/pages/register": { route: "pages-register", method: "POST" },
@@ -24,11 +29,16 @@ const ROUTES: Readonly<Record<string, RouteDefinition>> = {
   "/v1/auth/rotate/cancel": { route: "auth-rotate-cancel", method: "POST" },
   "/v1/bootstrap/webhook-token": { route: "bootstrap-webhook-token", method: "GET" },
   "/v1/bootstrap/activate": { route: "bootstrap-activate", method: "POST" },
+  "/v1/snapshot": { route: "snapshot-upload", method: "PUT" },
 };
 
-export function bridgeApiRoute(request: Request): RouteDefinition | null {
+export function bridgeApiRoute(request: Request): BridgeApiRouteDefinition | null {
   try {
-    return ROUTES[new URL(request.url).pathname] ?? null;
+    const pathname = new URL(request.url).pathname;
+    const graph = CANONICAL_GRAPH_PATH.exec(pathname);
+    const graphId = graph?.[1];
+    if (graphId !== undefined) return { route: "graph-read", method: "GET", graphId };
+    return ROUTES[pathname] ?? null;
   } catch {
     return null;
   }

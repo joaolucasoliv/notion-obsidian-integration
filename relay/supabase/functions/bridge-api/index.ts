@@ -1,11 +1,15 @@
 import { handleBridgeApi, type BridgeApiDependencies } from "../../../src/queue/handler.ts";
+import type { SnapshotRepository } from "../../../src/snapshot/repository.ts";
 
 /**
  * The Edge adapter owns no credentials or business logic. A local service-role
- * host injects scoped repositories, the relay-token pepper, and the webhook
- * verification-token accessor without exposing any of them to requests.
+ * host injects scoped repositories, including the atomic ciphertext snapshot
+ * store, the relay-token pepper, and the webhook verification-token accessor
+ * without exposing any of them to requests.
  */
-export interface BridgeApiEdgeDependencies extends BridgeApiDependencies {}
+export interface BridgeApiEdgeDependencies extends BridgeApiDependencies {
+  readonly snapshots: SnapshotRepository;
+}
 
 export function createBridgeApiEdgeHandler(
   deps: BridgeApiEdgeDependencies,

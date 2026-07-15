@@ -13,6 +13,7 @@ class RecordingProcessAdapter implements IntegrationProcessAdapter {
   readonly root = "/repo";
   readonly secrets = ["local-anon-secret", "local-service-secret", "local-jwt-secret"];
   statusCode = 1;
+  partialStatus = false;
   failStart = false;
   failReset = false;
   failVitest = false;
@@ -46,7 +47,11 @@ class RecordingProcessAdapter implements IntegrationProcessAdapter {
     if (args.includes("status")) {
       return {
         code: this.statusCode,
-        stdout: this.statusCode === 0 ? "API_URL=http://127.0.0.1:54321\nANON_KEY=local-anon-secret\nSERVICE_ROLE_KEY=local-service-secret\nJWT_SECRET=local-jwt-secret\n" : "",
+        stdout: this.statusCode === 0
+          ? this.partialStatus
+            ? "API_URL=http://127.0.0.1:54321\n"
+            : "API_URL=http://127.0.0.1:54321\nANON_KEY=local-anon-secret\nSERVICE_ROLE_KEY=local-service-secret\nJWT_SECRET=local-jwt-secret\n"
+          : "",
         stderr: this.statusCode === 0 ? "" : "not running",
       };
     }
@@ -67,6 +72,7 @@ class RecordingProcessAdapter implements IntegrationProcessAdapter {
     if (args.includes("start")) {
       if (!this.failStart) {
         this.statusCode = 0;
+        this.partialStatus = false;
       }
       return { code: this.failStart ? 1 : 0, stdout: "", stderr: this.failStart ? "start failed" : "" };
     }
@@ -132,6 +138,17 @@ describe("local relay integration runner", () => {
 
     expect(supabaseCalls(adapter).some((call) => call.args.includes("start"))).toBe(false);
     expect(supabaseCalls(adapter).some((call) => call.args.includes("stop"))).toBe(false);
+  });
+
+  it("starts and owns a stack when status exits successfully before its local test environment is ready", async () => {
+    const adapter = new RecordingProcessAdapter();
+    adapter.statusCode = 0;
+    adapter.partialStatus = true;
+
+    await runIntegrationTests([], runnerOptions(adapter));
+
+    expect(supabaseCalls(adapter).some((call) => call.args.includes("start"))).toBe(true);
+    expect(supabaseCalls(adapter).filter((call) => call.args.includes("stop"))).toHaveLength(1);
   });
 
   it.each([

@@ -15,6 +15,12 @@ import {
   type BridgeApiInstallations,
   type SafeBridgeApiLogger,
 } from "./handler.js";
+import {
+  SnapshotRepository,
+  type GraphPublicRead,
+  type GraphSnapshotRecord,
+  type SnapshotRepositoryStore,
+} from "../snapshot/repository.js";
 
 const INSTALLATION_ID = "11111111-1111-4111-8111-111111111111";
 const SECOND_INSTALLATION_ID = "22222222-2222-4222-8222-222222222222";
@@ -23,6 +29,8 @@ const BRIDGE_ID = "44444444-4444-4444-8444-444444444444";
 const SECOND_PAGE_ID = "55555555-5555-4555-8555-555555555555";
 const EVENT_ID = "66666666-6666-4666-8666-666666666666";
 const SECOND_EVENT_ID = "77777777-7777-4777-8777-777777777777";
+const GRAPH_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+const SECOND_GRAPH_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 const RELAY_TOKEN = token(1);
 const NEXT_RELAY_TOKEN = token(2);
 const SECOND_RELAY_TOKEN = token(3);
@@ -229,6 +237,58 @@ class MemoryEventStore implements EventRepositoryStore {
   }
 }
 
+class MemorySnapshotStore implements SnapshotRepositoryStore {
+  private readonly snapshotsByInstallation = new Map<string, GraphSnapshotRecord>();
+  private readonly snapshotsByGraph = new Map<string, GraphSnapshotRecord>();
+  private readonly graphRates = new Map<string, { readonly count: number; readonly windowStartedAt: string }>();
+
+  constructor(private readonly graphByInstallation: ReadonlyMap<string, string>) {}
+
+  async compareAndSetSnapshot(input: {
+    readonly installationId: string;
+    readonly expectedSequence: number;
+    readonly next: GraphSnapshotRecord;
+  }): Promise<boolean> {
+    const current = this.snapshotsByInstallation.get(input.installationId);
+    if (this.graphByInstallation.get(input.installationId) !== input.next.graphId || (current?.sequence ?? 0) !== input.expectedSequence) {
+      return false;
+    }
+    this.snapshotsByInstallation.set(input.installationId, input.next);
+    this.snapshotsByGraph.set(input.next.graphId, input.next);
+    return true;
+  }
+
+  async storeSnapshotIfNewer(input: { readonly installationId: string; readonly next: GraphSnapshotRecord }): Promise<boolean> {
+    const current = this.snapshotsByInstallation.get(input.installationId);
+    if (this.graphByInstallation.get(input.installationId) !== input.next.graphId || (current?.sequence ?? 0) >= input.next.sequence) {
+      return false;
+    }
+    this.snapshotsByInstallation.set(input.installationId, input.next);
+    this.snapshotsByGraph.set(input.next.graphId, input.next);
+    return true;
+  }
+
+  async readSnapshot(installationId: string): Promise<GraphSnapshotRecord | null> {
+    return this.snapshotsByInstallation.get(installationId) ?? null;
+  }
+
+  async readPublicSnapshot(input: {
+    readonly graphId: string;
+    readonly now: Date;
+    readonly limit: number;
+    readonly windowSeconds: number;
+  }): Promise<GraphPublicRead> {
+    const previous = this.graphRates.get(input.graphId);
+    const previousStart = previous === undefined ? Number.NaN : new Date(previous.windowStartedAt).getTime();
+    const state = !Number.isFinite(previousStart) || input.now.getTime() - previousStart >= input.windowSeconds * 1_000
+      ? { count: 0, windowStartedAt: input.now.toISOString() }
+      : previous;
+    if (state.count >= input.limit) return { allowed: false, windowStartedAt: state.windowStartedAt, snapshot: null };
+    this.graphRates.set(input.graphId, { count: state.count + 1, windowStartedAt: state.windowStartedAt });
+    return { allowed: true, windowStartedAt: state.windowStartedAt, snapshot: this.snapshotsByGraph.get(input.graphId) ?? null };
+  }
+}
+
 interface MutableInstallation extends BridgeApiInstallation {
   relayTokenHash: string;
   pendingRelayTokenHash: string | null;
@@ -341,6 +401,7 @@ interface Harness {
   readonly clock: FixtureClock;
   readonly store: MemoryEventStore;
   readonly events: EventRepository;
+  readonly snapshots: SnapshotRepository;
   readonly installations: MemoryInstallations;
   readonly logs: FixtureLogger;
   readonly deps: BridgeApiDependencies;
@@ -350,9 +411,14 @@ async function harness(): Promise<Harness> {
   const clock = new FixtureClock(NOW);
   const store = new MemoryEventStore();
   const events = new EventRepository(store);
+  const snapshots = new SnapshotRepository(new MemorySnapshotStore(new Map([
+    [INSTALLATION_ID, GRAPH_ID],
+    [SECOND_INSTALLATION_ID, SECOND_GRAPH_ID],
+  ])));
   const installations = new MemoryInstallations([
     {
       id: INSTALLATION_ID,
+      graphId: GRAPH_ID,
       relayTokenHash: await hmacBase64url(RELAY_TOKEN_PEPPER, RELAY_TOKEN),
       pendingRelayTokenHash: null,
       pendingRelayTokenExpiresAt: null,
@@ -361,6 +427,7 @@ async function harness(): Promise<Harness> {
     },
     {
       id: SECOND_INSTALLATION_ID,
+      graphId: SECOND_GRAPH_ID,
       relayTokenHash: await hmacBase64url(RELAY_TOKEN_PEPPER, SECOND_RELAY_TOKEN),
       pendingRelayTokenHash: null,
       pendingRelayTokenExpiresAt: null,
@@ -373,10 +440,12 @@ async function harness(): Promise<Harness> {
     clock,
     store,
     events,
+    snapshots,
     installations,
     logs,
     deps: {
       events,
+      snapshots,
       installations,
       verificationToken: async (installationId) => (installationId === INSTALLATION_ID ? FIXTURE_VERIFICATION_TOKEN : null),
       relayTokenPepper: RELAY_TOKEN_PEPPER,
@@ -407,6 +476,37 @@ async function activationProof(installationId = INSTALLATION_ID): Promise<string
 }
 
 describe("handleBridgeApi", () => {
+  it("authenticates snapshot uploads before exposing only the matching graph ciphertext", async () => {
+    const fixture = await harness();
+    const graphEnvelope = {
+      version: 1,
+      algorithm: "A256GCM",
+      installationId: INSTALLATION_ID,
+      keyId: "fixture-graph-key",
+      sequence: 1,
+      createdAt: NOW.toISOString(),
+      nonce: "AAAAAAAAAAAAAAAA",
+      ciphertext: "AQIDBAUGBwgJCgsMDQ4PEA",
+    };
+
+    expect(
+      (
+        await handleBridgeApi(apiRequest("/v1/snapshot", RELAY_TOKEN, graphEnvelope, { method: "PUT" }), fixture.deps)
+      ).status,
+    ).toBe(201);
+    expect(
+      (
+        await handleBridgeApi(apiRequest("/v1/snapshot", token(9), graphEnvelope, { method: "PUT" }), fixture.deps)
+      ).status,
+    ).toBe(401);
+
+    const publicGraph = await handleBridgeApi(new Request(`https://fixture.invalid/v1/graph/${GRAPH_ID}`), fixture.deps);
+    expect(publicGraph.status).toBe(200);
+    expect(publicGraph.headers.get("cache-control")).toBe("no-store");
+    expect(await publicGraph.json()).toEqual(graphEnvelope);
+    expect((await handleBridgeApi(new Request(`https://fixture.invalid/v1/graph/${GRAPH_ID.toUpperCase()}`), fixture.deps)).status).toBe(404);
+  });
+
   it("scopes claims and acknowledgements to the bearer-token installation", async () => {
     const fixture = await harness();
     await fixture.events.enqueue(INSTALLATION_ID, SAFE_EVENT, NOW);
