@@ -368,6 +368,9 @@ export class CortexNotionApi implements CortexTreeNotionApi {
     if (!validTitleInput(input)) throw failure("invalid-response");
     await this.#assertInRoot(input.pageId, input.rootPageId);
     const current = await this.#retrieveCompletePage(input.pageId, input.rootPageId);
+    if (input.pageId === input.rootPageId && current.opaqueRoot === true) {
+      throw failure("unsupported-content");
+    }
     if (!current.complete || current.editedAt !== input.observedEditedAt) throw failure("revision-race");
     parseRegularPageMetadata(await this.#request.request<unknown>({
       method: "PATCH",
@@ -384,6 +387,9 @@ export class CortexNotionApi implements CortexTreeNotionApi {
     if (!validBodyInput(input)) throw failure("invalid-response");
     await this.#assertInRoot(input.pageId, input.rootPageId);
     const current = await this.#retrieveCompletePage(input.pageId, input.rootPageId);
+    if (input.pageId === input.rootPageId && current.opaqueRoot === true) {
+      throw failure("unsupported-content");
+    }
     if (!current.complete || current.editedAt !== input.observedEditedAt) throw failure("revision-race");
     const oldMarkers = childPageMarkers(input.oldMarkdown);
     const newMarkers = childPageMarkers(input.newMarkdown);
@@ -443,17 +449,20 @@ export class CortexNotionApi implements CortexTreeNotionApi {
       method: "GET",
       path: `/v1/pages/${pageId}/markdown`,
     }), pageId);
+    const opaqueRoot = pageId === rootPageId && !markdown.complete;
+    const sourceMarkdown = opaqueRoot ? "" : markdown.sourceMarkdown;
     return Object.freeze({
       pageId,
       parentPageId,
       rootPageId,
       title: metadata.title,
-      sourceMarkdown: markdown.sourceMarkdown,
+      sourceMarkdown,
       directChildPageIds: Object.freeze([]),
-      semanticHash: await cortexSemanticHash(markdown.sourceMarkdown),
+      semanticHash: await cortexSemanticHash(sourceMarkdown),
       structureHash: await sha256Hex("[]"),
       editedAt: metadata.editedAt,
-      complete: markdown.complete,
+      complete: opaqueRoot || markdown.complete,
+      ...(opaqueRoot ? { opaqueRoot: true as const } : {}),
     });
   }
 

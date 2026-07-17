@@ -54,6 +54,8 @@ export interface CortexPageObservation {
   readonly structureHash: string;
   readonly editedAt: string;
   readonly complete: boolean;
+  /** True only for a configured root whose visual Notion body is intentionally not mirrored. */
+  readonly opaqueRoot?: true;
 }
 
 export type CortexLocalObservation =

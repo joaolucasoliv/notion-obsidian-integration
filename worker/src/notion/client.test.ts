@@ -293,6 +293,36 @@ describe("NotionClient request contract", () => {
     });
   });
 
+  it("keeps a truncated Cortex root as an opaque shell while discovering complete descendants", async () => {
+    const root = cortexRoot();
+    const child = cortexChildOne() as Record<string, any>;
+    const rootId = root.id as string;
+    const childId = child.id as string;
+    child.parent.page_id = rootId;
+    const opaqueRootMarkdown = cortexMarkdownFor(rootId, "visual-only root content") as Record<string, any>;
+    opaqueRootMarkdown.truncated = true;
+    opaqueRootMarkdown.unknown_block_ids = [BLOCK_ID];
+    const transport = new RecordingTransport([
+      response(root),
+      response(opaqueRootMarkdown),
+      response(blockChildren([childId])),
+      response(child),
+      response(cortexMarkdownFor(childId, "Child content")),
+      response(blockChildren([])),
+    ]);
+
+    const result = await client(transport).value.cortexTree.discoverCortexTree({ rootPageId: rootId, maxDepth: 32, maxPages: 5 });
+
+    expect(result).toMatchObject({
+      complete: true,
+      attention: [],
+      pages: [
+        expect.objectContaining({ pageId: rootId, sourceMarkdown: "", complete: true, opaqueRoot: true, directChildPageIds: [childId] }),
+        expect.objectContaining({ pageId: childId, sourceMarkdown: "Child content", complete: true }),
+      ],
+    });
+  });
+
   it("uses paginated block-children requests and deterministic child IDs for regular-page discovery", async () => {
     const root = cortexRoot();
     const childOne = cortexChildOne();
@@ -638,6 +668,53 @@ describe("NotionClient request contract", () => {
     }).catch((caught) => caught);
 
     expectSafeCortexError(error, "revision-race", false);
+    expect(transport.requests.some((request) => request.method === "PATCH")).toBe(false);
+  });
+
+  it("rejects a body write to an opaque Cortex root before PATCH", async () => {
+    const root = cortexRoot();
+    const rootId = root.id as string;
+    const opaqueRootMarkdown = cortexMarkdownFor(rootId, "visual-only root content") as Record<string, any>;
+    opaqueRootMarkdown.truncated = true;
+    opaqueRootMarkdown.unknown_block_ids = [BLOCK_ID];
+    const transport = new RecordingTransport([
+      response(root),
+      response(opaqueRootMarkdown),
+      response(blockChildren([])),
+    ]);
+
+    const error = await client(transport).value.cortexTree.updateCortexBodyExact({
+      rootPageId: rootId,
+      pageId: rootId,
+      oldMarkdown: "",
+      newMarkdown: "Do not overwrite the visual root",
+      observedEditedAt: root.last_edited_time as string,
+    }).catch((caught) => caught);
+
+    expectSafeCortexError(error, "unsupported-content", false);
+    expect(transport.requests.some((request) => request.method === "PATCH")).toBe(false);
+  });
+
+  it("rejects a title write to an opaque Cortex root before PATCH", async () => {
+    const root = cortexRoot();
+    const rootId = root.id as string;
+    const opaqueRootMarkdown = cortexMarkdownFor(rootId, "visual-only root content") as Record<string, any>;
+    opaqueRootMarkdown.truncated = true;
+    opaqueRootMarkdown.unknown_block_ids = [BLOCK_ID];
+    const transport = new RecordingTransport([
+      response(root),
+      response(opaqueRootMarkdown),
+      response(blockChildren([])),
+    ]);
+
+    const error = await client(transport).value.cortexTree.updateCortexTitle({
+      rootPageId: rootId,
+      pageId: rootId,
+      title: "Do not rename the visual root",
+      observedEditedAt: root.last_edited_time as string,
+    }).catch((caught) => caught);
+
+    expectSafeCortexError(error, "unsupported-content", false);
     expect(transport.requests.some((request) => request.method === "PATCH")).toBe(false);
   });
 

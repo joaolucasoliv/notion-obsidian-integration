@@ -118,7 +118,8 @@ function validObservation(value: unknown, pageId: string, rootPageId: string): v
     isHash(value.semanticHash) &&
     isHash(value.structureHash) &&
     isStrictInstant(value.editedAt) &&
-    typeof value.complete === "boolean"
+    typeof value.complete === "boolean" &&
+    (value.opaqueRoot === undefined || (value.opaqueRoot === true && pageId === rootPageId && value.sourceMarkdown === ""))
   );
 }
 

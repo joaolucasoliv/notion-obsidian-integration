@@ -38,6 +38,70 @@ function seedPairedTree(harness: CortexTreeHarness, includeArchive = false): voi
 }
 
 describe("planCortexTree", () => {
+  it("keeps an opaque root body local-only while still reconciling its child structure", async () => {
+    const harness = new CortexTreeHarness();
+    harness.putRemote({ pageId: CORTEX_ROOT_ID, parentPageId: null, title: "the cortex", sourceMarkdown: "", editedAt: "2026-07-16T12:00:00.000Z", opaqueRoot: true });
+    harness.putRemote({ pageId: RESEARCH_ID, parentPageId: CORTEX_ROOT_ID, title: "Research", sourceMarkdown: "Research\n", editedAt: "2026-07-16T12:00:00.000Z" });
+    harness.putOwnedLocal({ path: "The Cortex.md", pageId: CORTEX_ROOT_ID, parentPageId: null, parentPath: null, body: "Local dashboard body\n", childPageIds: [RESEARCH_ID] });
+    harness.putOwnedLocal({ path: "The Cortex/Research.md", pageId: RESEARCH_ID, parentPageId: CORTEX_ROOT_ID, parentPath: "The Cortex.md", body: "Research\n" });
+
+    const initial = await initialPlan(harness);
+    expect(initial.pages.find((page) => page.pageId === CORTEX_ROOT_ID)).toMatchObject({ action: "noop" });
+    expect(initial.nextCortex?.pages[CORTEX_ROOT_ID]?.title).toBe("the cortex");
+    let state = initial.nextCortex;
+
+    harness.putRemote({ pageId: CORTEX_ROOT_ID, parentPageId: null, title: "the renamed cortex", sourceMarkdown: "", editedAt: "2026-07-16T12:01:00.000Z", opaqueRoot: true });
+    const titleChangePlan = await planCortexTree({
+      config,
+      state,
+      reconciliation: await reconcileCortexTree(config, { notion: harness.notion, scan: () => harness.scan() }),
+      now: () => "2026-07-16T12:01:00.000Z",
+    });
+    expect(titleChangePlan.pages.find((page) => page.pageId === CORTEX_ROOT_ID)).toMatchObject({ action: "noop" });
+    expect(titleChangePlan.effects.some((effect) => effect.kind === "update-cortex-title" && effect.pageId === CORTEX_ROOT_ID)).toBe(false);
+    expect(titleChangePlan.nextCortex?.pages[CORTEX_ROOT_ID]?.title).toBe("the renamed cortex");
+    state = titleChangePlan.nextCortex;
+
+    harness.putOwnedLocal({ path: "The Cortex.md", pageId: CORTEX_ROOT_ID, parentPageId: null, parentPath: null, body: "Edited local dashboard body\n", childPageIds: [RESEARCH_ID] });
+    const localEditPlan = await planCortexTree({
+      config,
+      state,
+      reconciliation: await reconcileCortexTree(config, { notion: harness.notion, scan: () => harness.scan() }),
+      now: () => "2026-07-16T12:00:00.000Z",
+    });
+    expect(localEditPlan.effects.some((effect) => effect.kind === "update-cortex-body" && effect.pageId === CORTEX_ROOT_ID)).toBe(false);
+    expect(localEditPlan.effects.some((effect) => effect.kind === "update-cortex-title" && effect.pageId === CORTEX_ROOT_ID)).toBe(false);
+    expect(localEditPlan.pages.find((page) => page.pageId === CORTEX_ROOT_ID)).toMatchObject({ action: "noop" });
+
+    harness.putRemote({ pageId: PROJECT_ID, parentPageId: CORTEX_ROOT_ID, title: "Project", sourceMarkdown: "Project\n", editedAt: "2026-07-16T12:00:00.000Z" });
+    const structurePlan = await planCortexTree({
+      config,
+      state,
+      reconciliation: await reconcileCortexTree(config, { notion: harness.notion, scan: () => harness.scan() }),
+      now: () => "2026-07-16T12:00:00.000Z",
+    });
+    const rootWrite = structurePlan.operations.find((operation) => operation.effect.kind === "write-cortex-local" && operation.pageId === CORTEX_ROOT_ID);
+    expect(rootWrite?.target.localBytes).toContain("Edited local dashboard body");
+    expect(structurePlan.effects.some((effect) => effect.kind === "update-cortex-body" && effect.pageId === CORTEX_ROOT_ID)).toBe(false);
+  });
+
+  it("fails closed when an opaque root observation includes a body", async () => {
+    const harness = new CortexTreeHarness();
+    harness.putRemote({
+      pageId: CORTEX_ROOT_ID,
+      parentPageId: null,
+      title: "The Cortex",
+      sourceMarkdown: "A body cannot be safely treated as opaque.\n",
+      editedAt: "2026-07-16T12:00:00.000Z",
+      opaqueRoot: true,
+    });
+
+    const plan = await initialPlan(harness);
+
+    expect(plan.error?.code).toBe("identity-collision");
+    expect(plan.effects).toEqual([]);
+  });
+
   it("plans parent-before-child local creation deterministically for a first nested remote import", async () => {
     const harness = new CortexTreeHarness();
     harness.putRemote({ pageId: CORTEX_ROOT_ID, parentPageId: null, title: "The Cortex", sourceMarkdown: "Root\n", editedAt: "2026-07-16T12:00:00.000Z" });

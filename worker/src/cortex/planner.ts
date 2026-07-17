@@ -71,6 +71,8 @@ interface LocalRenderTarget {
   readonly path: string;
   readonly bytes: string;
   readonly byteHash: string;
+  /** The body selected for the local projection, which may be unowned on an opaque root. */
+  readonly sourceMarkdown: string;
 }
 
 interface DraftPage {
@@ -166,6 +168,11 @@ function validateRemoteTree(input: CortexPlanningInput): RemoteTree | SafeError 
       byId.has(page.pageId) ||
       !Array.isArray(page.directChildPageIds) ||
       !page.directChildPageIds.every(isCanonicalUuid) ||
+      (page.opaqueRoot !== undefined && (
+        page.opaqueRoot !== true ||
+        page.pageId !== input.config.rootPageId ||
+        page.sourceMarkdown !== ""
+      )) ||
       !page.complete
     ) {
       return safeError("identity-collision");
@@ -284,11 +291,17 @@ async function renderTarget(
   page: CortexPageObservation,
   path: string,
   paths: ReadonlyMap<string, string>,
+  local: CortexLocalPage | null,
 ): Promise<LocalRenderTarget> {
   const parentPath = page.parentPageId === null ? null : paths.get(page.parentPageId) ?? null;
   if (page.pageId !== page.rootPageId && parentPath === null) throw new Error("unknown parent path");
+  // Visual-only Notion roots must retain any local body verbatim. The bridge
+  // owns their title and hierarchy, not their opaque page body.
+  const sourceMarkdown = page.opaqueRoot === true && local !== null
+    ? local.sourceMarkdown
+    : page.sourceMarkdown;
   const markdown = renderCortexMarkdown({
-    bodyMarkdown: page.sourceMarkdown,
+    bodyMarkdown: sourceMarkdown,
     parentWikiLink: parentPath,
     directChildPageIds: page.directChildPageIds,
   });
@@ -298,10 +311,14 @@ async function renderTarget(
     parentPageId: page.parentPageId,
     rootPageId: page.rootPageId,
   });
-  return Object.freeze({ path, bytes, byteHash: await sha256Hex(bytes) });
+  return Object.freeze({ path, bytes, byteHash: await sha256Hex(bytes), sourceMarkdown });
 }
 
-function localChanged(local: CortexLocalPage, prior: CortexPageStateV1): boolean {
+function localChanged(local: CortexLocalPage, prior: CortexPageStateV1, remote: CortexPageObservation): boolean {
+  // The fixed local root filename is an implementation anchor, not a title
+  // claim over a visual-only Notion dashboard. Its local body, filename, and
+  // managed markers must never turn into a remote mutation.
+  if (remote.opaqueRoot === true) return false;
   return (
     local.semanticHash !== prior.lastCommonSemanticHash ||
     local.structureHash !== prior.lastCommonStructureHash ||
@@ -312,7 +329,7 @@ function localChanged(local: CortexLocalPage, prior: CortexPageStateV1): boolean
 
 function remoteChanged(remote: CortexPageObservation, prior: CortexPageStateV1): boolean {
   return (
-    remote.semanticHash !== prior.lastCommonSemanticHash ||
+    (remote.opaqueRoot !== true && remote.semanticHash !== prior.lastCommonSemanticHash) ||
     remote.structureHash !== prior.lastCommonStructureHash ||
     remote.title !== prior.title ||
     remote.parentPageId !== prior.parentPageId
@@ -320,6 +337,7 @@ function remoteChanged(remote: CortexPageObservation, prior: CortexPageStateV1):
 }
 
 function directRemoteMove(remote: CortexPageObservation, prior: CortexPageStateV1): boolean {
+  if (remote.opaqueRoot === true) return false;
   return remote.title !== prior.title || remote.parentPageId !== prior.parentPageId;
 }
 
@@ -371,6 +389,7 @@ function hasDirectlyMovedPriorAncestor(
 }
 
 function converged(local: CortexLocalPage, remote: CortexPageObservation): boolean {
+  if (remote.opaqueRoot === true) return local.parentPageId === remote.parentPageId;
   return (
     local.semanticHash === remote.semanticHash &&
     local.structureHash === remote.structureHash &&
@@ -680,15 +699,15 @@ export async function planCortexTree(input: CortexPlanningInput): Promise<Cortex
       return emptyPlan(input.config, safeError("identity-collision"), input.state, remote.pages.map((page) => page.pageId));
     }
 
+    const localsById = new Map(input.reconciliation.localPages.map((page) => [page.pageId, page]));
     const rendered = new Map<string, LocalRenderTarget>();
     for (const page of remote.pages) {
       const path = projected.get(page.pageId);
       if (path === undefined) throw new Error("missing projection");
-      rendered.set(page.pageId, await renderTarget(page, path, projected));
+      rendered.set(page.pageId, await renderTarget(page, path, projected, localsById.get(page.pageId) ?? null));
     }
     const at = timestamp(input.now);
     let nextCortex = desiredState(input.config, remote, rendered, input.reconciliation.discovery?.traversalId ?? "", at, input.state);
-    const localsById = new Map(input.reconciliation.localPages.map((page) => [page.pageId, page]));
     const drafts = new Map<string, DraftPage>();
 
     // A complete traversal proves only the absence itself.  Do not use a
@@ -740,7 +759,7 @@ export async function planCortexTree(input: CortexPlanningInput): Promise<Cortex
             title: page.title,
             path: target.path,
             sourcePath: null,
-            sourceMarkdown: page.sourceMarkdown,
+            sourceMarkdown: target.sourceMarkdown,
             localBytes: target.bytes,
             localByteHash: target.byteHash,
             semanticHash: page.semanticHash,
@@ -774,7 +793,7 @@ export async function planCortexTree(input: CortexPlanningInput): Promise<Cortex
         continue;
       }
 
-      const changedLocal = localChanged(local, prior);
+      const changedLocal = localChanged(local, prior, page);
       const changedRemote = remoteChanged(page, prior);
       const movedByAncestor = local.path !== target.path && !directRemoteMove(page, prior) &&
         hasDirectlyMovedRemoteAncestor(page, remote, input.state);
@@ -833,7 +852,7 @@ export async function planCortexTree(input: CortexPlanningInput): Promise<Cortex
       }
 
       if (changedLocal && !changedRemote) {
-        if (local.semanticHash !== prior.lastCommonSemanticHash) {
+        if (page.opaqueRoot !== true && local.semanticHash !== prior.lastCommonSemanticHash) {
           addEffect(draft, "update-remote-body", Object.freeze({
             kind: "update-cortex-body",
             rootPageId: input.config.rootPageId,
@@ -862,7 +881,7 @@ export async function planCortexTree(input: CortexPlanningInput): Promise<Cortex
             }),
           });
         }
-        if (local.title !== prior.title) {
+        if (page.opaqueRoot !== true && local.title !== prior.title) {
           addEffect(draft, "update-remote-title", Object.freeze({
             kind: "update-cortex-title",
             rootPageId: input.config.rootPageId,
@@ -948,7 +967,7 @@ export async function planCortexTree(input: CortexPlanningInput): Promise<Cortex
               title: page.title,
               path: target.path,
               sourcePath: local.path,
-              sourceMarkdown: page.sourceMarkdown,
+              sourceMarkdown: target.sourceMarkdown,
               localBytes: target.bytes,
               localByteHash: target.byteHash,
               semanticHash: page.semanticHash,
@@ -978,7 +997,7 @@ export async function planCortexTree(input: CortexPlanningInput): Promise<Cortex
               title: page.title,
               path: writePath,
               sourcePath: local.path,
-              sourceMarkdown: page.sourceMarkdown,
+              sourceMarkdown: target.sourceMarkdown,
               localBytes: target.bytes,
               localByteHash: target.byteHash,
               semanticHash: page.semanticHash,

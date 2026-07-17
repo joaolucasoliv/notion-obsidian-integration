@@ -38,6 +38,7 @@ export interface FakeCortexPage {
   sourceMarkdown: string;
   editedAt: string;
   complete?: boolean;
+  opaqueRoot?: boolean;
 }
 
 function nextEditedAt(sequence: number): string {
@@ -243,6 +244,7 @@ export class FakeCortexTreeApi implements CortexTreeNotionApi {
       structureHash: await sha256Hex(JSON.stringify(directChildPageIds)),
       editedAt: page.editedAt,
       complete: page.complete !== false,
+      ...(page.opaqueRoot === true ? { opaqueRoot: true } : {}),
     });
   }
 

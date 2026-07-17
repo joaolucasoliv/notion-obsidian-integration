@@ -174,6 +174,7 @@ function sameRemote(
     actual.structureHash === expected.structureHash &&
     actual.editedAt === expected.editedAt &&
     actual.complete &&
+    actual.opaqueRoot === expected.opaqueRoot &&
     actual.directChildPageIds.length === expected.directChildPageIds.length &&
     actual.directChildPageIds.every((child, index) => child === expected.directChildPageIds[index])
   );
