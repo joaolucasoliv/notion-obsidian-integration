@@ -111,6 +111,37 @@ describe("worker CLI", () => {
     });
   });
 
+  it("accepts a Cortex apply invocation without a credential or config path", () => {
+    expect(parseCliArguments([
+      "setup",
+      "cortex",
+      "apply",
+      "--vault",
+      "/private/tmp/grandbox-vault",
+      "--root-page-id",
+      PARENT_PAGE_ID,
+      "--json",
+    ])).toEqual({
+      kind: "setup-cortex",
+      mode: "apply",
+      vaultRoot: "/private/tmp/grandbox-vault",
+      rootPageId: PARENT_PAGE_ID,
+    });
+    expect(parseCliArguments([
+      "setup",
+      "cortex",
+      "status",
+      "--vault",
+      "/private/tmp/grandbox-vault",
+      "--json",
+    ])).toEqual({
+      kind: "setup-cortex",
+      mode: "status",
+      vaultRoot: "/private/tmp/grandbox-vault",
+      rootPageId: null,
+    });
+  });
+
   it("prints help without composing a worker", async () => {
     const stdout: string[] = [];
     const exit = await runCli(["--help"], {
@@ -224,6 +255,84 @@ describe("worker CLI", () => {
 
     expect(exit).toBe(0);
     expect(received).toEqual([`${INSTALLATION_ID}:/private/tmp/grandbox-vault`]);
+    expect(stdout).toEqual(["{\"configuration\":\"ready\",\"created\":false}\n"]);
+    expect(stderr).toEqual([]);
+  });
+
+  it("routes Cortex apply through the stored-credential setup boundary only", async () => {
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const received: unknown[] = [];
+    const exit = await runCli([
+      "setup",
+      "cortex",
+      "apply",
+      "--vault",
+      "/private/tmp/grandbox-vault",
+      "--root-page-id",
+      PARENT_PAGE_ID,
+      "--json",
+    ], {
+      stdout: { write: (value: string) => { stdout.push(value); return true; } },
+      stderr: { write: (value: string) => { stderr.push(value); return true; } },
+      createWorker: async () => { throw new Error("must not compose a sync worker"); },
+      readSetupInstallationId: async () => INSTALLATION_ID,
+      readSetupToken: async () => { throw new Error("must not read a Cortex token from stdin"); },
+      createInstallationInitializer: async () => { throw new Error("must not use legacy setup initializer"); },
+      createCortexInstallationInitializer: async (installationId) => {
+        expect(installationId).toBe(INSTALLATION_ID);
+        return {
+          cortexStatus: async () => { throw new Error("must not read status during apply"); },
+          configureCortex: async (input) => {
+            received.push(input);
+            return { configuration: "ready" as const, created: true };
+          },
+        };
+      },
+    });
+
+    expect(exit).toBe(0);
+    expect(received).toEqual([{
+      installationId: INSTALLATION_ID,
+      vaultRoot: "/private/tmp/grandbox-vault",
+      rootPageId: PARENT_PAGE_ID,
+    }]);
+    expect(stdout).toEqual(["{\"configuration\":\"ready\",\"created\":true}\n"]);
+    expect(stderr).toEqual([]);
+  });
+
+  it("routes Cortex status without a root ID, credential, or remote output", async () => {
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const received: unknown[] = [];
+    const exit = await runCli([
+      "setup",
+      "cortex",
+      "status",
+      "--vault",
+      "/private/tmp/grandbox-vault",
+      "--json",
+    ], {
+      stdout: { write: (value: string) => { stdout.push(value); return true; } },
+      stderr: { write: (value: string) => { stderr.push(value); return true; } },
+      createWorker: async () => { throw new Error("must not compose a sync worker"); },
+      readSetupInstallationId: async () => INSTALLATION_ID,
+      readSetupToken: async () => { throw new Error("must not read a Cortex token from stdin"); },
+      createInstallationInitializer: async () => { throw new Error("must not use legacy setup initializer"); },
+      createCortexInstallationInitializer: async () => ({
+        cortexStatus: async (input) => {
+          received.push(input);
+          return { configuration: "ready" as const, created: false };
+        },
+        configureCortex: async () => { throw new Error("must not configure during status"); },
+      }),
+    });
+
+    expect(exit).toBe(0);
+    expect(received).toEqual([{
+      installationId: INSTALLATION_ID,
+      vaultRoot: "/private/tmp/grandbox-vault",
+    }]);
     expect(stdout).toEqual(["{\"configuration\":\"ready\",\"created\":false}\n"]);
     expect(stderr).toEqual([]);
   });

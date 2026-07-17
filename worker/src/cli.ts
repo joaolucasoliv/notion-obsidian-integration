@@ -22,7 +22,11 @@ import { semanticHash } from "./markdown/normalize.js";
 import { FetchNotionTransport } from "./notion/transport.js";
 import { NotionClient, type NotionObservationDecoder, type RawNotionPageRecord } from "./notion/client.js";
 import { createNotionWorkspaceProvisioner, NotionSetupError } from "./setup/notion-provision.js";
-import { InstallationInitializer, type NotionWorkspaceProvisioner } from "./setup/installation.js";
+import {
+  InstallationInitializer,
+  type CortexRootValidator,
+  type NotionWorkspaceProvisioner,
+} from "./setup/installation.js";
 import { readInstallationIdFromVault } from "./setup/vault-locator.js";
 import { persistedLinkMapping } from "./sync/reconcile.js";
 import { canonicalVaultRoot } from "./vault/safety.js";
@@ -39,6 +43,12 @@ export type ParsedCliArguments =
       readonly mode: "preview" | "apply" | "status";
       readonly vaultRoot: string;
       readonly parentPageId: string | null;
+    }
+  | {
+      readonly kind: "setup-cortex";
+      readonly mode: "apply" | "status";
+      readonly vaultRoot: string;
+      readonly rootPageId: string | null;
     }
   | {
       readonly kind: "run";
@@ -58,6 +68,7 @@ export interface CliDependencies {
   readonly readSetupInstallationId?: (vaultRoot: string) => Promise<string>;
   readonly readSetupToken?: () => Promise<string | null>;
   readonly createInstallationInitializer?: (installationId: string) => Promise<Pick<InstallationInitializer, "initialize" | "status">>;
+  readonly createCortexInstallationInitializer?: (installationId: string) => Promise<Pick<InstallationInitializer, "configureCortex" | "cortexStatus">>;
 }
 
 function cliError(): Error {
@@ -119,8 +130,42 @@ function parseSetupArguments(argv: readonly string[]): Extract<ParsedCliArgument
   return Object.freeze({ kind: "setup" as const, mode, vaultRoot, parentPageId });
 }
 
+function parseCortexSetupArguments(argv: readonly string[]): Extract<ParsedCliArguments, { readonly kind: "setup-cortex" }> {
+  const mode = argv[2];
+  if (mode !== "apply" && mode !== "status") throw cliError();
+  let vaultRoot: string | null = null;
+  let rootPageId: string | null = null;
+  let json = false;
+  for (let index = 3; index < argv.length; index += 1) {
+    const current = argv[index];
+    if (current === "--vault" || current === "--root-page-id") {
+      const value = argv[index + 1];
+      if (value === undefined || value.startsWith("--")) throw cliError();
+      index += 1;
+      if (current === "--vault") {
+        if (vaultRoot !== null || !validConfigPath(value)) throw cliError();
+        vaultRoot = value;
+      } else {
+        if (rootPageId !== null || !validPageId(value)) throw cliError();
+        rootPageId = value;
+      }
+      continue;
+    }
+    if (current === "--json") {
+      if (json) throw cliError();
+      json = true;
+      continue;
+    }
+    throw cliError();
+  }
+  if (vaultRoot === null || !json || (mode === "apply" && rootPageId === null)) throw cliError();
+  if (mode === "status" && rootPageId !== null) throw cliError();
+  return Object.freeze({ kind: "setup-cortex" as const, mode, vaultRoot, rootPageId });
+}
+
 export function parseCliArguments(argv: readonly string[]): ParsedCliArguments {
   if (argv.length === 1 && argv[0] === "--help") return Object.freeze({ kind: "help" as const });
+  if (argv[0] === "setup" && argv[1] === "cortex") return parseCortexSetupArguments(argv);
   if (argv[0] === "setup") return parseSetupArguments(argv);
   let configPath: string | null = null;
   let reason: Extract<ParsedCliArguments, { readonly kind: "run" }> ["reason"] | null = null;
@@ -161,6 +206,7 @@ function helpText(): string {
   return [
     "Usage: bridge-worker.cjs --config <absolute-path> [--dry-run] --reason <manual|obsidian-event|schedule|reconciliation> --json",
     "       bridge-worker.cjs setup <preview|apply|status> --vault <absolute-path> [--parent-page-id <uuid>] --json",
+    "       bridge-worker.cjs setup cortex <apply|status> --vault <absolute-path> [--root-page-id <uuid>] --json",
     "",
     "--config   Absolute normalized bridge configuration path.",
     "--dry-run  Plan safely without applying local, Notion, journal, state, or UUID mutations.",
@@ -276,6 +322,35 @@ export async function runCli(argv: readonly string[], dependencies: CliDependenc
   if (parsed.kind === "help") {
     dependencies.stdout.write(helpText());
     return 0;
+  }
+  if (parsed.kind === "setup-cortex") {
+    try {
+      if (
+        dependencies.readSetupInstallationId === undefined ||
+        dependencies.createCortexInstallationInitializer === undefined
+      ) {
+        throw new Error("setup unavailable");
+      }
+      const installationId = await dependencies.readSetupInstallationId(parsed.vaultRoot);
+      const initializer = await dependencies.createCortexInstallationInitializer(installationId);
+      const result = parsed.mode === "status"
+        ? await initializer.cortexStatus({ installationId, vaultRoot: parsed.vaultRoot })
+        : await initializer.configureCortex({
+          installationId,
+          vaultRoot: parsed.vaultRoot,
+          rootPageId: parsed.rootPageId as string,
+        });
+      writeSetupSummary(dependencies.stdout, result);
+      return 0;
+    } catch (caught) {
+      try {
+        writeSetupFailure(dependencies.stdout, setupFailureCode(caught));
+      } catch {
+        // A failed stdout must not leak provider details through stderr.
+      }
+      safeDiagnostic(dependencies.stderr, "bridge-worker: Cortex setup failed");
+      return 1;
+    }
   }
   if (parsed.kind === "setup") {
     try {
@@ -409,9 +484,27 @@ function initialInstallationState(installationId: string) {
   };
 }
 
+function productionCortexRootValidator(state: FileStateStore): CortexRootValidator {
+  return async ({ token, rootPageId }) => {
+    const notion = new NotionClient(
+      token,
+      new FetchNotionTransport(),
+      createProductionNotionObservationDecoder(await state.load()),
+      { clock: { now: () => new Date(), sleep: async (milliseconds) => new Promise((resolveSleep) => setTimeout(resolveSleep, milliseconds)) } },
+    );
+    const discovery = await notion.cortexTree.discoverCortexTree({ rootPageId, maxDepth: 32, maxPages: 5_000 });
+    const root = discovery.pages.find((page) => page.pageId === rootPageId) ?? null;
+    if (!discovery.complete || root === null || root.parentPageId !== null || !root.complete) {
+      throw new Error("Cortex root validation failed");
+    }
+    return Object.freeze(discovery.pages.map((page) => page.pageId));
+  };
+}
+
 export interface ProductionInstallationInitializerOptions {
   readonly processRunner?: ProcessRunner;
   readonly provisionNotion?: NotionWorkspaceProvisioner;
+  readonly validateCortexRoot?: CortexRootValidator;
 }
 
 export interface ProductionCliDependenciesInput {
@@ -432,6 +525,7 @@ export function createProductionInstallationInitializer(
   const runtimePaths = deriveProductionRuntimePaths(configPath, installationId);
   const config = new FileConfigStore(configPath, installationId);
   const state = new FileStateStore(runtimePaths.statePath, installationId);
+  const credentials = new MacOSKeychainCredentialStore(installationId, options.processRunner ?? processRunner());
   return new InstallationInitializer({
     canonicalizeVault: async (vaultRoot, requestedInstallationId) => canonicalVaultRoot(vaultRoot, requestedInstallationId, {
       mode: "bootstrap",
@@ -449,9 +543,11 @@ export function createProductionInstallationInitializer(
         }
         await state.load();
       },
+      load: async () => await state.load(),
     },
-    credentials: new MacOSKeychainCredentialStore(installationId, options.processRunner ?? processRunner()),
+    credentials,
     provisionNotion: options.provisionNotion ?? createNotionWorkspaceProvisioner(),
+    validateCortexRoot: options.validateCortexRoot ?? productionCortexRootValidator(state),
   });
 }
 
@@ -464,6 +560,13 @@ export function createProductionCliDependencies(input: ProductionCliDependencies
     readSetupInstallationId: readInstallationIdFromVault,
     readSetupToken: async () => readSetupToken(input.setupTokenSource),
     createInstallationInitializer: async (installationId: string) => {
+      const runtimePaths = deriveRuntimePaths(input.homeDirectory, installationId);
+      return createProductionInstallationInitializer(runtimePaths.configPath, installationId, {
+        ...(input.processRunner === undefined ? {} : { processRunner: input.processRunner }),
+        ...(input.provisionNotion === undefined ? {} : { provisionNotion: input.provisionNotion }),
+      });
+    },
+    createCortexInstallationInitializer: async (installationId: string) => {
       const runtimePaths = deriveRuntimePaths(input.homeDirectory, installationId);
       return createProductionInstallationInitializer(runtimePaths.configPath, installationId, {
         ...(input.processRunner === undefined ? {} : { processRunner: input.processRunner }),
