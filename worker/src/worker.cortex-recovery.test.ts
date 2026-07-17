@@ -1,4 +1,5 @@
-import { describe, expect, it } from "vitest";
+import { parseJournalIntent, sha256Hex } from "@grandbox-bridge/shared";
+import { describe, expect, it, vi } from "vitest";
 import { CortexTreeHarness, CORTEX_ROOT_ID, INSTALLATION_ID, RESEARCH_ID } from "../../tests/fakes/cortex-tree-harness.js";
 import { executeCortexTreePlan } from "./cortex/executor.js";
 import { planCortexTree } from "./cortex/planner.js";
@@ -31,6 +32,81 @@ function dependencies(harness: CortexTreeHarness) {
 }
 
 describe("worker Cortex recovery observer", () => {
+  it("proves a legacy raw body journal after Notion only normalizes plain-block spacing", async () => {
+    const harness = new CortexTreeHarness();
+    harness.putRemote({ pageId: CORTEX_ROOT_ID, parentPageId: null, title: "The Cortex", sourceMarkdown: "Root\n", editedAt: "2026-07-16T12:00:00.000Z" });
+    harness.putRemote({ pageId: RESEARCH_ID, parentPageId: CORTEX_ROOT_ID, title: "Research", sourceMarkdown: "Research\n", editedAt: "2026-07-16T12:00:00.000Z" });
+    const imported = await executeCortexTreePlan({ state: harness.initialState(), plan: await plan(harness, null) }, dependencies(harness));
+    const before = imported.state;
+    harness.putOwnedLocal({
+      path: "The Cortex/Research.md",
+      pageId: RESEARCH_ID,
+      parentPageId: CORTEX_ROOT_ID,
+      parentPath: "The Cortex.md",
+      body: "First paragraph.\n\nSecond paragraph.\n",
+    });
+
+    const rawLegacyHash = await sha256Hex("First paragraph.\n\nSecond paragraph.\n");
+    const begin = harness.journal.begin.bind(harness.journal);
+    vi.spyOn(harness.journal, "begin").mockImplementation(async (intent) => {
+      if (intent.effectKind !== "update-cortex-body" || intent.cortex === undefined || intent.cortex === null) return begin(intent);
+      return begin(parseJournalIntent({
+        ...intent,
+        resultSemanticHash: rawLegacyHash,
+        cortex: {
+          ...intent.cortex,
+          expectedPostcondition: {
+            ...intent.cortex.expectedPostcondition,
+            semanticHash: rawLegacyHash,
+          },
+        },
+      }));
+    });
+    const update = harness.notion.updateCortexBodyExact.bind(harness.notion);
+    vi.spyOn(harness.notion, "updateCortexBodyExact").mockImplementation(async (input) => {
+      await update(input);
+      harness.notion.changeBody(RESEARCH_ID, "First paragraph.\nSecond paragraph.");
+      const normalized = await harness.notion.retrieveCortexPage({ rootPageId: CORTEX_ROOT_ID, pageId: RESEARCH_ID });
+      if (normalized === null) throw new Error("missing normalized Cortex page");
+      return normalized;
+    });
+    const complete = harness.journal.complete.bind(harness.journal);
+    let completionInterrupted = false;
+    vi.spyOn(harness.journal, "complete").mockImplementation(async (id, evidence) => {
+      const intent = harness.journal.begun.find((candidate) => candidate.id === id);
+      if (!completionInterrupted && intent?.effectKind === "update-cortex-body") {
+        completionInterrupted = true;
+        throw Object.assign(new Error("synthetic journal completion interruption"), { code: "internal-error" });
+      }
+      return complete(id, evidence);
+    });
+
+    const interrupted = await executeCortexTreePlan(
+      { state: before, plan: await plan(harness, before.cortex ?? null) },
+      dependencies(harness),
+    );
+    const pending = (await harness.journal.incomplete()).find((intent) => intent.effectKind === "update-cortex-body");
+    if (pending === undefined) throw new Error("missing legacy Cortex body journal");
+    const observer = createCortexRecoveryObserver({
+      notion: harness.notion,
+      clock: harness.clock,
+      readLocalBytes: (path: string) => harness.readLocalBytes(path),
+      markAttention: async () => {},
+    });
+
+    const recovery = await recoverIncompleteJournal({
+      journal: harness.journal,
+      localObserver: { observe: async () => ({ kind: "missing" as const }) },
+      remoteObserver: { classify: async () => ({ kind: "unprovable" as const }) },
+      cortexObserver: observer,
+      now: () => "2026-07-16T12:00:00.000Z",
+    });
+
+    expect(interrupted).toMatchObject({ outcome: "attention" });
+    expect(recovery).toMatchObject({ status: "reconciled", reconciled: 1 });
+    expect(await harness.journal.incomplete()).toEqual([]);
+  });
+
   it("proves an interrupted ID-bound local rebind after remote page creation", async () => {
     const harness = new CortexTreeHarness();
     harness.putRemote({ pageId: CORTEX_ROOT_ID, parentPageId: null, title: "The Cortex", sourceMarkdown: "Root\n", editedAt: "2026-07-16T12:00:00.000Z" });

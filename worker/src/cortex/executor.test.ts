@@ -57,6 +57,39 @@ describe("executeCortexTreePlan", () => {
     expect(repeat.effects).toEqual([]);
   });
 
+  it("keeps an exact remote body fence when a title update receives a normalized body", async () => {
+    const harness = new CortexTreeHarness();
+    harness.putRemote({ pageId: CORTEX_ROOT_ID, parentPageId: null, title: "The Cortex", sourceMarkdown: "Root\n", editedAt: "2026-07-16T12:00:00.000Z" });
+    harness.putRemote({
+      pageId: RESEARCH_ID,
+      parentPageId: CORTEX_ROOT_ID,
+      title: "Research",
+      sourceMarkdown: "First paragraph.\nSecond paragraph.\n",
+      editedAt: "2026-07-16T12:00:00.000Z",
+    });
+    const imported = await executeCortexTreePlan({ state: harness.initialState(), plan: await plan(harness, null) }, dependencies(harness));
+    const titleBytes = harness.localFiles.get("The Cortex/Research.md");
+    if (titleBytes === undefined) throw new Error("missing imported title fixture");
+    harness.localFiles.delete("The Cortex/Research.md");
+    harness.localFiles.set("The Cortex/Renamed.md", titleBytes);
+
+    const updateTitle = harness.notion.updateCortexTitle.bind(harness.notion);
+    harness.notion.updateCortexTitle = async (input) => {
+      await updateTitle(input);
+      harness.notion.changeBody(RESEARCH_ID, "First paragraph.\n\nSecond paragraph.\n");
+      const observed = await harness.notion.retrieveCortexPage({ rootPageId: input.rootPageId, pageId: input.pageId });
+      if (observed === null) throw new Error("missing normalized title response");
+      return observed;
+    };
+
+    const result = await executeCortexTreePlan(
+      { state: imported.state, plan: await plan(harness, imported.state.cortex ?? null) },
+      dependencies(harness),
+    );
+
+    expect(result).toMatchObject({ outcome: "attention", error: { code: "revision-race" } });
+  });
+
   it("uses the mandatory subtree move writer and records attention without clearing a held lock", async () => {
     const harness = new CortexTreeHarness();
     harness.putRemote({ pageId: CORTEX_ROOT_ID, parentPageId: null, title: "The Cortex", sourceMarkdown: "Root\n", editedAt: "2026-07-16T12:00:00.000Z" });

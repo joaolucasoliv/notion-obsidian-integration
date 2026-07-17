@@ -64,6 +64,59 @@ describe("LocalWorkerController", () => {
     }]);
   });
 
+  it("delegates Cortex sync through the isolated worker command", async () => {
+    const commands: WorkerCommand[] = [];
+    const runner: WorkerProcessRunner = {
+      run: async (command) => {
+        commands.push(command);
+        return { code: 0, stdout: JSON.stringify(summary({ mode: "apply", outcome: "noop" })) };
+      },
+    };
+    const controller = new LocalWorkerController(locator(), runner, {
+      install: async () => ({ enabled: true }),
+      disable: async () => ({ enabled: false }),
+      status: async () => ({ configuration: "ready", service: "disabled" }),
+    });
+    const syncCortex = Reflect.get(controller, "syncCortex");
+    if (typeof syncCortex !== "function") throw new Error("missing isolated Cortex controller action");
+
+    await expect(syncCortex.call(controller)).resolves.toMatchObject({ mode: "apply", outcome: "noop" });
+
+    expect(commands).toEqual([{
+      executable: "/usr/local/bin/node",
+      args: [
+        "/synthetic/vault/.obsidian/plugins/grandbox-bridge/bridge-worker.cjs",
+        "cortex",
+        "--config",
+        "/Users/synthetic/Library/Application Support/Grandbox Bridge/11111111-1111-4111-8111-111111111111/config.json",
+        "--reason",
+        "manual",
+        "--json",
+      ],
+      shell: false,
+    }]);
+  });
+
+  it("returns a bounded Cortex recovery result instead of masking it as an unavailable action", async () => {
+    const runner: WorkerProcessRunner = {
+      run: async () => ({
+        code: 1,
+        stdout: JSON.stringify(summary({ mode: "apply", outcome: "recovery-required", errors: 0 })),
+      }),
+    };
+    const controller = new LocalWorkerController(locator(), runner, {
+      install: async () => ({ enabled: true }),
+      disable: async () => ({ enabled: false }),
+      status: async () => ({ configuration: "ready", service: "disabled" }),
+    });
+
+    await expect(controller.syncCortex()).resolves.toMatchObject({
+      mode: "apply",
+      outcome: "recovery-required",
+      errors: 0,
+    });
+  });
+
   it("sends a Notion connection token through stdin only to the installed setup worker", async () => {
     const commands: WorkerCommand[] = [];
     const runner: WorkerProcessRunner = {

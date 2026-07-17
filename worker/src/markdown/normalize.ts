@@ -14,7 +14,7 @@ import {
 
 const MAX_TAG_COUNT = 128;
 const MAX_TAG_BYTES = 256;
-const NOTION_AMBIGUOUS_SOFT_WRAP_SPECIALS = /[\\*~`$\[\]<>{}|^]/u;
+export const NOTION_AMBIGUOUS_SOFT_WRAP_SPECIALS = /[\\*~`$\[\]<>{}|^]/u;
 
 export const REMARK_STRINGIFY_OPTIONS = Object.freeze({
   bullet: "-" as const,

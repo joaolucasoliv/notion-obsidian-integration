@@ -190,7 +190,7 @@ function parseCortexClassification(
   throw new Error("Invalid Cortex recovery observation");
 }
 
-function isCortexIntent(intent: JournalIntentV1): boolean {
+export function isCortexJournalIntent(intent: JournalIntentV1): boolean {
   return CORTEX_EFFECT_KINDS.has(intent.effectKind) && intent.cortex !== undefined && intent.cortex !== null;
 }
 
@@ -289,7 +289,7 @@ export async function recoverIncompleteJournal(dependencies: RecoveryDependencie
         return safeResult("recovery-required", processed, reconciled, retryable, intent);
       }
       let resolved: { readonly kind: ResolvedKind; readonly evidence: JournalCompletionV1 } | null;
-      if (isCortexIntent(intent)) {
+      if (isCortexJournalIntent(intent)) {
         if (dependencies.cortexObserver === undefined) {
           return safeResult("recovery-required", processed, reconciled, retryable, intent);
         }

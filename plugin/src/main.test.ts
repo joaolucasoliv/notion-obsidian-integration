@@ -280,6 +280,7 @@ describe("GrandboxBridgePlugin", () => {
     const app = new App();
     class CortexRecordingController extends RecordingController {
       public readonly cortexRoots: string[] = [];
+      public cortexSyncCalls = 0;
 
       public async configureCortex(input: { readonly rootPageId: string }): Promise<{
         readonly configuration: "ready";
@@ -294,6 +295,11 @@ describe("GrandboxBridgePlugin", () => {
         readonly created: boolean;
       }> {
         return { configuration: "ready", created: false };
+      }
+
+      public async syncCortex(): Promise<BridgeRunSummary> {
+        this.cortexSyncCalls += 1;
+        return summary("apply");
       }
     }
     const controller = new CortexRecordingController();
@@ -315,7 +321,8 @@ describe("GrandboxBridgePlugin", () => {
     await tab.actions.cortexStatus();
 
     expect(controller.cortexRoots).toEqual(["22222222-2222-4222-8222-222222222222"]);
-    expect(controller.calls).toEqual([{ mode: "apply", reason: "manual" }]);
+    expect(controller.calls).toEqual([]);
+    expect(controller.cortexSyncCalls).toBe(1);
     expect(Notice.messages).toEqual([
       "Grandbox Bridge: The Cortex connected.",
       "Grandbox Bridge: The Cortex synced: 0 writes, 0 conflicts, 0 errors.",
@@ -354,6 +361,81 @@ describe("GrandboxBridgePlugin", () => {
 
     expect(controller.calls).toEqual([]);
     expect(Notice.messages).toEqual(["Grandbox Bridge: The Cortex is not configured."]);
+  });
+
+  it("reports a completed Cortex sync even when the auxiliary status note is malformed", async () => {
+    const { GrandboxBridgePlugin } = await import("./main.js");
+    const app = new App();
+    app.vault.addFile("Grandbox Bridge.md", "# Existing private note without bridge markers\n");
+    class CortexStatusFailureController extends RecordingController {
+      public async configureCortex(_input: { readonly rootPageId: string }): Promise<{
+        readonly configuration: "ready";
+        readonly created: boolean;
+      }> {
+        return { configuration: "ready", created: false };
+      }
+
+      public async cortexStatus(): Promise<{
+        readonly configuration: "ready";
+        readonly created: boolean;
+      }> {
+        return { configuration: "ready", created: false };
+      }
+
+      public async syncCortex(): Promise<BridgeRunSummary> {
+        return summary("apply");
+      }
+    }
+    const controller = new CortexStatusFailureController();
+    class TestPlugin extends GrandboxBridgePlugin {
+      protected override createWorkerController(_locator: ExternalLocator): WorkerController { return controller; }
+    }
+    const plugin = new TestPlugin(app, { id: "grandbox-bridge" });
+    await plugin.onload();
+    const tab = plugin.settingTabs[0] as unknown as { actions: { syncCortex(): Promise<void> } };
+
+    await tab.actions.syncCortex();
+
+    expect(Notice.messages).toEqual([
+      "Grandbox Bridge: The Cortex synced: 0 writes, 0 conflicts, 0 errors.",
+    ]);
+  });
+
+  it("labels a partial Cortex result as needing attention", async () => {
+    const { GrandboxBridgePlugin } = await import("./main.js");
+    const app = new App();
+    class PartialCortexController extends RecordingController {
+      public async configureCortex(_input: { readonly rootPageId: string }): Promise<{
+        readonly configuration: "ready";
+        readonly created: boolean;
+      }> {
+        return { configuration: "ready", created: false };
+      }
+
+      public async cortexStatus(): Promise<{
+        readonly configuration: "ready";
+        readonly created: boolean;
+      }> {
+        return { configuration: "ready", created: false };
+      }
+
+      public async syncCortex(): Promise<BridgeRunSummary> {
+        return { ...summary("apply"), outcome: "partial", writes: 1, errors: 1 };
+      }
+    }
+    const controller = new PartialCortexController();
+    class TestPlugin extends GrandboxBridgePlugin {
+      protected override createWorkerController(_locator: ExternalLocator): WorkerController { return controller; }
+    }
+    const plugin = new TestPlugin(app, { id: "grandbox-bridge" });
+    await plugin.onload();
+    const tab = plugin.settingTabs[0] as unknown as { actions: { syncCortex(): Promise<void> } };
+
+    await tab.actions.syncCortex();
+
+    expect(Notice.messages).toEqual([
+      "Grandbox Bridge: The Cortex sync needs attention: 0 conflicts, 1 errors.",
+    ]);
   });
 
   it("explains that a missing parent page is not a workspace ID", async () => {

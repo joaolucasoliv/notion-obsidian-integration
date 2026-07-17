@@ -14,6 +14,7 @@ import {
 } from "@grandbox-bridge/shared";
 import { inspectCortexFrontmatter, upsertCortexFrontmatter } from "../../worker/src/cortex/frontmatter.js";
 import { renderCortexMarkdown } from "../../worker/src/cortex/markdown.js";
+import { cortexSemanticHash } from "../../worker/src/cortex/semantic.js";
 import { parseLocalNote } from "../../worker/src/markdown/frontmatter.js";
 import type { JournalStore } from "../../worker/src/persistence/journal-store.js";
 import type { ScannedCortexVaultNote } from "../../worker/src/vault/scanner.js";
@@ -238,7 +239,7 @@ export class FakeCortexTreeApi implements CortexTreeNotionApi {
       title: page.title,
       sourceMarkdown: page.sourceMarkdown,
       directChildPageIds: Object.freeze(directChildPageIds),
-      semanticHash: await sha256Hex(page.sourceMarkdown),
+      semanticHash: await cortexSemanticHash(page.sourceMarkdown),
       structureHash: await sha256Hex(JSON.stringify(directChildPageIds)),
       editedAt: page.editedAt,
       complete: page.complete !== false,

@@ -55,6 +55,12 @@ export type ParsedCliArguments =
       readonly configPath: string;
       readonly mode: "preview" | "apply";
       readonly reason: "manual" | "obsidian-event" | "schedule" | "reconciliation";
+    }
+  | {
+      readonly kind: "cortex-run";
+      readonly configPath: string;
+      readonly mode: "preview" | "apply";
+      readonly reason: "manual" | "obsidian-event" | "schedule" | "reconciliation";
     };
 
 export interface CliWritable {
@@ -163,10 +169,10 @@ function parseCortexSetupArguments(argv: readonly string[]): Extract<ParsedCliAr
   return Object.freeze({ kind: "setup-cortex" as const, mode, vaultRoot, rootPageId });
 }
 
-export function parseCliArguments(argv: readonly string[]): ParsedCliArguments {
-  if (argv.length === 1 && argv[0] === "--help") return Object.freeze({ kind: "help" as const });
-  if (argv[0] === "setup" && argv[1] === "cortex") return parseCortexSetupArguments(argv);
-  if (argv[0] === "setup") return parseSetupArguments(argv);
+function parseRunArguments(
+  argv: readonly string[],
+  kind: "run" | "cortex-run",
+): Extract<ParsedCliArguments, { readonly kind: "run" | "cortex-run" }> {
   let configPath: string | null = null;
   let reason: Extract<ParsedCliArguments, { readonly kind: "run" }> ["reason"] | null = null;
   let dryRun = false;
@@ -199,12 +205,23 @@ export function parseCliArguments(argv: readonly string[]): ParsedCliArguments {
     throw cliError();
   }
   if (configPath === null || reason === null || !json) throw cliError();
-  return Object.freeze({ kind: "run" as const, configPath, mode: dryRun ? "preview" : "apply", reason });
+  return kind === "run"
+    ? Object.freeze({ kind: "run" as const, configPath, mode: dryRun ? "preview" as const : "apply" as const, reason })
+    : Object.freeze({ kind: "cortex-run" as const, configPath, mode: dryRun ? "preview" as const : "apply" as const, reason });
+}
+
+export function parseCliArguments(argv: readonly string[]): ParsedCliArguments {
+  if (argv.length === 1 && argv[0] === "--help") return Object.freeze({ kind: "help" as const });
+  if (argv[0] === "setup" && argv[1] === "cortex") return parseCortexSetupArguments(argv);
+  if (argv[0] === "setup") return parseSetupArguments(argv);
+  if (argv[0] === "cortex") return parseRunArguments(argv.slice(1), "cortex-run");
+  return parseRunArguments(argv, "run");
 }
 
 function helpText(): string {
   return [
     "Usage: bridge-worker.cjs --config <absolute-path> [--dry-run] --reason <manual|obsidian-event|schedule|reconciliation> --json",
+    "       bridge-worker.cjs cortex --config <absolute-path> [--dry-run] --reason <manual|obsidian-event|schedule|reconciliation> --json",
     "       bridge-worker.cjs setup <preview|apply|status> --vault <absolute-path> [--parent-page-id <uuid>] --json",
     "       bridge-worker.cjs setup cortex <apply|status> --vault <absolute-path> [--root-page-id <uuid>] --json",
     "",
@@ -386,7 +403,9 @@ export async function runCli(argv: readonly string[], dependencies: CliDependenc
   }
   try {
     const worker = await dependencies.createWorker(parsed.configPath);
-    const result = await worker.run({ mode: parsed.mode, reason: parsed.reason });
+    const result = parsed.kind === "cortex-run"
+      ? await worker.runCortex({ mode: parsed.mode, reason: parsed.reason })
+      : await worker.run({ mode: parsed.mode, reason: parsed.reason });
     writeSummary(dependencies.stdout, result);
     return result.outcome === "failed" || result.outcome === "recovery-required" ? 1 : 0;
   } catch {

@@ -214,6 +214,8 @@ async function verifyRemote(
     sourceMarkdown: string | null;
     semanticHash: string | null;
     structureHash: string | null;
+    /** Only body mutations may accept Notion's proven plain-block normalization. */
+    allowSemanticSourceNormalization?: boolean;
   }>,
   dependencies: CortexExecutorDependencies,
 ): Promise<CortexPageObservation> {
@@ -221,7 +223,9 @@ async function verifyRemote(
     (expected.pageId !== null && observed.pageId !== expected.pageId) ||
     (expected.parentPageId !== null && observed.parentPageId !== expected.parentPageId) ||
     (expected.title !== null && observed.title !== expected.title) ||
-    (expected.sourceMarkdown !== null && observed.sourceMarkdown !== expected.sourceMarkdown) ||
+    // Never relax an exact source fence implicitly. Only the body-update call
+    // site has evidence that Notion can canonicalize plain-block whitespace.
+    (expected.sourceMarkdown !== null && expected.allowSemanticSourceNormalization !== true && observed.sourceMarkdown !== expected.sourceMarkdown) ||
     (expected.semanticHash !== null && observed.semanticHash !== expected.semanticHash) ||
     (expected.structureHash !== null && observed.structureHash !== expected.structureHash) ||
     !observed.complete
@@ -677,6 +681,7 @@ async function executeOperation(
       sourceMarkdown: operation.target.sourceMarkdown,
       semanticHash: effect.nextSemanticHash,
       structureHash: observed.structureHash,
+      allowSemanticSourceNormalization: true,
     }, dependencies);
     outcome = { remote, pageId: remote.pageId, localByteHash: operation.observedLocal?.byteHash ?? null, localPath: operation.observedLocal?.path ?? null };
   } else if (effect.kind === "update-cortex-title") {

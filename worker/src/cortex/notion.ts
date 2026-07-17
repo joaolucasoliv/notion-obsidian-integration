@@ -12,6 +12,7 @@ import {
   type UpdateCortexTitleInput,
 } from "@grandbox-bridge/shared";
 import { collectCortexChildPageIds, discoverCortexTree, type CortexDiscoverySource } from "./discovery.js";
+import { cortexSemanticHash } from "./semantic.js";
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const HASH_PATTERN = /^[0-9a-f]{64}$/u;
@@ -449,7 +450,7 @@ export class CortexNotionApi implements CortexTreeNotionApi {
       title: metadata.title,
       sourceMarkdown: markdown.sourceMarkdown,
       directChildPageIds: Object.freeze([]),
-      semanticHash: await sha256Hex(markdown.sourceMarkdown),
+      semanticHash: await cortexSemanticHash(markdown.sourceMarkdown),
       structureHash: await sha256Hex("[]"),
       editedAt: metadata.editedAt,
       complete: markdown.complete,

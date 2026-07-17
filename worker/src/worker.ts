@@ -26,7 +26,12 @@ import { RelayEventSource, type RelayEvent } from "./relay/event-source.js";
 import { RelaySnapshotSink } from "./relay/snapshot-sink.js";
 import type { ConfigStore } from "./persistence/config-store.js";
 import type { JournalStore } from "./persistence/journal-store.js";
-import { recoverIncompleteJournal, type CortexRecoveryObserver, type RemoteRecoveryObserver } from "./persistence/recovery.js";
+import {
+  isCortexJournalIntent,
+  recoverIncompleteJournal,
+  type CortexRecoveryObserver,
+  type RemoteRecoveryObserver,
+} from "./persistence/recovery.js";
 import type { StateStore } from "./persistence/state-store.js";
 import { safeErrorFrom, localRecoveryObservation, reconcilePairs, type ReconciliationResult } from "./sync/reconcile.js";
 import { executePlans, type PlannedPair } from "./sync/executor.js";
@@ -36,7 +41,10 @@ import { type CanonicalVaultRoot } from "./vault/safety.js";
 import { AtomicVaultWriter, type VaultWriter } from "./vault/writer.js";
 import { semanticHash } from "./markdown/normalize.js";
 import { parseCortexLocalNote } from "./cortex/frontmatter.js";
+import { stripCortexManagedMarkdown } from "./cortex/markdown.js";
+import { cortexParentFilePath } from "./cortex/path.js";
 import { reconcileCortexTree } from "./cortex/reconcile.js";
+import { cortexSemanticHash } from "./cortex/semantic.js";
 import { planCortexTree, type CortexExecutableTreePlan } from "./cortex/planner.js";
 import { executeCortexTreePlan } from "./cortex/executor.js";
 
@@ -47,6 +55,8 @@ export type WorkerRunInput = {
 
 export interface BridgeWorker {
   run(input: WorkerRunInput): Promise<BridgeRunSummary>;
+  /** Executes only the configured Cortex tree; it never reconciles direct pairs, relay, or graph state. */
+  runCortex(input: WorkerRunInput): Promise<BridgeRunSummary>;
 }
 
 export interface WorkerLock {
@@ -479,8 +489,10 @@ export function createCortexRecoveryObserver(input: CortexRecoveryObserverInput)
         if (localBytes === null || await sha256Hex(localBytes) !== postcondition.byteHash) {
           return Object.freeze({ kind: "attention" as const });
         }
-        if (intent.effectKind !== "create-cortex-conflict") {
-          const local = parseCortexLocalNote(postcondition.relativePath, localBytes);
+        const local = intent.effectKind === "create-cortex-conflict"
+          ? null
+          : parseCortexLocalNote(postcondition.relativePath, localBytes);
+        if (local !== null) {
           if (
             local.cortex.pageId !== postcondition.pageId ||
             local.cortex.pageId !== cortex.pageId ||
@@ -494,6 +506,22 @@ export function createCortexRecoveryObserver(input: CortexRecoveryObserverInput)
           rootPageId: cortex.rootPageId,
           pageId: postcondition.pageId,
         });
+        let semanticMatches = remote !== null && remote.semanticHash === postcondition.semanticHash;
+        if (!semanticMatches && intent.effectKind === "update-cortex-body" && local !== null && remote !== null) {
+          // Older Cortex journals stored a raw Markdown hash.  Recover them
+          // only when the current owned local body reconstructs exactly and
+          // both sides match the current loss-aware Notion semantic boundary.
+          const localSource = stripCortexManagedMarkdown({
+            markdown: local.body,
+            expectedParentWikiLink: postcondition.parentPageId === null
+              ? null
+              : cortexParentFilePath(postcondition.relativePath),
+            expectedChildPageIds: remote.directChildPageIds,
+          });
+          if (await sha256Hex(localSource) === postcondition.semanticHash) {
+            semanticMatches = await cortexSemanticHash(localSource) === remote.semanticHash;
+          }
+        }
         if (
           remote === null ||
           !remote.complete ||
@@ -501,7 +529,7 @@ export function createCortexRecoveryObserver(input: CortexRecoveryObserverInput)
           remote.rootPageId !== cortex.rootPageId ||
           remote.parentPageId !== postcondition.parentPageId ||
           remote.title !== postcondition.title ||
-          remote.semanticHash !== postcondition.semanticHash ||
+          !semanticMatches ||
           remote.structureHash !== postcondition.structureHash
         ) {
           return Object.freeze({ kind: "attention" as const });
@@ -598,7 +626,39 @@ export class GrandboxBridgeWorker implements BridgeWorker {
     }
   }
 
-  private async loadContext(): Promise<LoadedRunContext> {
+  /**
+   * The Cortex button must remain operational when an unrelated legacy pair
+   * needs attention. It shares the installation lock, but deliberately never
+   * initializes relay credentials or relay clients.
+   */
+  public async runCortex(input: WorkerRunInput): Promise<BridgeRunSummary> {
+    const startedAt = safeTimestamp(this.dependencies.clock);
+    try {
+      await this.loadContext(false);
+    } catch (caught) {
+      const error = caught instanceof WorkerFailure ? caught.error : safeRelayError(caught) ?? safeErrorFrom(caught, "invalid-config");
+      safeLog(this.dependencies.logger, {
+        level: "error",
+        event: "run-failed",
+        fields: { mode: input.mode, reason: input.reason, outcome: "failed", errorCode: error.code, retryable: error.retryable },
+      });
+      return failedSummary(input, startedAt, this.dependencies.clock);
+    }
+
+    try {
+      return await this.dependencies.lock.runExclusive(async () => this.runCortexLocked(input, startedAt));
+    } catch (caught) {
+      const error = safeErrorFrom(caught, "active-lock");
+      safeLog(this.dependencies.logger, {
+        level: "error",
+        event: "run-failed",
+        fields: { mode: input.mode, reason: input.reason, outcome: "failed", errorCode: error.code, retryable: error.retryable },
+      });
+      return failedSummary(input, startedAt, this.dependencies.clock);
+    }
+  }
+
+  private async loadContext(loadRelay = true): Promise<LoadedRunContext> {
     try {
       const config = await this.dependencies.config.load();
       const state = await this.dependencies.state.load();
@@ -606,7 +666,7 @@ export class GrandboxBridgeWorker implements BridgeWorker {
       const root = await this.dependencies.canonicalizeVault(config);
       validateRoot(config, root);
       const token = validateCredential(await this.dependencies.credentials.get("notion-token"));
-      const relay = config.relay === null || config.graph === null
+      const relay = !loadRelay || config.relay === null || config.graph === null
         ? null
         : Object.freeze({
             relayToken: validateRelayToken(await this.dependencies.credentials.get("relay-token")),
@@ -852,6 +912,79 @@ export class GrandboxBridgeWorker implements BridgeWorker {
     }
   }
 
+  /**
+   * A Cortex-only run intentionally has a narrower recovery boundary than a
+   * full bridge run. A pending non-Cortex intent can belong to a direct pair,
+   * relay, or a shared state commit, so it blocks rather than being ignored.
+   */
+  private async cortexPendingJournalScope(): Promise<"clean" | "cortex-pending" | "foreign-pending"> {
+    try {
+      const pending = await this.dependencies.journal.incomplete();
+      if (!Array.isArray(pending)) return "foreign-pending";
+      if (pending.length === 0) return "clean";
+      return pending.every((intent) => isCortexJournalIntent(intent)) ? "cortex-pending" : "foreign-pending";
+    } catch {
+      return "foreign-pending";
+    }
+  }
+
+  private async runCortexLocked(input: WorkerRunInput, startedAt: string): Promise<BridgeRunSummary> {
+    let context: LoadedRunContext;
+    try {
+      context = await this.loadContext(false);
+      if (context.config.cortex === null) throw new WorkerFailure(fixedError("invalid-config"));
+      const pendingScope = await this.cortexPendingJournalScope();
+      if (pendingScope === "foreign-pending" || (input.mode === "preview" && pendingScope !== "clean")) {
+        return summary(input, startedAt, { planned: 0, writes: 0, pushed: 0, pulled: 0, conflicts: 0, errors: 0 }, "recovery-required", this.dependencies.clock);
+      }
+
+      const notion = await this.dependencies.createNotionApi(context.token, {
+        config: context.config,
+        state: context.state,
+        root: context.root,
+      });
+      await notion.verifyConnection();
+      if (notion.cortexTree === undefined) throw new WorkerFailure(fixedError("invalid-config"));
+
+      if (input.mode === "apply" && pendingScope === "cortex-pending") {
+        const recovery = await recoverIncompleteJournal({
+          journal: this.dependencies.journal,
+          localObserver: { observe: async (intent) => intent.relativePath === null
+            ? Object.freeze({ kind: "missing" as const })
+            : localRecoveryObservation(context.root, intent.relativePath) },
+          remoteObserver: asRemoteRecoveryObserver(notion, this.dependencies.clock, context.state),
+          cortexObserver: createCortexRecoveryObserver({
+            notion: notion.cortexTree,
+            clock: this.dependencies.clock,
+            readLocalBytes: async (relativePath) => readCurrentLocal(context.root, relativePath),
+            markAttention: async (intent) => markCortexRecoveryAttention(this.dependencies.state, context.state, intent),
+          }),
+          now: () => safeTimestamp(this.dependencies.clock),
+        });
+        if (recovery.status === "recovery-required") {
+          safeLog(this.dependencies.logger, {
+            level: "error",
+            event: "recovery-required",
+            fields: { installationId: context.config.installationId, errorCode: "recovery-required", retryable: false },
+          });
+          return summary(input, startedAt, { planned: 0, writes: 0, pushed: 0, pulled: 0, conflicts: 0, errors: 0 }, "recovery-required", this.dependencies.clock);
+        }
+      }
+
+      const cortexPlan = await this.planCortexTree(context, notion);
+      if (cortexPlan === null) throw new WorkerFailure(fixedError("invalid-config"));
+      return this.finishCortexRun(input, startedAt, context, notion, cortexPlan);
+    } catch (caught) {
+      const error = caught instanceof WorkerFailure ? caught.error : safeRelayError(caught) ?? safeErrorFrom(caught);
+      safeLog(this.dependencies.logger, {
+        level: "error",
+        event: "run-failed",
+        fields: { mode: input.mode, reason: input.reason, outcome: "failed", errorCode: error.code, retryable: error.retryable },
+      });
+      return failedSummary(input, startedAt, this.dependencies.clock);
+    }
+  }
+
   private async planCortexTree(
     context: LoadedRunContext,
     notion: NotionApi,
@@ -1086,6 +1219,91 @@ export class GrandboxBridgeWorker implements BridgeWorker {
         conflicts: runSummary.conflicts,
         errors: runSummary.errors,
         graphUploads: runSummary.graphUploads,
+      },
+    });
+    return runSummary;
+  }
+
+  /**
+   * Executes one plan for the reserved Cortex tree. This intentionally leaves
+   * direct-pair, relay, graph, full-reconciliation, and last-run state intact.
+   */
+  private async finishCortexRun(
+    input: WorkerRunInput,
+    startedAt: string,
+    context: LoadedRunContext,
+    notion: NotionApi,
+    cortexPlan: CortexExecutableTreePlan,
+  ): Promise<BridgeRunSummary> {
+    const planned = cortexPlan.effects.length;
+    const planningConflicts = cortexPlan.pages.filter((page) => page.action === "conflict").length;
+    const planningErrors = cortexPlan.error !== null || cortexPlan.pages.some((page) => page.action === "attention") ? 1 : 0;
+    const previewCounts = {
+      planned,
+      writes: 0,
+      pushed: 0,
+      pulled: 0,
+      conflicts: planningConflicts,
+      errors: planningErrors,
+    };
+    if (input.mode === "preview") {
+      return summary(input, startedAt, previewCounts, outcomeFor(previewCounts, input.mode), this.dependencies.clock);
+    }
+
+    const requiresPreExecutionStateFence = planned > 0 || !sameCortexState(context.state.cortex, cortexPlan.nextCortex);
+    let stateFence = requiresPreExecutionStateFence
+      ? stateCommitIntent(context.config.installationId, this.dependencies.uuid, this.dependencies.clock)
+      : null;
+    if (stateFence !== null) await this.dependencies.journal.begin(stateFence);
+
+    const cortexNotion = notion.cortexTree;
+    if (cortexNotion === undefined) throw new WorkerFailure(fixedError("invalid-config"));
+    const writer = this.dependencies.createWriter?.(context.root) ?? new AtomicVaultWriter(context.root);
+    const executed = await executeCortexTreePlan({ state: context.state, plan: cortexPlan }, {
+      installationId: context.config.installationId,
+      journal: this.dependencies.journal,
+      notion: cortexNotion,
+      writer,
+      uuid: this.dependencies.uuid,
+      clock: this.dependencies.clock,
+      readLocalBytes: async (relativePath) => readCurrentLocal(context.root, relativePath),
+    });
+    const counts = {
+      planned,
+      writes: executed.writes,
+      pushed: 0,
+      pulled: 0,
+      conflicts: executed.outcome === "conflict" ? Math.max(planningConflicts, 1) : planningConflicts,
+      errors: executed.outcome === "attention" || executed.outcome === "error" ? 1 : 0,
+    };
+    const nextState: BridgeStateV1 = sameCortexState(context.state.cortex, executed.state.cortex ?? null)
+      ? context.state
+      : { ...context.state, schemaVersion: 2, cortex: executed.state.cortex ?? null };
+    const runSummary = summary(input, startedAt, counts, outcomeFor(counts, input.mode), this.dependencies.clock);
+    if (!sameDurableState(context.state, nextState)) {
+      if (stateFence === null) {
+        stateFence = stateCommitIntent(context.config.installationId, this.dependencies.uuid, this.dependencies.clock);
+        await this.dependencies.journal.begin(stateFence);
+      }
+      await this.dependencies.state.save(nextState);
+    }
+    if (stateFence !== null) {
+      await this.dependencies.journal.complete(stateFence.id, stateCommitCompletion(this.dependencies.clock));
+    }
+    safeLog(this.dependencies.logger, {
+      level: "info",
+      event: "run-completed",
+      fields: {
+        installationId: context.config.installationId,
+        mode: input.mode,
+        outcome: runSummary.outcome,
+        planned: runSummary.planned,
+        writes: runSummary.writes,
+        pushed: runSummary.pushed,
+        pulled: runSummary.pulled,
+        conflicts: runSummary.conflicts,
+        errors: runSummary.errors,
+        graphUploads: 0,
       },
     });
     return runSummary;

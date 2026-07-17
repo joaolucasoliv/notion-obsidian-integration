@@ -11,6 +11,7 @@ import {
 import { parseCortexLocalNote } from "./frontmatter.js";
 import { stripCortexManagedMarkdown } from "./markdown.js";
 import { cortexParentFilePath } from "./path.js";
+import { cortexSemanticHash } from "./semantic.js";
 import {
   scanCortexVaultNotes,
   type ScannedCortexVaultNote,
@@ -246,7 +247,7 @@ async function materializeLocal(
         bytes: entry.bytes,
         byteHash: await sha256Hex(entry.bytes),
         sourceMarkdown,
-        semanticHash: await sha256Hex(sourceMarkdown),
+        semanticHash: await cortexSemanticHash(sourceMarkdown),
         structureHash: await sha256Hex(JSON.stringify(directChildPageIds)),
         directChildPageIds,
       }));
@@ -274,7 +275,7 @@ async function materializeLocal(
         bytes: entry.note.bytes,
         byteHash: await sha256Hex(entry.note.bytes),
         sourceMarkdown: entry.note.body,
-        semanticHash: await sha256Hex(entry.note.body),
+        semanticHash: await cortexSemanticHash(entry.note.body),
       }));
     } catch {
       invalidPaths.add(entry.path);

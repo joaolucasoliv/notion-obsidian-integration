@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import type { Clock, NotionObservation, PairStatus } from "@grandbox-bridge/shared";
+import { sha256Hex, type Clock, type NotionObservation, type PairStatus } from "@grandbox-bridge/shared";
 import {
   NotionClient,
   NotionClientError,
@@ -239,6 +239,20 @@ describe("NotionClient request contract", () => {
       complete: true,
       pages: [expect.objectContaining({ pageId: rootId, parentPageId: null, title: "The Cortex" })],
     });
+  });
+
+  it("hashes Notion-collapsed adjacent plain blocks as one Cortex semantic body", async () => {
+    const root = cortexRoot();
+    const rootId = root.id as string;
+    const transport = new RecordingTransport([
+      response(root),
+      response(cortexMarkdownFor(rootId, "First paragraph.\nSecond paragraph.")),
+      response(blockChildren([])),
+    ]);
+
+    const result = await client(transport).value.cortexTree.discoverCortexTree({ rootPageId: rootId, maxDepth: 32, maxPages: 5 });
+
+    expect(result.pages[0]?.semanticHash).toBe(await sha256Hex("First paragraph.\n\nSecond paragraph.\n"));
   });
 
   it("keeps a root title with harmless outer whitespace discoverable", async () => {

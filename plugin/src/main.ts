@@ -3,6 +3,7 @@ import type { BridgeRunSummary } from "@grandbox-bridge/shared";
 import { changeNoteOptIn, isGeneratedGithubNote, isManageableMarkdownPath } from "./commands.js";
 import {
   LocalWorkerController,
+  supportsCortexSync,
   supportsCortexSetup,
   supportsNotionSetup,
   NodeWorkerProcessRunner,
@@ -101,6 +102,9 @@ function cortexSyncNotice(summary: BridgeRunSummary): string {
   if (summary.outcome === "noop") return "Grandbox Bridge: The Cortex has no changes.";
   if (summary.outcome === "failed" || summary.outcome === "recovery-required") {
     return "Grandbox Bridge: The Cortex sync needs attention.";
+  }
+  if (summary.outcome === "partial" || summary.outcome === "conflict" || summary.conflicts > 0 || summary.errors > 0) {
+    return `Grandbox Bridge: The Cortex sync needs attention: ${summary.conflicts} conflicts, ${summary.errors} errors.`;
   }
   return `Grandbox Bridge: The Cortex synced: ${summary.writes} writes, ${summary.conflicts} conflicts, ${summary.errors} errors.`;
 }
@@ -252,7 +256,10 @@ export class GrandboxBridgePlugin extends Plugin {
       new Notice("Grandbox Bridge: Cortex status unavailable.");
       return;
     }
-    await this.runWorkerAction((controller) => controller.syncNow(), true, cortexSyncNotice);
+    await this.runWorkerAction((controller) => {
+      if (!supportsCortexSync(controller)) throw pluginError();
+      return controller.syncCortex();
+    }, true, cortexSyncNotice);
   }
 
   private async syncFromVaultEvent(): Promise<void> {
@@ -264,16 +271,23 @@ export class GrandboxBridgePlugin extends Plugin {
     notify = true,
     successNotice: (summary: BridgeRunSummary) => string = actionNotice,
   ): Promise<void> {
+    let summary: BridgeRunSummary;
     try {
-      const summary = await this.serialize(async () => {
+      summary = await this.serialize(async () => {
         if (this.controller === null) throw pluginError();
         return action(this.controller);
       });
-      await this.writeStatusNote(summary);
-      if (notify) new Notice(successNotice(summary));
     } catch {
       if (notify) new Notice("Grandbox Bridge: action unavailable.");
+      return;
     }
+    try {
+      await this.writeStatusNote(summary);
+    } catch {
+      // Status notes are auxiliary: an existing private note with malformed
+      // markers must never hide a completed local worker action.
+    }
+    if (notify) new Notice(successNotice(summary));
   }
 
   private async installService(): Promise<void> {

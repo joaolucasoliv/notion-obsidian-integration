@@ -59,6 +59,11 @@ export interface CortexWorkerController extends WorkerController {
   cortexStatus(): Promise<CortexSetupResult>;
 }
 
+/** Optional extension for the dedicated, legacy-pair-free Cortex sync action. */
+export interface CortexSyncWorkerController extends WorkerController {
+  syncCortex(): Promise<BridgeRunSummary>;
+}
+
 /** An optional extension used only for a debounced vault event reason. */
 export interface EventWorkerController extends WorkerController {
   syncFromVaultEvent(): Promise<BridgeRunSummary>;
@@ -145,6 +150,15 @@ function parseWorkerSummary(stdout: string): BridgeRunSummary {
   }
 }
 
+/** The worker uses exit 1 only for a safe failed/recovery summary. */
+function parseCortexWorkerResult(result: WorkerProcessResult): BridgeRunSummary {
+  if (!validWorkerResult(result)) throw controllerError();
+  const parsed = parseWorkerSummary(result.stdout);
+  const needsAttention = parsed.outcome === "failed" || parsed.outcome === "recovery-required";
+  if ((result.code === 0 && !needsAttention) || (result.code === 1 && needsAttention)) return parsed;
+  throw controllerError();
+}
+
 function validServiceStatus(value: unknown): value is ServiceStatus {
   return typeof value === "object" && value !== null && typeof (value as ServiceStatus).enabled === "boolean";
 }
@@ -227,6 +241,17 @@ function workerArguments(
   return Object.freeze(args);
 }
 
+function cortexWorkerArguments(
+  locator: ExternalLocator,
+  mode: "preview" | "apply",
+  reason: "manual" | "obsidian-event",
+): readonly string[] {
+  const args = [locator.workerPath, "cortex", "--config", locator.configPath];
+  if (mode === "preview") args.push("--dry-run");
+  args.push("--reason", reason, "--json");
+  return Object.freeze(args);
+}
+
 function setupArguments(locator: ExternalLocator, input: NotionConnectionInput): WorkerCommand {
   if (!validConnectionInput(input)) throw controllerError();
   return Object.freeze({
@@ -286,7 +311,7 @@ function cortexStatusArguments(locator: ExternalLocator): WorkerCommand {
  * one queue for manual/event/service operations so concurrent UI gestures
  * cannot create overlapping processes.
  */
-export class LocalWorkerController implements EventWorkerController, SetupWorkerController, CortexWorkerController {
+export class LocalWorkerController implements EventWorkerController, SetupWorkerController, CortexWorkerController, CortexSyncWorkerController {
   private tail: Promise<void> = Promise.resolve();
 
   public constructor(
@@ -303,6 +328,10 @@ export class LocalWorkerController implements EventWorkerController, SetupWorker
 
   public syncNow(): Promise<BridgeRunSummary> {
     return this.enqueue(() => this.runWorker("apply", "manual"));
+  }
+
+  public syncCortex(): Promise<BridgeRunSummary> {
+    return this.enqueue(() => this.runCortexWorker("apply", "manual"));
   }
 
   public syncFromVaultEvent(): Promise<BridgeRunSummary> {
@@ -372,6 +401,19 @@ export class LocalWorkerController implements EventWorkerController, SetupWorker
       }));
       if (!validWorkerResult(result) || result.code !== 0) throw controllerError();
       return parseWorkerSummary(result.stdout);
+    } catch {
+      throw controllerError();
+    }
+  }
+
+  private async runCortexWorker(mode: "preview" | "apply", reason: "manual" | "obsidian-event"): Promise<BridgeRunSummary> {
+    try {
+      const result = await this.runner.run(Object.freeze({
+        executable: this.locator.nodeExecutable,
+        args: cortexWorkerArguments(this.locator, mode, reason),
+        shell: false,
+      }));
+      return parseCortexWorkerResult(result);
     } catch {
       throw controllerError();
     }
@@ -447,4 +489,8 @@ export function supportsCortexSetup(controller: WorkerController): controller is
     typeof (controller as Partial<CortexWorkerController>).configureCortex === "function" &&
     typeof (controller as Partial<CortexWorkerController>).cortexStatus === "function"
   );
+}
+
+export function supportsCortexSync(controller: WorkerController): controller is CortexSyncWorkerController {
+  return typeof (controller as Partial<CortexSyncWorkerController>).syncCortex === "function";
 }

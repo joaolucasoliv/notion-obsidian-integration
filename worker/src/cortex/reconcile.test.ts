@@ -36,6 +36,28 @@ describe("reconcileCortexTree", () => {
     expect(result.canClassifyAbsence).toBe(false);
   });
 
+  it("normalizes a local plain-block boundary to the Cortex semantic boundary used by Notion", async () => {
+    const harness = new CortexTreeHarness();
+    harness.putRemote({
+      pageId: CORTEX_ROOT_ID,
+      parentPageId: null,
+      title: "The Cortex",
+      sourceMarkdown: "First paragraph.\nSecond paragraph.",
+      editedAt: "2026-07-16T12:00:00.000Z",
+    });
+    harness.putOwnedLocal({
+      path: "The Cortex.md",
+      pageId: CORTEX_ROOT_ID,
+      parentPageId: null,
+      parentPath: null,
+      body: "First paragraph.\nSecond paragraph.\n",
+    });
+
+    const result = await reconcileCortexTree(config, { notion: harness.notion, scan: () => harness.scan() });
+
+    expect(result.localPages[0]?.semanticHash).toBe(result.discovery?.pages[0]?.semanticHash);
+  });
+
   it("preserves owned child-marker order when it differs from lexical local paths", async () => {
     const harness = new CortexTreeHarness();
     harness.putRemote({ pageId: CORTEX_ROOT_ID, parentPageId: null, title: "The Cortex", sourceMarkdown: "Root\n", editedAt: "2026-07-16T12:00:00.000Z" });

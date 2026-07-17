@@ -94,6 +94,47 @@ describe("worker CLI", () => {
     });
   });
 
+  it("accepts only the exact Cortex-only JSON apply invocation", () => {
+    expect(parseCliArguments(["cortex", "--config", CONFIG, "--reason", "manual", "--json"])).toEqual({
+      kind: "cortex-run",
+      configPath: CONFIG,
+      mode: "apply",
+      reason: "manual",
+    });
+  });
+
+  it("dispatches a Cortex-only invocation without entering the legacy worker path", async () => {
+    const stdout: string[] = [];
+    const cortexInputs: unknown[] = [];
+    const exit = await runCli(["cortex", "--config", CONFIG, "--reason", "manual", "--json"], {
+      stdout: { write: (value: string) => { stdout.push(value); return true; } },
+      stderr: { write: () => true },
+      createWorker: async () => ({
+        run: async () => { throw new Error("legacy worker path must not run"); },
+        runCortex: async (input) => {
+          cortexInputs.push(input);
+          return {
+            mode: "apply" as const,
+            outcome: "noop" as const,
+            planned: 0,
+            writes: 0,
+            pushed: 0,
+            pulled: 0,
+            conflicts: 0,
+            errors: 0,
+            graphUploads: 0,
+            startedAt: "2026-07-17T12:00:00.000Z",
+            completedAt: "2026-07-17T12:00:00.000Z",
+          };
+        },
+      }),
+    });
+
+    expect(exit).toBe(0);
+    expect(cortexInputs).toEqual([{ mode: "apply", reason: "manual" }]);
+    expect(JSON.parse(stdout[0] ?? "{}")).toMatchObject({ outcome: "noop", errors: 0 });
+  });
+
   it("accepts a setup apply invocation without a credential on argv", () => {
     expect(parseCliArguments([
       "setup",
@@ -462,6 +503,7 @@ describe("worker CLI", () => {
           completedAt: "2026-07-14T12:34:56.000Z",
           };
         },
+        runCortex: async () => { throw new Error("Cortex worker path must not run"); },
       }),
     });
 

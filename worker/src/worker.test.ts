@@ -1,3 +1,4 @@
+import { parseJournalIntent } from "@grandbox-bridge/shared";
 import { describe, expect, it, vi } from "vitest";
 import { BridgeHarness, optedIn } from "../../tests/fakes/bridge-harness.js";
 import { CORTEX_ROOT_ID, FakeCortexTreeApi, RESEARCH_ID } from "../../tests/fakes/cortex-tree-harness.js";
@@ -17,6 +18,172 @@ class MovingClock {
 }
 
 describe("GrandboxBridgeWorker", () => {
+  it("runs only the configured Cortex tree and leaves legacy pairs untouched", async () => {
+    const events: string[] = [];
+    const cortexTree = new FakeCortexTreeApi(events);
+    cortexTree.put({
+      pageId: CORTEX_ROOT_ID,
+      parentPageId: null,
+      title: "The Cortex",
+      sourceMarkdown: "Cortex root\n",
+      editedAt: "2026-07-16T12:00:00.000Z",
+    });
+    cortexTree.put({
+      pageId: RESEARCH_ID,
+      parentPageId: CORTEX_ROOT_ID,
+      title: "Research",
+      sourceMarkdown: "Research note\n",
+      editedAt: "2026-07-16T12:00:00.000Z",
+    });
+    const harness = await BridgeHarness.create({
+      cortex: {
+        rootPageId: CORTEX_ROOT_ID,
+        rootFilePath: "The Cortex.md",
+        rootDirectoryPath: "The Cortex",
+      },
+      cortexTree,
+    });
+    await harness.writeNote("Legacy.md", optedIn("Legacy bridge note\n"));
+    const before = structuredClone(harness.state.value);
+    const runCortex = Reflect.get(harness.worker, "runCortex");
+    if (typeof runCortex !== "function") throw new Error("missing Cortex-only worker entrypoint");
+
+    const applied = await runCortex.call(harness.worker, { mode: "apply", reason: "manual" });
+
+    expect(applied).toMatchObject({ mode: "apply", outcome: "success", planned: 2, writes: 2, errors: 0 });
+    expect(harness.notion.creates).toBe(0);
+    expect(harness.state.value.pairs).toEqual(before.pairs);
+    expect(harness.state.value.graph).toEqual(before.graph);
+    expect(harness.state.value.lastFullReconciliationAt).toBe(before.lastFullReconciliationAt);
+    expect(harness.state.value.lastRun).toEqual(before.lastRun);
+    await expect(harness.note("The Cortex.md")).resolves.toContain(`cortex_page_id: ${CORTEX_ROOT_ID}`);
+    await expect(harness.note("The Cortex/Research.md")).resolves.toContain(`cortex_page_id: ${RESEARCH_ID}`);
+  });
+
+  it("fails closed on a pending non-Cortex journal before contacting Notion", async () => {
+    const harness = await BridgeHarness.create({
+      cortex: {
+        rootPageId: CORTEX_ROOT_ID,
+        rootFilePath: "The Cortex.md",
+        rootDirectoryPath: "The Cortex",
+      },
+    });
+    await harness.journal.begin(parseJournalIntent({
+      schemaVersion: 1,
+      id: "77777777-7777-4777-8777-777777777777",
+      installationId: "11111111-1111-4111-8111-111111111111",
+      effectKind: "commit-state",
+      relativePath: null,
+      remoteId: null,
+      allocationId: null,
+      expectedByteHash: null,
+      expectedSemanticHash: null,
+      resultByteHash: null,
+      resultSemanticHash: null,
+      expectedRemoteEditedAt: null,
+      createdAt: "2026-07-17T12:00:00.000Z",
+    }));
+
+    const result = await harness.worker.runCortex({ mode: "apply", reason: "manual" });
+
+    expect(result).toMatchObject({ outcome: "recovery-required", planned: 0, writes: 0, errors: 0 });
+    expect(harness.notion.verifies).toBe(0);
+    expect(harness.state.saves).toBe(0);
+    await expect(harness.note("The Cortex.md")).rejects.toThrow();
+  });
+
+  it("rejects a Cortex-only run before any provider call when no Cortex root is configured", async () => {
+    const harness = await BridgeHarness.create();
+
+    const result = await harness.worker.runCortex({ mode: "apply", reason: "manual" });
+
+    expect(result).toMatchObject({ outcome: "failed", planned: 0, writes: 0, errors: 1 });
+    expect(harness.notion.verifies).toBe(0);
+    expect(harness.state.saves).toBe(0);
+  });
+
+  it("leaves a shared state fence pending when Cortex state persistence is interrupted", async () => {
+    const events: string[] = [];
+    const cortexTree = new FakeCortexTreeApi(events);
+    cortexTree.put({
+      pageId: CORTEX_ROOT_ID,
+      parentPageId: null,
+      title: "The Cortex",
+      sourceMarkdown: "Cortex root\n",
+      editedAt: "2026-07-16T12:00:00.000Z",
+    });
+    const harness = await BridgeHarness.create({
+      stateSaveFailures: 1,
+      cortex: {
+        rootPageId: CORTEX_ROOT_ID,
+        rootFilePath: "The Cortex.md",
+        rootDirectoryPath: "The Cortex",
+      },
+      cortexTree,
+    });
+
+    const interrupted = await harness.worker.runCortex({ mode: "apply", reason: "manual" });
+    const verifiesBeforeRetry = harness.notion.verifies;
+    const retry = await harness.worker.runCortex({ mode: "apply", reason: "manual" });
+
+    expect(interrupted).toMatchObject({ outcome: "failed", errors: 1 });
+    expect(await harness.journal.incomplete()).toEqual([
+      expect.objectContaining({ effectKind: "commit-state" }),
+    ]);
+    expect(retry).toMatchObject({ outcome: "recovery-required", planned: 0, writes: 0, errors: 0 });
+    expect(harness.notion.verifies).toBe(verifiesBeforeRetry);
+  });
+
+  it("recovers a proven pending Cortex effect without entering legacy reconciliation", async () => {
+    const events: string[] = [];
+    const cortexTree = new FakeCortexTreeApi(events);
+    cortexTree.put({
+      pageId: CORTEX_ROOT_ID,
+      parentPageId: null,
+      title: "The Cortex",
+      sourceMarkdown: "Cortex root\n",
+      editedAt: "2026-07-16T12:00:00.000Z",
+    });
+    cortexTree.put({
+      pageId: RESEARCH_ID,
+      parentPageId: CORTEX_ROOT_ID,
+      title: "Research",
+      sourceMarkdown: "Research note\n",
+      editedAt: "2026-07-16T12:00:00.000Z",
+    });
+    const harness = await BridgeHarness.create({
+      cortex: {
+        rootPageId: CORTEX_ROOT_ID,
+        rootFilePath: "The Cortex.md",
+        rootDirectoryPath: "The Cortex",
+      },
+      cortexTree,
+    });
+    await harness.worker.runCortex({ mode: "apply", reason: "manual" });
+    const local = await harness.note("The Cortex/Research.md");
+    await harness.writeNote("The Cortex/Research.md", local.replace("Research note", "Local research update"));
+    const complete = harness.journal.complete.bind(harness.journal);
+    let interrupted = false;
+    const completion = vi.spyOn(harness.journal, "complete").mockImplementation(async (id, evidence) => {
+      const intent = harness.journal.begun.find((candidate) => candidate.id === id);
+      if (!interrupted && intent?.effectKind === "update-cortex-body") {
+        interrupted = true;
+        throw new Error("synthetic Cortex journal interruption");
+      }
+      return complete(id, evidence);
+    });
+
+    const first = await harness.worker.runCortex({ mode: "apply", reason: "manual" });
+    completion.mockRestore();
+    const recovered = await harness.worker.runCortex({ mode: "apply", reason: "manual" });
+
+    expect(first).toMatchObject({ outcome: "partial", writes: 1, errors: 1 });
+    expect(recovered).toMatchObject({ outcome: "noop", writes: 0, errors: 0 });
+    expect(await harness.journal.incomplete()).toEqual([]);
+    expect(events.filter((event) => event === "remote-body")).toHaveLength(1);
+    expect(harness.notion.creates).toBe(0);
+  });
+
   it("reconciles and executes the configured Cortex tree alongside legacy pairs", async () => {
     const events: string[] = [];
     const cortexTree = new FakeCortexTreeApi(events);
@@ -117,6 +284,51 @@ describe("GrandboxBridgeWorker", () => {
     ]);
     expect(harness.state.value.cortex?.pages[CORTEX_ROOT_ID]).toMatchObject({ status: "synced" });
     expect(harness.state.value.cortex?.pages[RESEARCH_ID]).toMatchObject({ status: "attention" });
+  });
+
+  it("accepts Notion's normalized plain-block response after a Cortex body update", async () => {
+    const events: string[] = [];
+    const cortexTree = new FakeCortexTreeApi(events);
+    cortexTree.put({
+      pageId: CORTEX_ROOT_ID,
+      parentPageId: null,
+      title: "The Cortex",
+      sourceMarkdown: "Cortex root\n",
+      editedAt: "2026-07-16T12:00:00.000Z",
+    });
+    cortexTree.put({
+      pageId: RESEARCH_ID,
+      parentPageId: CORTEX_ROOT_ID,
+      title: "Research",
+      sourceMarkdown: "Research note\n",
+      editedAt: "2026-07-16T12:00:00.000Z",
+    });
+    const harness = await BridgeHarness.create({
+      cortex: {
+        rootPageId: CORTEX_ROOT_ID,
+        rootFilePath: "The Cortex.md",
+        rootDirectoryPath: "The Cortex",
+      },
+      cortexTree,
+    });
+    await harness.apply();
+    const local = await harness.note("The Cortex/Research.md");
+    await harness.writeNote("The Cortex/Research.md", local.replace("Research note\n", "First paragraph.\n\nSecond paragraph.\n"));
+
+    const update = cortexTree.updateCortexBodyExact.bind(cortexTree);
+    vi.spyOn(cortexTree, "updateCortexBodyExact").mockImplementation(async (input) => {
+      await update(input);
+      cortexTree.changeBody(RESEARCH_ID, "First paragraph.\nSecond paragraph.");
+      const normalized = await cortexTree.retrieveCortexPage({ rootPageId: CORTEX_ROOT_ID, pageId: RESEARCH_ID });
+      if (normalized === null) throw new Error("missing normalized Cortex page");
+      return normalized;
+    });
+
+    const result = await harness.apply();
+
+    expect(result).toMatchObject({ outcome: "success", writes: 1, errors: 0 });
+    expect(await harness.journal.incomplete()).toEqual([]);
+    expect(events.filter((event) => event === "remote-body")).toHaveLength(1);
   });
 
   it("keeps preview side-effect-free while still performing the read-only provider preflight", async () => {
