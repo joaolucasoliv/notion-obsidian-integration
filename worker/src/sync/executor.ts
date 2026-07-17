@@ -299,8 +299,7 @@ function resolvedBridgeId(identity: PairPlan["identity"], allocated: string | nu
 
 function shallowState(state: Readonly<BridgeStateV1>): BridgeStateV1 {
   return {
-    schemaVersion: 1,
-    installationId: state.installationId,
+    ...state,
     pairs: Object.fromEntries(Object.entries(state.pairs).map(([id, pair]) => [id, { ...pair }])),
     graph: state.graph === null ? null : { ...state.graph },
     lastFullReconciliationAt: state.lastFullReconciliationAt,

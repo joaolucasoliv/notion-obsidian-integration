@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { BridgeHarness, optedIn } from "../../tests/fakes/bridge-harness.js";
 import { CORTEX_ROOT_ID, FakeCortexTreeApi, RESEARCH_ID } from "../../tests/fakes/cortex-tree-harness.js";
 
@@ -66,6 +66,57 @@ describe("GrandboxBridgeWorker", () => {
     });
     await expect(harness.note("The Cortex.md")).resolves.toContain(`cortex_page_id: ${CORTEX_ROOT_ID}`);
     await expect(harness.note("The Cortex/Research.md")).resolves.toContain(`cortex_page_id: ${RESEARCH_ID}`);
+  });
+
+  it("retains Cortex state when a verified remote body update loses its journal completion", async () => {
+    const events: string[] = [];
+    const cortexTree = new FakeCortexTreeApi(events);
+    cortexTree.put({
+      pageId: CORTEX_ROOT_ID,
+      parentPageId: null,
+      title: "The Cortex",
+      sourceMarkdown: "Cortex root\n",
+      editedAt: "2026-07-16T12:00:00.000Z",
+    });
+    cortexTree.put({
+      pageId: RESEARCH_ID,
+      parentPageId: CORTEX_ROOT_ID,
+      title: "Research",
+      sourceMarkdown: "Research note\n",
+      editedAt: "2026-07-16T12:00:00.000Z",
+    });
+    const harness = await BridgeHarness.create({
+      cortex: {
+        rootPageId: CORTEX_ROOT_ID,
+        rootFilePath: "The Cortex.md",
+        rootDirectoryPath: "The Cortex",
+      },
+      cortexTree,
+    });
+    await harness.apply();
+    const local = await harness.note("The Cortex/Research.md");
+    await harness.writeNote("The Cortex/Research.md", local.replace("Research note", "Local research update"));
+
+    const complete = harness.journal.complete.bind(harness.journal);
+    let interrupted = false;
+    vi.spyOn(harness.journal, "complete").mockImplementation(async (id, evidence) => {
+      const intent = harness.journal.begun.find((candidate) => candidate.id === id);
+      if (!interrupted && intent?.effectKind === "update-cortex-body") {
+        interrupted = true;
+        throw Object.assign(new Error("synthetic journal completion interruption"), { code: "internal-error" });
+      }
+      return complete(id, evidence);
+    });
+
+    const result = await harness.apply();
+
+    expect(result).toMatchObject({ outcome: "partial", writes: 1, errors: 1 });
+    expect(events.filter((event) => event === "remote-body")).toHaveLength(1);
+    await expect(harness.journal.incomplete()).resolves.toEqual([
+      expect.objectContaining({ effectKind: "update-cortex-body", cortex: expect.objectContaining({ pageId: RESEARCH_ID }) }),
+    ]);
+    expect(harness.state.value.cortex?.pages[CORTEX_ROOT_ID]).toMatchObject({ status: "synced" });
+    expect(harness.state.value.cortex?.pages[RESEARCH_ID]).toMatchObject({ status: "attention" });
   });
 
   it("keeps preview side-effect-free while still performing the read-only provider preflight", async () => {
