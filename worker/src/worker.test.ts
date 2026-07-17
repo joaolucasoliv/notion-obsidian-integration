@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { BridgeHarness, optedIn } from "../../tests/fakes/bridge-harness.js";
+import { CORTEX_ROOT_ID, FakeCortexTreeApi, RESEARCH_ID } from "../../tests/fakes/cortex-tree-harness.js";
 
 class MovingClock {
   private value = new Date("2026-07-14T12:34:56.000Z").getTime();
@@ -16,6 +17,57 @@ class MovingClock {
 }
 
 describe("GrandboxBridgeWorker", () => {
+  it("reconciles and executes the configured Cortex tree alongside legacy pairs", async () => {
+    const events: string[] = [];
+    const cortexTree = new FakeCortexTreeApi(events);
+    cortexTree.put({
+      pageId: CORTEX_ROOT_ID,
+      parentPageId: null,
+      title: "The Cortex",
+      sourceMarkdown: "Cortex root\n",
+      editedAt: "2026-07-16T12:00:00.000Z",
+    });
+    cortexTree.put({
+      pageId: RESEARCH_ID,
+      parentPageId: CORTEX_ROOT_ID,
+      title: "Research",
+      sourceMarkdown: "Research note\n",
+      editedAt: "2026-07-16T12:00:00.000Z",
+    });
+    const harness = await BridgeHarness.create({
+      cortex: {
+        rootPageId: CORTEX_ROOT_ID,
+        rootFilePath: "The Cortex.md",
+        rootDirectoryPath: "The Cortex",
+      },
+      cortexTree,
+    });
+    await harness.writeNote("Legacy.md", optedIn("Legacy bridge note\n"));
+
+    const preview = await harness.preview();
+
+    expect(preview).toMatchObject({ mode: "preview", outcome: "success", planned: 4, writes: 0, errors: 0 });
+    expect(events).toContain("remote-discovery");
+    await expect(harness.note("The Cortex.md")).rejects.toThrow();
+
+    const applied = await harness.apply();
+
+    expect(applied).toMatchObject({ mode: "apply", outcome: "success", planned: 4, writes: 4, errors: 0 });
+    expect(Object.keys(harness.state.value.pairs)).toHaveLength(1);
+    expect(harness.state.value.cortex?.pages[CORTEX_ROOT_ID]).toMatchObject({
+      pageId: CORTEX_ROOT_ID,
+      localPath: "The Cortex.md",
+      status: "synced",
+    });
+    expect(harness.state.value.cortex?.pages[RESEARCH_ID]).toMatchObject({
+      pageId: RESEARCH_ID,
+      localPath: "The Cortex/Research.md",
+      status: "synced",
+    });
+    await expect(harness.note("The Cortex.md")).resolves.toContain(`cortex_page_id: ${CORTEX_ROOT_ID}`);
+    await expect(harness.note("The Cortex/Research.md")).resolves.toContain(`cortex_page_id: ${RESEARCH_ID}`);
+  });
+
   it("keeps preview side-effect-free while still performing the read-only provider preflight", async () => {
     const harness = await BridgeHarness.create();
     await harness.writeNote("Worker.md", optedIn("worker preview\n"));

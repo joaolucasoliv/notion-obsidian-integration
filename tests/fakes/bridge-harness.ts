@@ -13,10 +13,11 @@ import {
   type WorkerRunInput,
 } from "../../worker/src/worker.js";
 import type {
-  BridgeConfigV1,
+  BridgeConfigV2,
   BridgeRunSummary,
   BridgeStateV1,
   Clock,
+  CortexTreeNotionApi,
   CredentialStore,
   JournalCompletionV1,
   JournalIntentV1,
@@ -41,12 +42,13 @@ const NOW = "2026-07-14T12:34:56.000Z";
 
 function initialState(): BridgeStateV1 {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     installationId: INSTALLATION_ID,
     pairs: {},
     graph: null,
     lastFullReconciliationAt: null,
     lastRun: null,
+    cortex: null,
   };
 }
 
@@ -59,9 +61,9 @@ class FixedClock implements Clock {
 }
 
 class MemoryConfigStore implements ConfigStore {
-  public constructor(private readonly value: BridgeConfigV1) {}
+  public constructor(private readonly value: BridgeConfigV2) {}
 
-  public async load(): Promise<BridgeConfigV1> {
+  public async load(): Promise<BridgeConfigV2> {
     return structuredClone(this.value);
   }
 
@@ -171,6 +173,7 @@ export class FakeNotionApi implements NotionApi {
   public corruptBodyResult = false;
   public corruptManagedStatusResult = false;
   public failEventResolution = false;
+  public cortexTree: CortexTreeNotionApi | undefined;
   private readonly pages = new Map<string, StoredPage>();
   private readonly eventParents = new Map<string, string | null>();
 
@@ -343,6 +346,8 @@ export class BridgeHarness {
       corruptCreateBridgeResult?: boolean;
       corruptBodyResult?: boolean;
       corruptManagedStatusResult?: boolean;
+      cortex?: BridgeConfigV2["cortex"];
+      cortexTree?: CortexTreeNotionApi;
       clock?: Clock;
     }>,
   ) {
@@ -352,8 +357,9 @@ export class BridgeHarness {
     this.notion.corruptCreateBridgeResult = options.corruptCreateBridgeResult === true;
     this.notion.corruptBodyResult = options.corruptBodyResult === true;
     this.notion.corruptManagedStatusResult = options.corruptManagedStatusResult === true;
-    const config: BridgeConfigV1 = {
-      schemaVersion: 1,
+    this.notion.cortexTree = options.cortexTree;
+    const config: BridgeConfigV2 = {
+      schemaVersion: 2,
       installationId: INSTALLATION_ID,
       vaultRoot: root.canonicalRealPath,
       vaultFingerprint: root.vaultFingerprint,
@@ -365,6 +371,7 @@ export class BridgeHarness {
       },
       relay: null,
       graph: null,
+      cortex: options.cortex ?? null,
     };
     const dependencies: WorkerDependencies = {
       config: new MemoryConfigStore(config),
@@ -400,6 +407,8 @@ export class BridgeHarness {
       corruptCreateBridgeResult?: boolean;
       corruptBodyResult?: boolean;
       corruptManagedStatusResult?: boolean;
+      cortex?: BridgeConfigV2["cortex"];
+      cortexTree?: CortexTreeNotionApi;
       clock?: Clock;
     }> = {},
   ): Promise<BridgeHarness> {

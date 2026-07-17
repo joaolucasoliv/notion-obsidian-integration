@@ -36,6 +36,9 @@ import { type CanonicalVaultRoot } from "./vault/safety.js";
 import { AtomicVaultWriter, type VaultWriter } from "./vault/writer.js";
 import { semanticHash } from "./markdown/normalize.js";
 import { parseCortexLocalNote } from "./cortex/frontmatter.js";
+import { reconcileCortexTree } from "./cortex/reconcile.js";
+import { planCortexTree, type CortexExecutableTreePlan } from "./cortex/planner.js";
+import { executeCortexTreePlan } from "./cortex/executor.js";
 
 export type WorkerRunInput = {
   readonly mode: "preview" | "apply";
@@ -176,6 +179,13 @@ function stateCommitCompletion(clock: Clock): JournalCompletionV1 {
 
 function sameDurableState(left: Readonly<BridgeStateV1>, right: Readonly<BridgeStateV1>): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function sameCortexState(
+  left: BridgeStateV1["cortex"] | undefined,
+  right: BridgeStateV1["cortex"] | null,
+): boolean {
+  return JSON.stringify(left ?? null) === JSON.stringify(right);
 }
 
 function summary(
@@ -818,12 +828,14 @@ export class GrandboxBridgeWorker implements BridgeWorker {
         priorityPageIds: prioritizedEventPages,
         ...reconciliationScope,
       });
+      const cortexPlan = await this.planCortexTree(context, notion);
       return this.finishReconciliation(
         input,
         startedAt,
         context,
         notion,
         reconciled,
+        cortexPlan,
         relay,
         claimedEvents,
         matchedEventPages,
@@ -838,6 +850,26 @@ export class GrandboxBridgeWorker implements BridgeWorker {
       });
       return failedSummary(input, startedAt, this.dependencies.clock);
     }
+  }
+
+  private async planCortexTree(
+    context: LoadedRunContext,
+    notion: NotionApi,
+  ): Promise<CortexExecutableTreePlan | null> {
+    if (context.config.cortex === null) return null;
+    const cortexNotion = notion.cortexTree;
+    if (cortexNotion === undefined) throw new WorkerFailure(fixedError("invalid-config"));
+    const reconciliation = await reconcileCortexTree(context.config.cortex, {
+      root: context.root,
+      notion: cortexNotion,
+      legacyPaths: Object.values(context.state.pairs).map((pair) => pair.localPath),
+    });
+    return planCortexTree({
+      config: context.config.cortex,
+      state: context.state.cortex ?? null,
+      reconciliation,
+      now: () => safeTimestamp(this.dependencies.clock),
+    });
   }
 
   private async previewHasIncompleteJournal(): Promise<boolean> {
@@ -855,17 +887,31 @@ export class GrandboxBridgeWorker implements BridgeWorker {
     context: LoadedRunContext,
     notion: NotionApi,
     reconciled: ReconciliationResult,
+    cortexPlan: CortexExecutableTreePlan | null,
     relay: RelayRunContext | null,
     claimedEvents: readonly RelayEvent[],
     matchedEventPages: ReadonlyMap<string, string>,
     fullReconciliation: boolean,
   ): Promise<BridgeRunSummary> {
+    const cortexPlanned = cortexPlan?.effects.length ?? 0;
+    const cortexPlanningConflicts = cortexPlan?.pages.filter((page) => page.action === "conflict").length ?? 0;
+    const cortexNeedsAttention = cortexPlan !== null && (
+      cortexPlan.error !== null || cortexPlan.pages.some((page) => page.action === "attention")
+    );
+    const cortexPlanningErrors = cortexNeedsAttention ? 1 : 0;
     const validation = validatePlanningBatch(reconciled.inputs);
     if (!validation.ok) {
       return summary(
         input,
         startedAt,
-        { planned: 0, writes: 0, pushed: 0, pulled: 0, conflicts: 0, errors: reconciled.failures.length + 1 },
+        {
+          planned: cortexPlanned,
+          writes: 0,
+          pushed: 0,
+          pulled: 0,
+          conflicts: cortexPlanningConflicts,
+          errors: reconciled.failures.length + cortexPlanningErrors + 1,
+        },
         "failed",
         this.dependencies.clock,
       );
@@ -874,24 +920,37 @@ export class GrandboxBridgeWorker implements BridgeWorker {
     const planned = pairs.reduce((total, pair) => total + pair.plan.effects.length, 0);
     const planningErrors = pairs.filter((pair) => pair.plan.error !== null).length + reconciled.failures.length;
     if (input.mode === "preview") {
-      const counts = { planned, writes: 0, pushed: 0, pulled: 0, conflicts: 0, errors: planningErrors };
+      const counts = {
+        planned: planned + cortexPlanned,
+        writes: 0,
+        pushed: 0,
+        pulled: 0,
+        conflicts: cortexPlanningConflicts,
+        errors: planningErrors + cortexPlanningErrors,
+      };
       return summary(input, startedAt, counts, outcomeFor(counts, input.mode), this.dependencies.clock);
     }
 
     const requiresPreExecutionStateFence =
-      planned > 0 || pairs.some((pair) => pair.plan.stateAdvance.kind !== "none");
+      planned > 0 ||
+      pairs.some((pair) => pair.plan.stateAdvance.kind !== "none") ||
+      (cortexPlan !== null && (
+        cortexPlan.effects.length > 0 ||
+        !sameCortexState(context.state.cortex, cortexPlan.nextCortex)
+      ));
     let stateFence = requiresPreExecutionStateFence
       ? stateCommitIntent(context.config.installationId, this.dependencies.uuid, this.dependencies.clock)
       : null;
     if (stateFence !== null) {
       await this.dependencies.journal.begin(stateFence);
     }
+    const writer = this.dependencies.createWriter?.(context.root) ?? new AtomicVaultWriter(context.root);
     const executed = await executePlans(context.state, pairs, {
       installationId: context.config.installationId,
       notionConfig: context.config.notion as NonNullable<ParsedBridgeConfigV1["notion"]>,
       journal: this.dependencies.journal,
       notion,
-      writer: this.dependencies.createWriter?.(context.root) ?? new AtomicVaultWriter(context.root),
+      writer,
       uuid: this.dependencies.uuid,
       clock: this.dependencies.clock,
       readLocalBytes: async (relativePath) => readCurrentLocal(context.root, relativePath),
@@ -904,7 +963,30 @@ export class GrandboxBridgeWorker implements BridgeWorker {
       conflicts: executed.counts.conflicts,
       errors: executed.counts.errors,
     };
-    let stateAfterGraph: BridgeStateV1 = executed.state;
+    let stateAfterCortex: BridgeStateV1 = executed.state;
+    if (cortexPlan !== null) {
+      const cortexNotion = notion.cortexTree;
+      if (cortexNotion === undefined) throw new WorkerFailure(fixedError("invalid-config"));
+      const cortexExecuted = await executeCortexTreePlan({ state: stateAfterCortex, plan: cortexPlan }, {
+        installationId: context.config.installationId,
+        journal: this.dependencies.journal,
+        notion: cortexNotion,
+        writer,
+        uuid: this.dependencies.uuid,
+        clock: this.dependencies.clock,
+        readLocalBytes: async (relativePath) => readCurrentLocal(context.root, relativePath),
+      });
+      stateAfterCortex = cortexExecuted.state;
+      counts.planned += cortexPlanned;
+      counts.writes += cortexExecuted.writes;
+      if (cortexExecuted.outcome === "conflict") {
+        counts.conflicts += Math.max(cortexPlanningConflicts, 1);
+      } else if (cortexExecuted.outcome === "attention" || cortexExecuted.outcome === "error") {
+        counts.errors += 1;
+      }
+    }
+
+    let stateAfterGraph: BridgeStateV1 = stateAfterCortex;
     let graphUploads = 0;
     if (relay !== null) {
       try {
@@ -912,7 +994,7 @@ export class GrandboxBridgeWorker implements BridgeWorker {
         const projection = await this.graphProjection(
           context.root,
           context.config,
-          executed.state,
+          stateAfterCortex,
           fullReconciliation ? undefined : PARTIAL_RECONCILIATION_CANDIDATE_LIMIT,
           fullReconciliation ? undefined : PARTIAL_RECONCILIATION_TRAVERSAL_LIMIT,
         );
@@ -923,11 +1005,11 @@ export class GrandboxBridgeWorker implements BridgeWorker {
             : new GraphPublisher({ sink, nonceSource: this.dependencies.nonceSource });
           const published = await publisher.publishIfChanged({
             projection,
-            state: executed.state.graph ?? initialGraphState(context.config.graph),
+            state: stateAfterCortex.graph ?? initialGraphState(context.config.graph),
             key: relay.graphKey,
             now: safeTimestamp(this.dependencies.clock),
           });
-          stateAfterGraph = { ...executed.state, graph: published.state };
+          stateAfterGraph = { ...stateAfterCortex, graph: published.state };
           graphUploads = published.uploaded ? 1 : 0;
         }
       } catch {
