@@ -50,7 +50,7 @@ export class CortexNotionError extends Error {
 
 interface RegularPageMetadata {
   readonly pageId: string;
-  readonly parentPageId: string;
+  readonly parentPageId: string | null;
   readonly title: string;
   readonly editedAt: string;
 }
@@ -84,11 +84,16 @@ function isStrictInstant(value: unknown): value is string {
   return Number.isFinite(date.getTime()) && date.toISOString() === value;
 }
 
-function isBoundedText(value: unknown, maximumBytes = 2_000, allowEmpty = false): value is string {
+function isBoundedText(
+  value: unknown,
+  maximumBytes = 2_000,
+  allowEmpty = false,
+  allowOuterWhitespace = false,
+): value is string {
   return (
     typeof value === "string" &&
     (allowEmpty || value.length > 0) &&
-    value.trim() === value &&
+    (allowOuterWhitespace || value.trim() === value) &&
     Buffer.byteLength(value, "utf8") <= maximumBytes &&
     !/[\u0000-\u001f\u007f]/u.test(value)
   );
@@ -130,7 +135,7 @@ function isSafePageUrl(value: unknown, expectedPageId: string): value is string 
 }
 
 function plainTextItem(value: unknown): string | null {
-  if (!isRecord(value) || value.type !== "text" || !isBoundedText(value.plain_text)) return null;
+  if (!isRecord(value) || value.type !== "text" || !isBoundedText(value.plain_text, 2_000, false, true)) return null;
   if (!isRecord(value.text) || value.text.content !== value.plain_text) return null;
   return value.plain_text;
 }
@@ -147,6 +152,12 @@ function regularTitle(properties: unknown): string | null {
 /** This intentionally does not call the legacy Grandbox Notes metadata parser. */
 function parseRegularPageMetadata(value: unknown, expectedPageId?: string): RegularPageMetadata {
   try {
+    const parent: Record<string, unknown> | null = isRecord(value) && isRecord(value.parent) ? value.parent : null;
+    const parentPageId = parent?.type === "page_id" && isCanonicalUuid(parent.page_id)
+      ? parent.page_id
+      : parent?.type === "workspace" && parent.workspace === true
+        ? null
+        : undefined;
     if (
       !isRecord(value) ||
       value.object !== "page" ||
@@ -155,15 +166,13 @@ function parseRegularPageMetadata(value: unknown, expectedPageId?: string): Regu
       !isSafePageUrl(value.url, value.id) ||
       !isStrictInstant(value.last_edited_time) ||
       value.in_trash !== false ||
-      !isRecord(value.parent) ||
-      value.parent.type !== "page_id" ||
-      !isCanonicalUuid(value.parent.page_id)
+      parentPageId === undefined
     ) {
       throw failure("invalid-response");
     }
     const title = regularTitle(value.properties);
     if (title === null) throw failure("invalid-response");
-    return Object.freeze({ pageId: value.id, parentPageId: value.parent.page_id, title, editedAt: value.last_edited_time });
+    return Object.freeze({ pageId: value.id, parentPageId, title, editedAt: value.last_edited_time });
   } catch (caught) {
     if (caught instanceof CortexNotionError) throw caught;
     throw failure("invalid-response");
@@ -427,13 +436,15 @@ export class CortexNotionApi implements CortexTreeNotionApi {
 
   async #retrieveUnstructuredPage(pageId: string, rootPageId: string): Promise<CortexPageObservation> {
     const metadata = await this.#retrieveMetadata(pageId);
+    const parentPageId = pageId === rootPageId ? null : metadata.parentPageId;
+    if (pageId !== rootPageId && parentPageId === null) throw failure("invalid-response");
     const markdown = parseRegularPageMarkdown(await this.#request.request<unknown>({
       method: "GET",
       path: `/v1/pages/${pageId}/markdown`,
     }), pageId);
     return Object.freeze({
       pageId,
-      parentPageId: pageId === rootPageId ? null : metadata.parentPageId,
+      parentPageId,
       rootPageId,
       title: metadata.title,
       sourceMarkdown: markdown.sourceMarkdown,
@@ -521,6 +532,7 @@ export class CortexNotionApi implements CortexTreeNotionApi {
       seen.add(currentPageId);
       const metadata = await this.#retrieveMetadata(currentPageId);
       if (page === null) page = metadata;
+      if (metadata.parentPageId === null) throw failure("revision-race");
       currentPageId = metadata.parentPageId;
     }
     throw failure("revision-race");

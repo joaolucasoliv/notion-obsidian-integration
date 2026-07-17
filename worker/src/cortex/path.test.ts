@@ -25,6 +25,19 @@ describe("projectCortexTreePaths", () => {
     expect(paths.get(PROJECT_ID)).toBe("The Cortex/Research/Project.md");
   });
 
+  it("uses the fixed root path even when the remote root title has outer whitespace", () => {
+    const paths = projectCortexTreePaths({
+      rootPageId: ROOT_ID,
+      pages: [
+        { pageId: ROOT_ID, parentPageId: null, rootPageId: ROOT_ID, title: "The Cortex " },
+        { pageId: RESEARCH_ID, parentPageId: ROOT_ID, rootPageId: ROOT_ID, title: "Research" },
+      ],
+    });
+
+    expect(paths.get(ROOT_ID)).toBe("The Cortex.md");
+    expect(paths.get(RESEARCH_ID)).toBe("The Cortex/Research.md");
+  });
+
   it("rejects case-insensitive local collisions and collisions with normal or legacy paths", () => {
     const base = {
       rootPageId: ROOT_ID,

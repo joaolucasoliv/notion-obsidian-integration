@@ -27,6 +27,7 @@ const MAX_TAG_BYTES = 100;
 const MAX_TAGS = 100;
 const MAX_UNKNOWN_BLOCK_IDS = 100;
 const LEADING_H1_SENTINEL = "\u200B\n\n";
+const SYNTHETIC_LEADING_EMPTY_BLOCK = /^<empty-block\/>\r?\n(?=#[ \t])/u;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const HASH_PATTERN = /^[0-9a-f]{64}$/u;
 const ISO_INSTANT_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u;
@@ -94,8 +95,14 @@ interface PageMetadata {
 interface PageMarkdown {
   readonly pageId: string;
   readonly sourceMarkdown: string;
+  readonly rawSourceMarkdown: string;
   readonly truncated: boolean;
   readonly unknownBlockIds: readonly string[];
+}
+
+interface RetrievedRawPage {
+  readonly record: Readonly<RawNotionPageRecord>;
+  readonly rawSourceMarkdown: string;
 }
 
 function clientFailure(code: SafeErrorCode, retryable: boolean): NotionClientError {
@@ -270,7 +277,8 @@ function parsePageMarkdown(value: unknown, expectedPageId: string): PageMarkdown
     }
     return Object.freeze({
       pageId: value.id,
-      sourceMarkdown: value.markdown,
+      sourceMarkdown: stripSyntheticLeadingEmptyBlock(value.markdown),
+      rawSourceMarkdown: value.markdown,
       truncated: value.truncated,
       unknownBlockIds: Object.freeze(unknownBlockIds),
     });
@@ -279,21 +287,24 @@ function parsePageMarkdown(value: unknown, expectedPageId: string): PageMarkdown
   }
 }
 
-function rawRecord(metadata: PageMetadata, markdown: PageMarkdown): Readonly<RawNotionPageRecord> {
+function rawRecord(metadata: PageMetadata, markdown: PageMarkdown): Readonly<RetrievedRawPage> {
   return Object.freeze({
-    pageId: metadata.pageId,
-    pageUrl: metadata.pageUrl,
-    editedAt: metadata.editedAt,
-    sourceMarkdown: markdown.sourceMarkdown,
-    truncated: markdown.truncated,
-    unknownBlockIds: Object.freeze([...markdown.unknownBlockIds]),
-    bridgeId: metadata.bridgeId,
-    managed: Object.freeze({
-      title: metadata.managed.title,
-      obsidianPath: metadata.managed.obsidianPath,
-      status: metadata.managed.status,
-      tags: Object.freeze([...metadata.managed.tags]),
+    record: Object.freeze({
+      pageId: metadata.pageId,
+      pageUrl: metadata.pageUrl,
+      editedAt: metadata.editedAt,
+      sourceMarkdown: markdown.sourceMarkdown,
+      truncated: markdown.truncated,
+      unknownBlockIds: Object.freeze([...markdown.unknownBlockIds]),
+      bridgeId: metadata.bridgeId,
+      managed: Object.freeze({
+        title: metadata.managed.title,
+        obsidianPath: metadata.managed.obsidianPath,
+        status: metadata.managed.status,
+        tags: Object.freeze([...metadata.managed.tags]),
+      }),
     }),
+    rawSourceMarkdown: markdown.rawSourceMarkdown,
   });
 }
 
@@ -341,6 +352,13 @@ function bodyMatchCount(source: string, oldMarkdown: string): number {
     offset = index + 1;
   }
   return count;
+}
+
+function exactSourceForUpdate(rawSource: string, canonicalSource: string, expectedSource: string): string | null {
+  if (rawSource !== canonicalSource && expectedSource === canonicalSource) {
+    return rawSource;
+  }
+  return bodyMatchCount(rawSource, expectedSource) === 1 ? expectedSource : null;
 }
 
 function validRetryAfter(headers: Readonly<Record<string, string>>): number | null {
@@ -490,6 +508,10 @@ function preserveLeadingH1(markdown: string): string {
   return /^#[ \t]/u.test(markdown) ? `${LEADING_H1_SENTINEL}${markdown}` : markdown;
 }
 
+function stripSyntheticLeadingEmptyBlock(markdown: string): string {
+  return markdown.replace(SYNTHETIC_LEADING_EMPTY_BLOCK, "");
+}
+
 function blockParent(value: unknown, expectedBlockId: string): { readonly kind: "page" | "block"; readonly id: string } | null {
   if (!isRecord(value) || value.object !== "block" || value.id !== expectedBlockId || !isRecord(value.parent) || typeof value.parent.type !== "string") {
     throw clientFailure("invalid-response", false);
@@ -558,7 +580,7 @@ export class NotionClient implements NotionApi {
   public async retrievePage(pageId: string): Promise<NotionObservation> {
     try {
       if (!isCanonicalUuid(pageId)) throw clientFailure("invalid-response", false);
-      return await this.#decode(await this.#retrieveRaw(pageId));
+      return await this.#decode((await this.#retrieveRaw(pageId)).record);
     } catch (caught) {
       throw safeClientCaught(caught);
     }
@@ -597,7 +619,7 @@ export class NotionClient implements NotionApi {
         markdown: preserveLeadingH1(input.markdown),
       });
       const metadata = parsePageMetadata(created);
-      return await this.retrievePage(metadata.pageId);
+      return await this.#retrieveCreatedPage(metadata.pageId);
     } catch (caught) {
       throw safeClientCaught(caught);
     }
@@ -607,15 +629,19 @@ export class NotionClient implements NotionApi {
     try {
       if (!validBodyUpdateInput(input)) throw clientFailure("invalid-response", false);
       const observed = await this.#retrieveRaw(input.pageId);
-      if (observed.editedAt !== input.observedEditedAt) throw clientFailure("revision-race", false);
-      const matches = bodyMatchCount(observed.sourceMarkdown, input.oldMarkdown);
-      if (matches !== 1) throw clientFailure("revision-race", false);
+      if (observed.record.editedAt !== input.observedEditedAt) throw clientFailure("revision-race", false);
+      const exactOldMarkdown = exactSourceForUpdate(
+        observed.rawSourceMarkdown,
+        observed.record.sourceMarkdown,
+        input.oldMarkdown,
+      );
+      if (exactOldMarkdown === null) throw clientFailure("revision-race", false);
       const nextMarkdown = preserveLeadingH1(input.newMarkdown);
-      const body = observed.sourceMarkdown.length === 0 && input.oldMarkdown.length === 0
+      const body = observed.rawSourceMarkdown.length === 0 && exactOldMarkdown.length === 0
         ? { type: "replace_content", replace_content: { new_str: nextMarkdown } }
         : {
             type: "update_content",
-            update_content: { content_updates: [{ old_str: input.oldMarkdown, new_str: nextMarkdown }] },
+            update_content: { content_updates: [{ old_str: exactOldMarkdown, new_str: nextMarkdown }] },
           };
       const updated = await this.#request<unknown>("PATCH", `/v1/pages/${input.pageId}/markdown`, body);
       parsePageMarkdown(updated, input.pageId);
@@ -650,10 +676,27 @@ export class NotionClient implements NotionApi {
     return parsePageMetadata(value, pageId);
   }
 
-  async #retrieveRaw(pageId: string): Promise<Readonly<RawNotionPageRecord>> {
+  async #retrieveRaw(pageId: string): Promise<Readonly<RetrievedRawPage>> {
     const metadata = await this.#retrieveMetadata(pageId);
     const markdown = await this.#request<unknown>("GET", `/v1/pages/${pageId}/markdown`);
     return rawRecord(metadata, parsePageMarkdown(markdown, pageId));
+  }
+
+  /** A successful create can become readable a moment later; only retry that follow-up read. */
+  async #retrieveCreatedPage(pageId: string): Promise<NotionObservation> {
+    let retryAttempt = 0;
+    while (true) {
+      try {
+        return await this.retrievePage(pageId);
+      } catch (caught) {
+        const failure = safeClientCaught(caught);
+        if (failure.code !== "not-found" || retryAttempt >= NOTION_MAX_RETRY_DELAYS) {
+          throw failure;
+        }
+        retryAttempt += 1;
+        await this.#delay(retryAttempt, undefined);
+      }
+    }
   }
 
   async #decode(source: Readonly<RawNotionPageRecord>): Promise<NotionObservation> {

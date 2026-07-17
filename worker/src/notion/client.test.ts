@@ -122,6 +122,12 @@ function markdown(): Record<string, unknown> {
   return fixture<Record<string, unknown>>("page-markdown.json");
 }
 
+function markdownWith(source: string): Record<string, unknown> {
+  const value = markdown() as Record<string, unknown>;
+  value.markdown = source;
+  return value;
+}
+
 function updatedMarkdown(): Record<string, unknown> {
   return fixture<Record<string, unknown>>("page-markdown-updated.json");
 }
@@ -232,6 +238,44 @@ describe("NotionClient request contract", () => {
       rootPageId: rootId,
       complete: true,
       pages: [expect.objectContaining({ pageId: rootId, parentPageId: null, title: "The Cortex" })],
+    });
+  });
+
+  it("keeps a root title with harmless outer whitespace discoverable", async () => {
+    const root = cortexRoot();
+    const rootId = root.id as string;
+    const title = (root.properties as Record<string, any>).title.title[0];
+    title.plain_text = "The Cortex ";
+    title.text.content = "The Cortex ";
+    const transport = new RecordingTransport([
+      response(root),
+      response(cortexMarkdown()),
+      response({ object: "list", results: [], has_more: false, next_cursor: null }),
+    ]);
+
+    const result = await client(transport).value.cortexTree.discoverCortexTree({ rootPageId: rootId, maxDepth: 32, maxPages: 5 });
+
+    expect(result).toMatchObject({
+      complete: true,
+      pages: [expect.objectContaining({ pageId: rootId, title: "The Cortex " })],
+    });
+  });
+
+  it("discovers a workspace-owned root page", async () => {
+    const root = cortexRoot();
+    const rootId = root.id as string;
+    (root as Record<string, any>).parent = { type: "workspace", workspace: true };
+    const transport = new RecordingTransport([
+      response(root),
+      response(cortexMarkdown()),
+      response({ object: "list", results: [], has_more: false, next_cursor: null }),
+    ]);
+
+    const result = await client(transport).value.cortexTree.discoverCortexTree({ rootPageId: rootId, maxDepth: 32, maxPages: 5 });
+
+    expect(result).toMatchObject({
+      complete: true,
+      pages: [expect.objectContaining({ pageId: rootId, parentPageId: null })],
     });
   });
 
@@ -742,6 +786,36 @@ describe("NotionClient request contract", () => {
     ]);
   });
 
+  it("normalizes Notion's synthetic leading block for planning while matching its raw source on update", async () => {
+    const initial = markdownWith("<empty-block/>\n# Alpha\n");
+    const updated = markdownWith("<empty-block/>\n# Beta\n");
+    const transport = new RecordingTransport([
+      response(page()),
+      response(initial),
+      response(updated),
+      response(page()),
+      response(updated),
+    ]);
+
+    await expect(client(transport).value.updateBodyExact({
+      pageId: PAGE_ID,
+      oldMarkdown: "# Alpha\n",
+      newMarkdown: "# Beta\n",
+      observedEditedAt: EDITED_AT,
+    })).resolves.toMatchObject({ sourceMarkdown: "# Beta\n" });
+
+    expect(transport.requests[2]).toMatchObject({
+      method: "PATCH",
+      path: `/v1/pages/${PAGE_ID}/markdown`,
+      body: {
+        type: "update_content",
+        update_content: {
+          content_updates: [{ old_str: "<empty-block/>\n# Alpha\n", new_str: "\u200B\n\n# Beta\n" }],
+        },
+      },
+    });
+  });
+
   it("uses the exact connection, retrieve, create, and managed-property endpoint requests", async () => {
     const verifyTransport = new RecordingTransport([response(fixture("user-me.json"))]);
     await client(verifyTransport).value.verifyConnection();
@@ -897,6 +971,34 @@ describe("NotionClient retries and fixed errors", () => {
     expect(transport.requests).toHaveLength(1);
     expect(transport.requests[0]).toMatchObject({ method: "POST", path: "/v1/pages" });
     expect(clock.delays).toEqual([]);
+  });
+
+  it("retries only the readback of a newly created page when Notion is eventually consistent", async () => {
+    const transport = new RecordingTransport([
+      response(page()),
+      response({ message: "not ready" }, 404),
+      response(page()),
+      response(markdown()),
+    ]);
+    const { value, clock } = client(transport);
+
+    await expect(value.createNotePage({
+      parentPageId: USER_ID,
+      dataSourceId: OTHER_PAGE_ID,
+      bridgeId: BRIDGE_ID,
+      title: "Alpha",
+      obsidianPath: "Notes/Alpha.md",
+      tags: ["alpha"],
+      markdown: "# Alpha\n",
+    })).resolves.toMatchObject({ kind: "present", pageId: PAGE_ID });
+
+    expect(transport.requests.map((request) => ({ method: request.method, path: request.path }))).toEqual([
+      { method: "POST", path: "/v1/pages" },
+      { method: "GET", path: `/v1/pages/${PAGE_ID}` },
+      { method: "GET", path: `/v1/pages/${PAGE_ID}` },
+      { method: "GET", path: `/v1/pages/${PAGE_ID}/markdown` },
+    ]);
+    expect(clock.delays).toEqual([100]);
   });
 
   it.each([

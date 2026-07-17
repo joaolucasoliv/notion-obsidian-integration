@@ -86,6 +86,19 @@ function assertSafeTitle(value: unknown): asserts value is string {
   }
 }
 
+/** The root always maps to a fixed filename, so outer title whitespace cannot affect a local path. */
+function assertSafeRootTitle(value: unknown): asserts value is string {
+  if (
+    typeof value !== "string" ||
+    value.trim().length === 0 ||
+    value !== value.normalize("NFC") ||
+    Buffer.byteLength(value, "utf8") > MAX_TITLE_BYTES ||
+    /[\u0000-\u001f\u007f]/u.test(value)
+  ) {
+    throw invalidPath();
+  }
+}
+
 function pathKey(path: string): string {
   return path.normalize("NFC").toLocaleLowerCase("en-US");
 }
@@ -129,13 +142,13 @@ export function projectCortexLocalPath(input: Readonly<CortexLocalPathProjection
   ) {
     throw invalidPath();
   }
-  assertSafeTitle(input.title);
-
   if (input.pageId === input.rootPageId) {
+    assertSafeRootTitle(input.title);
     if (input.parentPageId !== null || input.parentLocalPath !== null) throw invalidPath();
     return CORTEX_ROOT_FILE_PATH;
   }
 
+  assertSafeTitle(input.title);
   if (input.parentPageId === null || input.parentLocalPath === null) throw invalidPath();
   assertSafeRelativePath(input.parentLocalPath);
   if (
@@ -200,7 +213,11 @@ export function projectCortexTreePaths(input: Readonly<CortexTreePathProjection>
     ) {
       throw invalidPath();
     }
-    assertSafeTitle(page.title);
+    if (page.pageId === input.rootPageId) {
+      assertSafeRootTitle(page.title);
+    } else {
+      assertSafeTitle(page.title);
+    }
     pages.set(page.pageId, page);
   }
 

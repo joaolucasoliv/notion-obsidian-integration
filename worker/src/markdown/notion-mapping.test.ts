@@ -76,6 +76,21 @@ describe("Notion Markdown mapping", () => {
     expect(decoded.semantic).toEqual(local);
   });
 
+  it("drops Notion's synthetic empty block only when it precedes a leading H1", () => {
+    const local = normalizeLocal(parseMarkdown("# Title\n\nBody\n"));
+
+    const decoded = fromNotionMarkdown("<empty-block/>\n# Title\nBody", FIXTURE_LINKS);
+
+    expect(decoded.semantic).toEqual(local);
+    expect(decoded.unsupportedKinds).toEqual([]);
+  });
+
+  it("keeps a non-sentinel empty block as unsupported raw HTML", () => {
+    const decoded = fromNotionMarkdown("<empty-block/>\nPlain body", FIXTURE_LINKS);
+
+    expect(decoded.unsupportedKinds).toEqual(["raw-html"]);
+  });
+
   it("restores a plain Notion block boundary before escaping a wiki-looking literal", () => {
     const decoded = fromNotionMarkdown("First paragraph.\nSecond [[literal]]", FIXTURE_LINKS);
 

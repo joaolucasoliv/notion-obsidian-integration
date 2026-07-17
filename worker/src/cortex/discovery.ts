@@ -70,6 +70,15 @@ function isBoundedText(value: unknown): value is string {
   );
 }
 
+function isBoundedRootTitle(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.trim().length > 0 &&
+    Buffer.byteLength(value, "utf8") <= 2_000 &&
+    !/[\u0000-\u001f\u007f]/u.test(value)
+  );
+}
+
 function normalizeInput(value: unknown): NormalizedDiscoveryInput {
   if (!isRecord(value) || !isCanonicalUuid(value.rootPageId)) throw new CortexDiscoveryError("invalid");
   const maxDepth = value.maxDepth === undefined ? MAX_DEPTH : value.maxDepth;
@@ -102,7 +111,7 @@ function validObservation(value: unknown, pageId: string, rootPageId: string): v
   if (!isRecord(value) || value.pageId !== pageId || value.rootPageId !== rootPageId) return false;
   return (
     (value.parentPageId === null || isCanonicalUuid(value.parentPageId)) &&
-    isBoundedText(value.title) &&
+    (pageId === rootPageId ? isBoundedRootTitle(value.title) : isBoundedText(value.title)) &&
     typeof value.sourceMarkdown === "string" &&
     Array.isArray(value.directChildPageIds) &&
     value.directChildPageIds.every(isCanonicalUuid) &&

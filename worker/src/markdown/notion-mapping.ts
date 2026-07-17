@@ -989,6 +989,11 @@ function hasAmbiguousTopLevelPlainSoftWrap(root: Root): boolean {
   );
 }
 
+/** Notion serializes the zero-width leading-H1 sentinel as this inert block. */
+function stripSyntheticLeadingEmptyBlock(markdown: string): string {
+  return markdown.replace(/^<empty-block\/>\r?\n(?=#[ \t])/u, "");
+}
+
 export function toNotionMarkdown(note: SemanticNote, links: LinkMapping): MappingResult {
   const index = validateLinkMapping(links);
   const semantic = normalizeLocal(parseMarkdown(note.bodyMarkdown), note.tags);
@@ -1013,7 +1018,7 @@ export function fromNotionMarkdown(
   tags: readonly string[] = [],
 ): MappingResult {
   const index = validateLinkMapping(links);
-  const document = parseMarkdown(markdown);
+  const document = parseMarkdown(stripSyntheticLeadingEmptyBlock(markdown));
   const root = structuredClone(document.root);
   const unsupported = new Set(
     document.unsupportedKinds.filter((kind) => kind !== "raw-html" && kind !== "html-comment"),
