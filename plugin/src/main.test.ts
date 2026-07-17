@@ -275,6 +275,87 @@ describe("GrandboxBridgePlugin", () => {
     expect(Notice.messages).toEqual(["Grandbox Bridge: Notion connected."]);
   });
 
+  it("wires The Cortex settings actions without persisting a root page reference", async () => {
+    const { GrandboxBridgePlugin } = await import("./main.js");
+    const app = new App();
+    class CortexRecordingController extends RecordingController {
+      public readonly cortexRoots: string[] = [];
+
+      public async configureCortex(input: { readonly rootPageId: string }): Promise<{
+        readonly configuration: "ready";
+        readonly created: boolean;
+      }> {
+        this.cortexRoots.push(input.rootPageId);
+        return { configuration: "ready", created: true };
+      }
+
+      public async cortexStatus(): Promise<{
+        readonly configuration: "ready";
+        readonly created: boolean;
+      }> {
+        return { configuration: "ready", created: false };
+      }
+    }
+    const controller = new CortexRecordingController();
+    class TestPlugin extends GrandboxBridgePlugin {
+      protected override createWorkerController(_locator: ExternalLocator): WorkerController { return controller; }
+    }
+    const plugin = new TestPlugin(app, { id: "grandbox-bridge" });
+    await plugin.onload();
+    const tab = plugin.settingTabs[0] as unknown as {
+      actions: {
+        configureCortex(input: { readonly rootPageId: string }): Promise<void>;
+        syncCortex(): Promise<void>;
+        cortexStatus(): Promise<void>;
+      };
+    };
+
+    await tab.actions.configureCortex({ rootPageId: "22222222-2222-4222-8222-222222222222" });
+    await tab.actions.syncCortex();
+    await tab.actions.cortexStatus();
+
+    expect(controller.cortexRoots).toEqual(["22222222-2222-4222-8222-222222222222"]);
+    expect(controller.calls).toEqual([{ mode: "apply", reason: "manual" }]);
+    expect(Notice.messages).toEqual([
+      "Grandbox Bridge: The Cortex connected.",
+      "Grandbox Bridge: The Cortex synced: 0 writes, 0 conflicts, 0 errors.",
+      "Grandbox Bridge: The Cortex is ready.",
+    ]);
+    expect(plugin.savedPluginData).toEqual({ installationId: expect.any(String) });
+  });
+
+  it("does not run a bridge sync before The Cortex has been configured", async () => {
+    const { GrandboxBridgePlugin } = await import("./main.js");
+    const app = new App();
+    class UnconfiguredCortexController extends RecordingController {
+      public async configureCortex(_input: { readonly rootPageId: string }): Promise<{
+        readonly configuration: "ready";
+        readonly created: boolean;
+      }> {
+        return { configuration: "ready", created: true };
+      }
+
+      public async cortexStatus(): Promise<{
+        readonly configuration: "unconfigured";
+        readonly created: boolean;
+      }> {
+        return { configuration: "unconfigured", created: false };
+      }
+    }
+    const controller = new UnconfiguredCortexController();
+    class TestPlugin extends GrandboxBridgePlugin {
+      protected override createWorkerController(_locator: ExternalLocator): WorkerController { return controller; }
+    }
+    const plugin = new TestPlugin(app, { id: "grandbox-bridge" });
+    await plugin.onload();
+    const tab = plugin.settingTabs[0] as unknown as { actions: { syncCortex(): Promise<void> } };
+
+    await tab.actions.syncCortex();
+
+    expect(controller.calls).toEqual([]);
+    expect(Notice.messages).toEqual(["Grandbox Bridge: The Cortex is not configured."]);
+  });
+
   it("explains that a missing parent page is not a workspace ID", async () => {
     const { GrandboxBridgePlugin } = await import("./main.js");
     const app = new App();

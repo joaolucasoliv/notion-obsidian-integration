@@ -1,5 +1,5 @@
 import { Notice, PluginSettingTab, Setting, type App, type Plugin } from "obsidian";
-import type { BridgeStatus, NotionConnectionInput } from "./controller.js";
+import type { BridgeStatus, CortexSetupInput, NotionConnectionInput } from "./controller.js";
 import { parseNotionParentPageId } from "./onboarding.js";
 
 export interface SettingsActions {
@@ -8,6 +8,9 @@ export interface SettingsActions {
   installService(): Promise<void>;
   disableService(): Promise<void>;
   connectNotion(input: NotionConnectionInput): Promise<void>;
+  configureCortex(input: CortexSetupInput): Promise<void>;
+  syncCortex(): Promise<void>;
+  cortexStatus(): Promise<void>;
   status(): Promise<BridgeStatus>;
 }
 
@@ -19,7 +22,7 @@ export function describeStatus(status: BridgeStatus): string {
   return "Ready; background service state is unavailable.";
 }
 
-/** Settings deliberately expose only local sync/service controls, never pairing or graph controls. */
+/** Settings expose local bridge controls and the bounded The Cortex tree workflow. */
 export class GrandboxBridgeSettingTab extends PluginSettingTab {
   public constructor(
     app: App,
@@ -73,6 +76,30 @@ export class GrandboxBridgeSettingTab extends PluginSettingTab {
           token?.setValue("");
         }
       }));
+    let cortexRoot: { getValue(): string; setValue(value: string): unknown } | null = null;
+    new Setting(this.containerEl)
+      .setName("The Cortex")
+      .setDesc("Connect the Notion root page for The Cortex. It uses the existing local Notion connection and never asks for a token.")
+      .addText((text) => {
+        cortexRoot = text;
+        text.setPlaceholder("The Cortex root page URL or ID");
+      })
+      .addButton((button) => button.setButtonText("Connect The Cortex").onClick(async () => {
+        try {
+          await this.actions.configureCortex({
+            rootPageId: parseNotionParentPageId(cortexRoot?.getValue() ?? ""),
+          });
+        } catch {
+          new Notice("Grandbox Bridge: enter a valid The Cortex root page URL or ID.");
+        } finally {
+          cortexRoot?.setValue("");
+        }
+      }));
+    new Setting(this.containerEl)
+      .setName("Cortex sync")
+      .setDesc("Sync The Cortex tree or check its local setup status.")
+      .addButton((button) => button.setButtonText("Sync The Cortex").onClick(() => this.actions.syncCortex()))
+      .addButton((button) => button.setButtonText("Cortex status").onClick(() => this.actions.cortexStatus()));
     new Setting(this.containerEl)
       .setName("Sync")
       .setDesc("Run a local preview or an explicit sync.")

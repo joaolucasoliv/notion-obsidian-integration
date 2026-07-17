@@ -37,9 +37,26 @@ export interface NotionConnectionResult {
   readonly error?: SafeErrorCode;
 }
 
+export interface CortexSetupInput {
+  readonly rootPageId: string;
+}
+
+/** Bounded result shared by the local Cortex setup and status commands. */
+export interface CortexSetupResult {
+  readonly configuration: "unconfigured" | "ready";
+  readonly created: boolean;
+  readonly error?: SafeErrorCode;
+}
+
 /** Optional extension used only by the explicit settings onboarding control. */
 export interface SetupWorkerController extends WorkerController {
   connectNotion(input: NotionConnectionInput): Promise<NotionConnectionResult>;
+}
+
+/** Optional extension for configuring and inspecting the dedicated Cortex tree. */
+export interface CortexWorkerController extends WorkerController {
+  configureCortex(input: CortexSetupInput): Promise<CortexSetupResult>;
+  cortexStatus(): Promise<CortexSetupResult>;
 }
 
 /** An optional extension used only for a debounced vault event reason. */
@@ -155,6 +172,14 @@ function validConnectionInput(value: unknown): value is NotionConnectionInput {
   );
 }
 
+function validCortexSetupInput(value: unknown): value is CortexSetupInput {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    UUID_PATTERN.test((value as CortexSetupInput).rootPageId)
+  );
+}
+
 function isSafeErrorCode(value: unknown): value is SafeErrorCode {
   return typeof value === "string" && (SAFE_ERROR_CODES as readonly string[]).includes(value);
 }
@@ -221,12 +246,47 @@ function setupArguments(locator: ExternalLocator, input: NotionConnectionInput):
   });
 }
 
+function cortexSetupArguments(locator: ExternalLocator, input: CortexSetupInput): WorkerCommand {
+  if (!validCortexSetupInput(input)) throw controllerError();
+  return Object.freeze({
+    executable: locator.nodeExecutable,
+    args: Object.freeze([
+      locator.workerPath,
+      "setup",
+      "cortex",
+      "apply",
+      "--vault",
+      locator.vaultRoot,
+      "--root-page-id",
+      input.rootPageId,
+      "--json",
+    ]),
+    shell: false,
+  });
+}
+
+function cortexStatusArguments(locator: ExternalLocator): WorkerCommand {
+  return Object.freeze({
+    executable: locator.nodeExecutable,
+    args: Object.freeze([
+      locator.workerPath,
+      "setup",
+      "cortex",
+      "status",
+      "--vault",
+      locator.vaultRoot,
+      "--json",
+    ]),
+    shell: false,
+  });
+}
+
 /**
  * Runs the already-installed worker through a fixed argv boundary.  It holds
  * one queue for manual/event/service operations so concurrent UI gestures
  * cannot create overlapping processes.
  */
-export class LocalWorkerController implements EventWorkerController, SetupWorkerController {
+export class LocalWorkerController implements EventWorkerController, SetupWorkerController, CortexWorkerController {
   private tail: Promise<void> = Promise.resolve();
 
   public constructor(
@@ -251,6 +311,14 @@ export class LocalWorkerController implements EventWorkerController, SetupWorker
 
   public connectNotion(input: NotionConnectionInput): Promise<NotionConnectionResult> {
     return this.enqueue(() => this.runSetup(input));
+  }
+
+  public configureCortex(input: CortexSetupInput): Promise<CortexSetupResult> {
+    return this.enqueue(() => this.runCortexSetup(cortexSetupArguments(this.locator, input)));
+  }
+
+  public cortexStatus(): Promise<CortexSetupResult> {
+    return this.enqueue(() => this.runCortexSetup(cortexStatusArguments(this.locator)));
   }
 
   public installService(): Promise<ServiceStatus> {
@@ -310,8 +378,16 @@ export class LocalWorkerController implements EventWorkerController, SetupWorker
   }
 
   private async runSetup(input: NotionConnectionInput): Promise<NotionConnectionResult> {
+    return this.runSetupCommand(setupArguments(this.locator, input));
+  }
+
+  private async runCortexSetup(command: WorkerCommand): Promise<CortexSetupResult> {
+    return this.runSetupCommand(command);
+  }
+
+  private async runSetupCommand(command: WorkerCommand): Promise<NotionConnectionResult> {
     try {
-      const result = await this.runner.run(setupArguments(this.locator, input));
+      const result = await this.runner.run(command);
       if (!validWorkerResult(result)) throw controllerError();
       const connection = parseConnectionResult(result.stdout);
       if (result.code === 0 && connection.error === undefined) return connection;
@@ -364,4 +440,11 @@ export function supportsEventSync(controller: WorkerController): controller is E
 
 export function supportsNotionSetup(controller: WorkerController): controller is SetupWorkerController {
   return typeof (controller as Partial<SetupWorkerController>).connectNotion === "function";
+}
+
+export function supportsCortexSetup(controller: WorkerController): controller is CortexWorkerController {
+  return (
+    typeof (controller as Partial<CortexWorkerController>).configureCortex === "function" &&
+    typeof (controller as Partial<CortexWorkerController>).cortexStatus === "function"
+  );
 }

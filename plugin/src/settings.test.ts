@@ -90,4 +90,42 @@ describe("Grandbox Bridge settings", () => {
       "Grandbox Bridge: enter a Notion parent-page URL (not a workspace ID) and integration token.",
     ]);
   });
+
+  it("configures The Cortex from a root page reference without rendering a token field", async () => {
+    const calls: string[] = [];
+    const roots: string[] = [];
+    const app = new App();
+    const actions = {
+      preview: async () => undefined,
+      syncNow: async () => { calls.push("sync-notes"); },
+      installService: async () => undefined,
+      disableService: async () => undefined,
+      connectNotion: async () => undefined,
+      status: async () => ({ configuration: "ready" as const, service: "disabled" as const }),
+      configureCortex: async (input: { readonly rootPageId: string }) => {
+        roots.push(input.rootPageId);
+        calls.push("configure-cortex");
+      },
+      syncCortex: async () => { calls.push("sync-cortex"); },
+      cortexStatus: async () => { calls.push("cortex-status"); },
+    };
+    const tab = new GrandboxBridgeSettingTab(app, new Plugin(app, { id: "grandbox-bridge" }), actions);
+
+    tab.display();
+    await Promise.resolve();
+    const cortex = tab.containerEl.settings.find((setting) => setting.name === "The Cortex");
+    const root = cortex?.texts.find((text) => text.placeholder === "The Cortex root page URL or ID");
+    const cortexButtons = tab.containerEl.settings.flatMap((setting) => setting.buttons);
+
+    root?.setValue("https://app.notion.com/p/The-Cortex-22222222222242228222222222222222?source=copy_link");
+    await cortexButtons.find((button) => button.label === "Connect The Cortex")?.click();
+    await cortexButtons.find((button) => button.label === "Sync The Cortex")?.click();
+    await cortexButtons.find((button) => button.label === "Cortex status")?.click();
+
+    expect(roots).toEqual(["22222222-2222-4222-8222-222222222222"]);
+    expect(calls).toEqual(["configure-cortex", "sync-cortex", "cortex-status"]);
+    expect(cortex?.texts.map((text) => text.placeholder)).toEqual(["The Cortex root page URL or ID"]);
+    expect(cortex?.texts.some((text) => /token/i.test(text.placeholder))).toBe(false);
+    expect(root?.getValue()).toBe("");
+  });
 });

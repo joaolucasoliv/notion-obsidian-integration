@@ -100,6 +100,76 @@ describe("LocalWorkerController", () => {
     }]);
   });
 
+  it("configures The Cortex through a token-free fixed argv command", async () => {
+    const commands: WorkerCommand[] = [];
+    const runner: WorkerProcessRunner = {
+      run: async (command) => {
+        commands.push(command);
+        return { code: 0, stdout: '{"configuration":"ready","created":true}\n' };
+      },
+    };
+    const controller = new LocalWorkerController(locator(), runner, {
+      install: async () => ({ enabled: true }),
+      disable: async () => ({ enabled: false }),
+      status: async () => ({ configuration: "ready", service: "disabled" }),
+    });
+
+    await expect(controller.configureCortex({ rootPageId: PARENT_PAGE_ID })).resolves.toEqual({
+      configuration: "ready",
+      created: true,
+    });
+
+    expect(commands).toEqual([{
+      executable: "/usr/local/bin/node",
+      args: [
+        "/synthetic/vault/.obsidian/plugins/grandbox-bridge/bridge-worker.cjs",
+        "setup",
+        "cortex",
+        "apply",
+        "--vault",
+        "/synthetic/vault",
+        "--root-page-id",
+        PARENT_PAGE_ID,
+        "--json",
+      ],
+      shell: false,
+    }]);
+  });
+
+  it("reads The Cortex status through the bounded local command", async () => {
+    const commands: WorkerCommand[] = [];
+    const runner: WorkerProcessRunner = {
+      run: async (command) => {
+        commands.push(command);
+        return { code: 0, stdout: '{"configuration":"ready","created":false}\n' };
+      },
+    };
+    const controller = new LocalWorkerController(locator(), runner, {
+      install: async () => ({ enabled: true }),
+      disable: async () => ({ enabled: false }),
+      status: async () => ({ configuration: "ready", service: "disabled" }),
+    });
+
+    await expect(controller.cortexStatus()).resolves.toEqual({
+      configuration: "ready",
+      created: false,
+    });
+
+    expect(commands).toEqual([{
+      executable: "/usr/local/bin/node",
+      args: [
+        "/synthetic/vault/.obsidian/plugins/grandbox-bridge/bridge-worker.cjs",
+        "setup",
+        "cortex",
+        "status",
+        "--vault",
+        "/synthetic/vault",
+        "--json",
+      ],
+      shell: false,
+    }]);
+  });
+
   it("returns a safe setup failure result from the worker instead of discarding it", async () => {
     const runner: WorkerProcessRunner = {
       run: async () => ({
