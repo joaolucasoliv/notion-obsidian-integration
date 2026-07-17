@@ -1,3 +1,5 @@
+import type { CortexTreeConfigV1, CortexTreeStateV1 } from "./cortex.ts";
+
 export type PairStatus =
   | "synced"
   | "conflict"
@@ -24,13 +26,28 @@ export interface PairStateV1 {
   lastSyncedAt: string;
 }
 
-export interface BridgeStateV1 {
-  schemaVersion: 1;
+interface BridgeStateFields {
   installationId: string;
   pairs: Record<string, PairStateV1>;
   graph: GraphPublishStateV1 | null;
   lastFullReconciliationAt: string | null;
   lastRun: BridgeRunSummary | null;
+}
+
+/**
+ * Legacy direct-pair runtime state shape. It accepts a V2 envelope so the
+ * unchanged pair executor can coexist with persisted Cortex state until the
+ * dedicated Cortex orchestration task owns that pipeline.
+ */
+export interface BridgeStateV1 extends BridgeStateFields {
+  schemaVersion: 1 | 2;
+  cortex?: CortexTreeStateV1 | null;
+}
+
+/** Current persisted state format. Cortex remains independent from legacy pairs. */
+export interface BridgeStateV2 extends BridgeStateV1 {
+  schemaVersion: 2;
+  cortex: CortexTreeStateV1 | null;
 }
 
 export interface GraphPublishStateV1 {
@@ -41,8 +58,7 @@ export interface GraphPublishStateV1 {
   lastPublishedAt: string | null;
 }
 
-export interface BridgeConfigV1 {
-  schemaVersion: 1;
+interface BridgeConfigFields {
   installationId: string;
   vaultRoot: string;
   vaultFingerprint: string;
@@ -62,6 +78,17 @@ export interface BridgeConfigV1 {
       domain: "academic" | "research" | "project" | "personal" | "other";
     }>;
   };
+}
+
+/** Persisted direct-pair configuration format retained for migration reads only. */
+export interface BridgeConfigV1 extends BridgeConfigFields {
+  schemaVersion: 1;
+}
+
+/** Current persisted configuration format. Cortex is opt-in and root-scoped. */
+export interface BridgeConfigV2 extends BridgeConfigFields {
+  schemaVersion: 2;
+  cortex: CortexTreeConfigV1 | null;
 }
 
 export interface BridgeRunSummary {

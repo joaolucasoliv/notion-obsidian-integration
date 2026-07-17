@@ -1,6 +1,9 @@
 import { z } from "zod";
 
 const sha256Schema = z.string().regex(/^[0-9a-f]{64}$/, "Expected a lowercase SHA-256 hash");
+const canonicalUuidSchema = z
+  .string()
+  .regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/, "Expected a canonical UUID");
 const loopbackHosts = new Set(["localhost", "127.0.0.1", "[::1]"]);
 
 function persistedWebUrlSchema(options: { bareOrigin: boolean }) {
@@ -86,6 +89,15 @@ const graphConfigSchema = z
   .strict()
   .readonly();
 
+export const cortexTreeConfigV1Schema = z
+  .object({
+    rootPageId: canonicalUuidSchema,
+    rootFilePath: z.literal("The Cortex.md"),
+    rootDirectoryPath: z.literal("The Cortex"),
+  })
+  .strict()
+  .readonly();
+
 export const bridgeConfigV1Schema = z
   .object({
     schemaVersion: z.literal(1),
@@ -99,8 +111,34 @@ export const bridgeConfigV1Schema = z
   .strict()
   .readonly();
 
-export type ParsedBridgeConfigV1 = z.infer<typeof bridgeConfigV1Schema>;
+export const bridgeConfigV2Schema = z
+  .object({
+    schemaVersion: z.literal(2),
+    installationId: z.uuid(),
+    vaultRoot: z.string().min(1),
+    vaultFingerprint: sha256Schema,
+    notion: notionConfigSchema.nullable(),
+    relay: relayConfigSchema.nullable(),
+    graph: graphConfigSchema.nullable(),
+    cortex: cortexTreeConfigV1Schema.nullable(),
+  })
+  .strict()
+  .readonly();
 
-export function parseBridgeConfig(input: unknown): ParsedBridgeConfigV1 {
-  return bridgeConfigV1Schema.parse(input);
+export type ParsedLegacyBridgeConfigV1 = z.infer<typeof bridgeConfigV1Schema>;
+export type ParsedBridgeConfigV2 = z.infer<typeof bridgeConfigV2Schema>;
+/** @deprecated Runtime configuration is normalized to V2; retained for current adapter compatibility. */
+export type ParsedBridgeConfigV1 = ParsedBridgeConfigV2;
+
+export function parseBridgeConfig(input: unknown): ParsedBridgeConfigV2 {
+  if (
+    typeof input === "object" &&
+    input !== null &&
+    !Array.isArray(input) &&
+    (input as { schemaVersion?: unknown }).schemaVersion === 1
+  ) {
+    const legacy = bridgeConfigV1Schema.parse(input);
+    return bridgeConfigV2Schema.parse({ ...legacy, schemaVersion: 2, cortex: null });
+  }
+  return bridgeConfigV2Schema.parse(input);
 }

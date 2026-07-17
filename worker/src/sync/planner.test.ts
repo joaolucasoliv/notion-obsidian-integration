@@ -7,6 +7,7 @@ const OTHER_BRIDGE_ID = "22222222-2222-4222-8222-222222222222";
 const PAGE_ID = "33333333-3333-4333-8333-333333333333";
 const OTHER_PAGE_ID = "44444444-4444-4444-8444-444444444444";
 const PAGE_URL = `https://www.notion.so/Alpha-${PAGE_ID.replaceAll("-", "")}`;
+const APP_PAGE_URL = `https://app.notion.com/${PAGE_ID.replaceAll("-", "")}`;
 const COMMON_HASH = "1".repeat(64);
 const LOCAL_HASH = "2".repeat(64);
 const NOTION_HASH = "3".repeat(64);
@@ -142,6 +143,16 @@ describe("planPair", () => {
   ] as const)("local changed=%s notion changed=%s => %s", (localChanged, notionChanged, action) => {
     const input = planningFixture({ localChanged, notionChanged });
     expect(planPair(input).action).toBe(action);
+  });
+
+  it("accepts canonical app.notion.com page URLs returned by the current page API", () => {
+    const input = mutable(planningFixture());
+    input.notion.pageUrl = APP_PAGE_URL;
+
+    const plan = planPair(input as PairPlanningInput);
+
+    expect(plan.action).toBe("noop");
+    expect(plan.error).toBeNull();
   });
 
   it("treats equal simultaneous semantic edits as convergence instead of a conflict", () => {

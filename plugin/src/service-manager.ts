@@ -54,12 +54,14 @@ function checkedLocator(locator: ExternalLocator): ExternalLocator {
     const expected = deriveExternalLocator({
       installationId: locator.installationId,
       homeDirectory: locator.homeDirectory,
+      vaultRoot: locator.vaultRoot,
       nodeExecutable: locator.nodeExecutable,
       workerPath: locator.workerPath,
     });
     if (
       locator.runtimeRoot !== expected.runtimeRoot ||
       locator.configPath !== expected.configPath ||
+      locator.vaultRoot !== expected.vaultRoot ||
       locator.installationId !== expected.installationId
     ) {
       throw serviceManagerError();

@@ -14,6 +14,7 @@ const BRIDGE_ID = "11111111-1111-4111-8111-111111111111";
 const OTHER_BRIDGE_ID = "22222222-2222-4222-8222-222222222222";
 const PAGE_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const PAGE_URL = "https://www.notion.so/Paired-aaaaaaaaaaaa4aaa8aaaaaaaaaaaaaaa";
+const APP_PAGE_URL = "https://app.notion.com/aaaaaaaaaaaa4aaa8aaaaaaaaaaaaaaa";
 const OTHER_PAGE_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 const OTHER_PAGE_URL = "https://www.notion.so/Other-bbbbbbbbbbbb4bbb8bbbbbbbbbbbbbbb";
 
@@ -67,6 +68,45 @@ describe("Notion Markdown mapping", () => {
     );
   });
 
+  it("restores separate plain-text blocks from Notion's single-newline markdown response", () => {
+    const local = normalizeLocal(parseMarkdown("# Title\n\nFirst paragraph.\n\nSecond paragraph.\n"), ["alpha"]);
+
+    const decoded = fromNotionMarkdown("# Title\nFirst paragraph.\nSecond paragraph.", FIXTURE_LINKS, ["alpha"]);
+
+    expect(decoded.semantic).toEqual(local);
+  });
+
+  it("restores a plain Notion block boundary before escaping a wiki-looking literal", () => {
+    const decoded = fromNotionMarkdown("First paragraph.\nSecond [[literal]]", FIXTURE_LINKS);
+
+    expect(decoded.markdown).toBe("First paragraph.\n\nSecond \\[\\[literal\\]\\]\n");
+    expect(toNotionMarkdown(decoded.semantic, FIXTURE_LINKS).unsupportedKinds).toEqual([]);
+  });
+
+  it("restores a plain Notion block boundary before reversing a paired link", () => {
+    const decoded = fromNotionMarkdown(`First paragraph.\n[paired](${PAGE_URL})`, FIXTURE_LINKS);
+
+    expect(decoded.markdown).toBe("First paragraph.\n\n[[Research/Paired Note.md|paired]]\n");
+    expect(toNotionMarkdown(decoded.semantic, FIXTURE_LINKS).unsupportedKinds).toEqual([]);
+  });
+
+  it("fails closed for a local soft wrap whose Markdown-special source is ambiguous to Notion", () => {
+    const mapped = toNotionMarkdown({ bodyMarkdown: "Line one\n$literal\n", tags: [] }, FIXTURE_LINKS);
+
+    expect(mapped.unsupportedKinds).toEqual(["ambiguous-soft-break"]);
+  });
+
+  it.each([
+    ["formatted content", "First\n**bold**\n"],
+    ["an external link", "First\n[external](https://example.com)\n"],
+    ["a paired Markdown link", "First\n[paired](<Research/Paired Note.md>)\n"],
+    ["inline code", "First\n`literal`\n"],
+  ])("fails closed for a local soft wrap before %s", (_kind, source) => {
+    const mapped = toNotionMarkdown({ bodyMarkdown: source, tags: [] }, FIXTURE_LINKS);
+
+    expect(mapped.unsupportedKinds).toEqual(["ambiguous-soft-break"]);
+  });
+
   it("maps a conservative local Markdown link only on an exact normalized target", () => {
     const exact = normalizeLocal(
       parseMarkdown("[paired](<Research/Paired Note.md>) and [readable](Missing.md)\n"),
@@ -78,6 +118,20 @@ describe("Notion Markdown mapping", () => {
       `[paired](${PAGE_URL} "grandbox-bridge:local-link:v1") and [readable](Missing.md)\n`,
     );
     expect(fromNotionMarkdown(mapped.markdown, FIXTURE_LINKS).semantic).toEqual(exact);
+  });
+
+  it("accepts canonical app.notion.com page URLs returned by the current page API", () => {
+    const links: LinkMapping = {
+      byLocalTarget: new Map([
+        ["Research/Paired Note.md", { bridgeId: BRIDGE_ID, notionPageUrl: APP_PAGE_URL }],
+      ]),
+      byNotionPageId: FIXTURE_LINKS.byNotionPageId,
+    };
+    const exact = normalizeLocal(parseMarkdown("[[Research/Paired Note.md]]\n"));
+
+    expect(toNotionMarkdown(exact, links).markdown).toBe(
+      `[Research/Paired Note.md](${APP_PAGE_URL})\n`,
+    );
   });
 
   it("preserves malformed wiki syntax as escaped literal source and reports it", async () => {
@@ -487,7 +541,7 @@ describe("Notion Markdown mapping", () => {
       const reversed = fromNotionMarkdown(source, FIXTURE_LINKS);
 
       expect(reversed.markdown).toBe(
-        `${prefixCollisions}\n${"[[x]]".repeat(constructCount)}\n`,
+        `${prefixCollisions}\n\n${"[[x]]".repeat(constructCount)}\n`,
       );
       expect(prefixChecks).toBeLessThanOrEqual(8);
       expect(restorationPasses).toBe(1);

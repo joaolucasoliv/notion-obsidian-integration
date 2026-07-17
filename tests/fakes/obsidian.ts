@@ -169,10 +169,31 @@ export class FakeButtonComponent {
   }
 }
 
+export class FakeTextComponent {
+  public placeholder = "";
+  public value = "";
+  public readonly inputEl = { type: "text" };
+
+  public setPlaceholder(placeholder: string): this {
+    this.placeholder = placeholder;
+    return this;
+  }
+
+  public setValue(value: string): this {
+    this.value = value;
+    return this;
+  }
+
+  public getValue(): string {
+    return this.value;
+  }
+}
+
 export class FakeSetting {
   public name = "";
   public description = "";
   public readonly buttons: FakeButtonComponent[] = [];
+  public readonly texts: FakeTextComponent[] = [];
 }
 
 export class FakeContainer {
@@ -216,6 +237,13 @@ export class Setting {
     const button = new FakeButtonComponent();
     this.setting.buttons.push(button);
     configure(button);
+    return this;
+  }
+
+  public addText(configure: (text: FakeTextComponent) => unknown): this {
+    const text = new FakeTextComponent();
+    this.setting.texts.push(text);
+    configure(text);
     return this;
   }
 }

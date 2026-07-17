@@ -130,6 +130,64 @@ function emptyMarkdown(): Record<string, unknown> {
   return fixture<Record<string, unknown>>("page-markdown-empty.json");
 }
 
+function cortexRoot(): Record<string, unknown> {
+  return fixture<Record<string, unknown>>("cortex-root.json");
+}
+
+function cortexChildOne(): Record<string, unknown> {
+  return fixture<Record<string, unknown>>("cortex-child-page-1.json");
+}
+
+function cortexChildTwo(): Record<string, unknown> {
+  return fixture<Record<string, unknown>>("cortex-child-page-2.json");
+}
+
+function cortexMarkdown(): Record<string, unknown> {
+  return fixture<Record<string, unknown>>("cortex-markdown.json");
+}
+
+function cortexMarkdownFor(pageId: string, markdown = "Body"): Record<string, unknown> {
+  const value = cortexMarkdown() as Record<string, any>;
+  value.id = pageId;
+  value.markdown = markdown;
+  return value;
+}
+
+function blockChildren(ids: readonly string[], hasMore = false, nextCursor: string | null = null): Record<string, unknown> {
+  return {
+    object: "list",
+    results: ids.map((id) => ({ object: "block", id, type: "child_page", child_page: { title: id } })),
+    has_more: hasMore,
+    next_cursor: nextCursor,
+  };
+}
+
+function regularCortexPage(pageId: string, parentPageId: string, title = "Cortex page"): Record<string, unknown> {
+  return {
+    object: "page",
+    id: pageId,
+    url: `https://www.notion.so/Cortex-${pageId.replaceAll("-", "")}`,
+    last_edited_time: "2026-07-15T12:00:00.000Z",
+    in_trash: false,
+    parent: { type: "page_id", page_id: parentPageId },
+    properties: {
+      title: {
+        id: "title",
+        type: "title",
+        title: [{ type: "text", plain_text: title, text: { content: title } }],
+      },
+    },
+  };
+}
+
+function cortexAncestorChain(rootPageId: string, depth: number): readonly Record<string, unknown>[] {
+  const pageIds = Array.from(
+    { length: depth },
+    (_unused, index) => `70000000-0000-4000-8000-${(index + 1).toString(16).padStart(12, "0")}`,
+  );
+  return pageIds.map((pageId, index) => regularCortexPage(pageId, index === 0 ? rootPageId : pageIds[index - 1] as string, `Depth ${index + 1}`));
+}
+
 function commonHeaders(hasBody = false): Record<string, string> {
   return {
     Authorization: TEST_CREDENTIALS.authorization,
@@ -148,7 +206,487 @@ function expectSafeClientError(error: unknown, code: string, retryable: boolean)
   expect(rendered).not.toContain("Bearer");
 }
 
+function expectSafeCortexError(error: unknown, code: string, retryable: boolean): void {
+  expect(error).toBeInstanceOf(Error);
+  expect((error as { code?: unknown }).code).toBe(code);
+  expect((error as { retryable?: unknown }).retryable).toBe(retryable);
+  const rendered = `${String(error)} ${JSON.stringify(error)} ${Object.values(error as object).join(" ")}`;
+  expect(rendered).not.toContain(TOKEN);
+  expect(rendered).not.toContain("Bearer");
+}
+
 describe("NotionClient request contract", () => {
+  it("discovers a title-only regular page without requiring Grandbox Notes properties", async () => {
+    const root = cortexRoot();
+    const rootId = root.id as string;
+    const transport = new RecordingTransport([
+      response(root),
+      response(cortexMarkdown()),
+      response({ object: "list", results: [], has_more: false, next_cursor: null }),
+    ]);
+    const cortex = (client(transport).value as unknown as {
+      readonly cortexTree: { discoverCortexTree(input: { rootPageId: string; maxDepth: number; maxPages: number }): Promise<unknown> };
+    }).cortexTree;
+
+    await expect(cortex.discoverCortexTree({ rootPageId: rootId, maxDepth: 32, maxPages: 5 })).resolves.toMatchObject({
+      rootPageId: rootId,
+      complete: true,
+      pages: [expect.objectContaining({ pageId: rootId, parentPageId: null, title: "The Cortex" })],
+    });
+  });
+
+  it("uses paginated block-children requests and deterministic child IDs for regular-page discovery", async () => {
+    const root = cortexRoot();
+    const childOne = cortexChildOne();
+    const childTwo = cortexChildTwo();
+    const rootId = root.id as string;
+    const childOneId = childOne.id as string;
+    const childTwoId = childTwo.id as string;
+    (childTwo as Record<string, any>).parent.page_id = rootId;
+    const transport = new RecordingTransport([
+      response(root),
+      response(cortexMarkdownFor(rootId)),
+      response({ ...blockChildren([childTwoId]), has_more: true, next_cursor: "cursor /?&" }),
+      response(blockChildren([childOneId])),
+      response(childOne),
+      response(cortexMarkdownFor(childOneId)),
+      response(blockChildren([])),
+      response(childTwo),
+      response(cortexMarkdownFor(childTwoId)),
+      response(blockChildren([])),
+    ]);
+
+    const result = await client(transport).value.cortexTree.discoverCortexTree({ rootPageId: rootId, maxDepth: 32, maxPages: 5 });
+
+    expect(result.pages.map((candidate) => candidate.pageId)).toEqual([rootId, childOneId, childTwoId]);
+    expect(result.pages[0]).toMatchObject({ parentPageId: null, directChildPageIds: [childTwoId, childOneId] });
+    expect(transport.requests.filter((request) => request.path.includes("/children")).map(({ path, query }) => ({ path, query }))).toEqual([
+      { path: `/v1/blocks/${rootId}/children`, query: { page_size: "100" } },
+      { path: `/v1/blocks/${rootId}/children`, query: { page_size: "100", start_cursor: "cursor /?&" } },
+      { path: `/v1/blocks/${childOneId}/children`, query: { page_size: "100" } },
+      { path: `/v1/blocks/${childTwoId}/children`, query: { page_size: "100" } },
+    ]);
+  });
+
+  it.each([403, 404])("returns attention rather than a missing child when regular-page access is denied (%i)", async (status) => {
+    const root = cortexRoot();
+    const childOne = cortexChildOne();
+    const rootId = root.id as string;
+    const childOneId = childOne.id as string;
+    const transport = new RecordingTransport([
+      response(root),
+      response(cortexMarkdownFor(rootId)),
+      response(blockChildren([childOneId])),
+      response({ message: "inaccessible" }, status),
+    ]);
+
+    const result = await client(transport).value.cortexTree.discoverCortexTree({ rootPageId: rootId, maxDepth: 32, maxPages: 5 });
+
+    expect(result).toMatchObject({
+      complete: false,
+      pages: [expect.objectContaining({ pageId: rootId })],
+      attention: [{ kind: "inaccessible", pageId: childOneId }],
+    });
+  });
+
+  it("marks an unsupported regular-page object invalid without treating it as missing", async () => {
+    const root = cortexRoot();
+    const childOne = cortexChildOne();
+    const rootId = root.id as string;
+    const childOneId = childOne.id as string;
+    const transport = new RecordingTransport([
+      response(root),
+      response(cortexMarkdownFor(rootId)),
+      response(blockChildren([childOneId])),
+      response({ object: "database" }),
+    ]);
+
+    const result = await client(transport).value.cortexTree.discoverCortexTree({ rootPageId: rootId, maxDepth: 32, maxPages: 5 });
+
+    expect(result).toMatchObject({
+      complete: false,
+      pages: [expect.objectContaining({ pageId: rootId })],
+      attention: [{ kind: "invalid-page", pageId: childOneId }],
+    });
+  });
+
+  it("does not expose an out-of-root page through root-scoped retrieval", async () => {
+    const root = cortexRoot();
+    const child = cortexChildOne() as Record<string, any>;
+    const external = cortexChildTwo() as Record<string, any>;
+    const rootId = root.id as string;
+    const childId = child.id as string;
+    child.parent.page_id = OTHER_PAGE_ID;
+    external.id = OTHER_PAGE_ID;
+    external.url = (external.url as string).replaceAll("33333333333343338333333333333333", "44444444444444448444444444444444");
+    external.parent.page_id = OTHER_PAGE_ID;
+    const transport = new RecordingTransport([response(child), response(external)]);
+
+    const error = await client(transport).value.cortexTree.retrieveCortexPage({ rootPageId: rootId, pageId: childId }).catch((caught) => caught);
+
+    expectSafeCortexError(error, "revision-race", false);
+    expect(transport.requests).toEqual([
+      expect.objectContaining({ method: "GET", path: `/v1/pages/${childId}` }),
+      expect.objectContaining({ method: "GET", path: `/v1/pages/${OTHER_PAGE_ID}` }),
+    ]);
+  });
+
+  it("creates a title-only regular page below a revision-checked page parent", async () => {
+    const root = cortexRoot();
+    const child = cortexChildOne();
+    const rootId = root.id as string;
+    const childId = child.id as string;
+    const transport = new RecordingTransport([
+      response(root),
+      response(cortexMarkdownFor(rootId)),
+      response(blockChildren([])),
+      response(child),
+      response(child),
+      response(cortexMarkdownFor(childId, "Created body")),
+      response(blockChildren([])),
+      response(child),
+    ]);
+
+    const result = await client(transport).value.cortexTree.createCortexPage({
+      rootPageId: rootId,
+      parentPageId: rootId,
+      title: "Research",
+      markdown: "Created body",
+      expectedParentEditedAt: root.last_edited_time as string,
+    });
+
+    expect(result).toMatchObject({ pageId: childId, parentPageId: rootId, title: "Research", directChildPageIds: [] });
+    expect(transport.requests).toHaveLength(8);
+    expect(transport.requests[7]).toMatchObject({ method: "GET", path: `/v1/pages/${childId}` });
+    expect(transport.requests[3]).toEqual({
+      method: "POST",
+      path: "/v1/pages",
+      headers: commonHeaders(true),
+      body: {
+        parent: { type: "page_id", page_id: rootId },
+        properties: { title: { title: [{ type: "text", text: { content: "Research" } }] } },
+        markdown: "Created body",
+      },
+      timeoutMs: 15_000,
+      maxBytes: 2 * 1024 * 1024,
+    });
+  });
+
+  it("rechecks title revisions and never sends a stale regular-page mutation", async () => {
+    const root = cortexRoot();
+    const rootId = root.id as string;
+    const transport = new RecordingTransport([
+      response(root),
+      response(cortexMarkdownFor(rootId)),
+      response(blockChildren([])),
+    ]);
+
+    const error = await client(transport).value.cortexTree.updateCortexTitle({
+      rootPageId: rootId,
+      pageId: rootId,
+      title: "New Cortex",
+      observedEditedAt: "2026-07-15T11:59:00.000Z",
+    }).catch((caught) => caught);
+
+    expectSafeCortexError(error, "revision-race", false);
+    expect(transport.requests).toHaveLength(3);
+    expect(transport.requests.some((request) => request.method === "PATCH")).toBe(false);
+  });
+
+  it("updates a regular-page title through only its title property", async () => {
+    const root = cortexRoot();
+    const child = cortexChildOne() as Record<string, any>;
+    const rootId = root.id as string;
+    const childId = child.id as string;
+    const updated = clone(child) as Record<string, any>;
+    updated.properties.title.title[0].plain_text = "Research Notes";
+    updated.properties.title.title[0].text.content = "Research Notes";
+    updated.last_edited_time = "2026-07-15T12:03:00.000Z";
+    const transport = new RecordingTransport([
+      response(child),
+      response(child),
+      response(cortexMarkdownFor(childId)),
+      response(blockChildren([])),
+      response(updated),
+      response(updated),
+      response(cortexMarkdownFor(childId)),
+      response(blockChildren([])),
+      response(updated),
+    ]);
+
+    const result = await client(transport).value.cortexTree.updateCortexTitle({
+      rootPageId: rootId,
+      pageId: childId,
+      title: "Research Notes",
+      observedEditedAt: child.last_edited_time,
+    });
+
+    expect(result).toMatchObject({ pageId: childId, title: "Research Notes", parentPageId: rootId });
+    expect(transport.requests).toHaveLength(9);
+    expect(transport.requests[8]).toMatchObject({ method: "GET", path: `/v1/pages/${childId}` });
+    expect(transport.requests[4]).toMatchObject({
+      method: "PATCH",
+      path: `/v1/pages/${childId}`,
+      body: { properties: { title: { title: [{ type: "text", text: { content: "Research Notes" } }] } } },
+    });
+  });
+
+  it("fails closed when a post-title ancestor leaves the configured root after preflight", async () => {
+    const root = cortexRoot();
+    const ancestor = cortexChildOne() as Record<string, any>;
+    const target = cortexChildTwo() as Record<string, any>;
+    const rootId = root.id as string;
+    const targetId = target.id as string;
+    const updated = clone(target) as Record<string, any>;
+    updated.properties.title.title[0].plain_text = "Project Renamed";
+    updated.properties.title.title[0].text.content = "Project Renamed";
+    updated.last_edited_time = "2026-07-15T12:04:00.000Z";
+    const ancestorMoved = clone(ancestor) as Record<string, any>;
+    ancestorMoved.parent.page_id = OTHER_PAGE_ID;
+    const outside = regularCortexPage(OTHER_PAGE_ID, OTHER_PAGE_ID, "Outside Cortex");
+    const transport = new RecordingTransport([
+      response(target),
+      response(ancestor),
+      response(target),
+      response(cortexMarkdownFor(targetId)),
+      response(blockChildren([])),
+      response(updated),
+      response(updated),
+      response(cortexMarkdownFor(targetId)),
+      response(blockChildren([])),
+      response(updated),
+      response(ancestorMoved),
+      response(outside),
+    ]);
+
+    const error = await client(transport).value.cortexTree.updateCortexTitle({
+      rootPageId: rootId,
+      pageId: targetId,
+      title: "Project Renamed",
+      observedEditedAt: target.last_edited_time,
+    }).catch((caught) => caught);
+
+    expectSafeCortexError(error, "revision-race", false);
+    expect(transport.requests.some((request) => request.method === "PATCH")).toBe(true);
+  });
+
+  it("does not retry an ambiguous Cortex page creation", async () => {
+    const root = cortexRoot();
+    const rootId = root.id as string;
+    const transport = new RecordingTransport([
+      response(root),
+      response(cortexMarkdownFor(rootId)),
+      response(blockChildren([])),
+      new NotionTransportError("timeout"),
+    ]);
+
+    const error = await client(transport).value.cortexTree.createCortexPage({
+      rootPageId: rootId,
+      parentPageId: rootId,
+      title: "Research",
+      markdown: "Created body",
+      expectedParentEditedAt: root.last_edited_time as string,
+    }).catch((caught) => caught);
+
+    expectSafeClientError(error, "timeout", true);
+    expect(transport.requests).toHaveLength(4);
+    expect(transport.requests[3]).toMatchObject({ method: "POST", path: "/v1/pages" });
+  });
+
+  it("rejects creation below a depth-32 parent before sending POST", async () => {
+    const root = cortexRoot();
+    const rootId = root.id as string;
+    const ancestors = cortexAncestorChain(rootId, 32);
+    const parent = ancestors[31] as Record<string, unknown>;
+    const parentId = parent.id as string;
+    const transport = new RecordingTransport([...ancestors].reverse().map((entry) => response(entry)));
+
+    const error = await client(transport).value.cortexTree.createCortexPage({
+      rootPageId: rootId,
+      parentPageId: parentId,
+      title: "Too deep",
+      markdown: "Body",
+      expectedParentEditedAt: parent.last_edited_time as string,
+    }).catch((caught) => caught);
+
+    expectSafeCortexError(error, "revision-race", false);
+    expect(transport.requests).toHaveLength(32);
+    expect(transport.requests.some((request) => request.method === "POST")).toBe(false);
+  });
+
+  it("updates regular-page bodies only when ordered child-page markers match the fresh snapshot", async () => {
+    const root = cortexRoot();
+    const child = cortexChildOne();
+    const grandchild = cortexChildTwo();
+    const rootId = root.id as string;
+    const childId = child.id as string;
+    const grandchildId = grandchild.id as string;
+    const firstChildPageId = OTHER_PAGE_ID;
+    const updatedChild = clone(child) as Record<string, any>;
+    updatedChild.last_edited_time = "2026-07-15T12:03:00.000Z";
+    const firstMarker = `<!-- grandbox-cortex:child-page:${firstChildPageId} -->`;
+    const secondMarker = `<!-- grandbox-cortex:child-page:${grandchildId} -->`;
+    const transport = new RecordingTransport([
+      response(child),
+      response(child),
+      response(cortexMarkdownFor(childId, "old body")),
+      response(blockChildren([firstChildPageId, grandchildId])),
+      response(cortexMarkdownFor(childId, "new body")),
+      response(updatedChild),
+      response(cortexMarkdownFor(childId, "new body")),
+      response(blockChildren([firstChildPageId, grandchildId])),
+      response(updatedChild),
+    ]);
+
+    const result = await client(transport).value.cortexTree.updateCortexBodyExact({
+      rootPageId: rootId,
+      pageId: childId,
+      oldMarkdown: `old body${firstMarker}${secondMarker}`,
+      newMarkdown: `new body${firstMarker}${secondMarker}`,
+      observedEditedAt: child.last_edited_time as string,
+    });
+
+    expect(result).toMatchObject({ pageId: childId, directChildPageIds: [firstChildPageId, grandchildId] });
+    expect(transport.requests).toHaveLength(9);
+    expect(transport.requests[8]).toMatchObject({ method: "GET", path: `/v1/pages/${childId}` });
+    expect(transport.requests[4]).toMatchObject({
+      method: "PATCH",
+      path: `/v1/pages/${childId}/markdown`,
+      body: { type: "update_content", update_content: { content_updates: [{ old_str: "old body", new_str: "new body" }] } },
+    });
+    expect(JSON.stringify(transport.requests[4]?.body)).not.toContain("allow_deleting_content");
+  });
+
+  it("rejects a regular-page body write before PATCH when its child-page marker order changes", async () => {
+    const root = cortexRoot();
+    const child = cortexChildOne();
+    const grandchild = cortexChildTwo();
+    const rootId = root.id as string;
+    const childId = child.id as string;
+    const grandchildId = grandchild.id as string;
+    const transport = new RecordingTransport([
+      response(child),
+      response(child),
+      response(cortexMarkdownFor(childId, "old body")),
+      response(blockChildren([grandchildId])),
+    ]);
+
+    const error = await client(transport).value.cortexTree.updateCortexBodyExact({
+      rootPageId: rootId,
+      pageId: childId,
+      oldMarkdown: "old body",
+      newMarkdown: "new body",
+      observedEditedAt: child.last_edited_time as string,
+    }).catch((caught) => caught);
+
+    expectSafeCortexError(error, "revision-race", false);
+    expect(transport.requests.some((request) => request.method === "PATCH")).toBe(false);
+  });
+
+  it("moves a regular page through Notion's page-move endpoint after a fresh revision check", async () => {
+    const root = cortexRoot();
+    const childOne = cortexChildOne();
+    const childTwo = cortexChildTwo();
+    const rootId = root.id as string;
+    const childOneId = childOne.id as string;
+    const childTwoId = childTwo.id as string;
+    const moved = clone(childTwo) as Record<string, any>;
+    moved.parent.page_id = rootId;
+    moved.last_edited_time = "2026-07-15T12:04:00.000Z";
+    const transport = new RecordingTransport([
+      response(childTwo),
+      response(childOne),
+      response(childTwo),
+      response(cortexMarkdownFor(childTwoId)),
+      response(blockChildren([])),
+      response(moved),
+      response(moved),
+      response(cortexMarkdownFor(childTwoId)),
+      response(blockChildren([])),
+      response(moved),
+    ]);
+
+    const result = await client(transport).value.cortexTree.moveCortexPage({
+      rootPageId: rootId,
+      pageId: childTwoId,
+      parentPageId: rootId,
+      observedEditedAt: childTwo.last_edited_time as string,
+    });
+
+    expect(result).toMatchObject({ pageId: childTwoId, parentPageId: rootId });
+    expect(transport.requests).toHaveLength(10);
+    expect(transport.requests[9]).toMatchObject({ method: "GET", path: `/v1/pages/${childTwoId}` });
+    expect(transport.requests[5]).toMatchObject({
+      method: "POST",
+      path: `/v1/pages/${childTwoId}/move`,
+      body: { parent: { type: "page_id", page_id: rootId } },
+    });
+  });
+
+  it("rejects a move below a depth-32 parent before reading or moving the target", async () => {
+    const root = cortexRoot();
+    const rootId = root.id as string;
+    const target = regularCortexPage(PAGE_ID, rootId, "Target");
+    const ancestors = cortexAncestorChain(rootId, 32);
+    const parent = ancestors[31] as Record<string, unknown>;
+    const parentId = parent.id as string;
+    const transport = new RecordingTransport([
+      response(target),
+      ...[...ancestors].reverse().map((entry) => response(entry)),
+    ]);
+
+    const error = await client(transport).value.cortexTree.moveCortexPage({
+      rootPageId: rootId,
+      pageId: PAGE_ID,
+      parentPageId: parentId,
+      observedEditedAt: target.last_edited_time as string,
+    }).catch((caught) => caught);
+
+    expectSafeCortexError(error, "revision-race", false);
+    expect(transport.requests).toHaveLength(33);
+    expect(transport.requests.some((request) => request.path === `/v1/pages/${PAGE_ID}/markdown`)).toBe(false);
+    expect(transport.requests.some((request) => request.method === "POST")).toBe(false);
+  });
+
+  it("rejects a move when a nested existing descendant would become depth 33", async () => {
+    const root = cortexRoot();
+    const rootId = root.id as string;
+    const target = regularCortexPage(PAGE_ID, rootId, "Target");
+    const childId = BLOCK_ID;
+    const ancestors = cortexAncestorChain(rootId, 30);
+    const parent = ancestors[29] as Record<string, unknown>;
+    const parentId = parent.id as string;
+    const moved = clone(target) as Record<string, any>;
+    moved.parent.page_id = parentId;
+    moved.last_edited_time = "2026-07-15T12:05:00.000Z";
+    const transport = new RecordingTransport([
+      response(target),
+      ...[...ancestors].reverse().map((entry) => response(entry)),
+      response(target),
+      response(cortexMarkdownFor(PAGE_ID)),
+      response(blockChildren([childId])),
+      response(blockChildren([NESTED_BLOCK_ID])),
+      response(moved),
+      response(moved),
+      response(cortexMarkdownFor(PAGE_ID)),
+      response(blockChildren([childId])),
+    ]);
+
+    const error = await client(transport).value.cortexTree.moveCortexPage({
+      rootPageId: rootId,
+      pageId: PAGE_ID,
+      parentPageId: parentId,
+      observedEditedAt: target.last_edited_time as string,
+    }).catch((caught) => caught);
+
+    expectSafeCortexError(error, "revision-race", false);
+    expect(transport.requests.some((request) => request.method === "POST")).toBe(false);
+    expect(transport.requests.filter((request) => request.path.includes("/children"))).toEqual([
+      expect.objectContaining({ path: `/v1/blocks/${PAGE_ID}/children`, query: { page_size: "100" } }),
+      expect.objectContaining({ path: `/v1/blocks/${childId}/children`, query: { page_size: "100" } }),
+    ]);
+  });
+
   it("resolves only bounded opaque block-parent hops without retrieving page content", async () => {
     const transport = new RecordingTransport([
       response({ object: "block", id: BLOCK_ID, parent: { type: "block_id", block_id: NESTED_BLOCK_ID } }),
@@ -241,7 +779,7 @@ describe("NotionClient request contract", () => {
           Tags: { multi_select: [{ name: "alpha" }, { name: "zeta" }] },
           "Sync Status": { select: { name: "Synced" } },
         },
-        markdown: "# Alpha\n",
+        markdown: "\u200B\n\n# Alpha\n",
       },
       timeoutMs: 15_000,
       maxBytes: 2 * 1024 * 1024,
@@ -271,6 +809,28 @@ describe("NotionClient request contract", () => {
       },
       timeoutMs: 15_000,
       maxBytes: 2 * 1024 * 1024,
+    });
+  });
+
+  it("prefixes a leading H1 when replacing Notion markdown so it remains page content", async () => {
+    const transport = new RecordingTransport([
+      response(page()),
+      response(markdown()),
+      response(updatedMarkdown()),
+      response(page()),
+      response(updatedMarkdown()),
+    ]);
+
+    await client(transport).value.updateBodyExact({
+      pageId: PAGE_ID,
+      oldMarkdown: "old body",
+      newMarkdown: "# Alpha\n",
+      observedEditedAt: EDITED_AT,
+    });
+
+    expect(transport.requests[2]?.body).toEqual({
+      type: "update_content",
+      update_content: { content_updates: [{ old_str: "old body", new_str: "\u200B\n\n# Alpha\n" }] },
     });
   });
 });
@@ -357,6 +917,15 @@ describe("NotionClient retries and fixed errors", () => {
 });
 
 describe("NotionClient raw page validation and decoder boundary", () => {
+  it("accepts canonical app.notion.com URLs returned by the current page API", async () => {
+    const currentPage = page() as Record<string, any>;
+    currentPage.url = `https://app.notion.com/${PAGE_ID}`;
+
+    await expect(
+      client(new RecordingTransport([response(currentPage), response(markdown())])).value.retrievePage(PAGE_ID),
+    ).resolves.toMatchObject({ kind: "present", pageId: PAGE_ID });
+  });
+
   it.each([
     ["missing managed property", (value: Record<string, any>) => { delete value.properties.Name; }],
     ["wrong managed property type", (value: Record<string, any>) => { value.properties.Name.type = "rich_text"; }],

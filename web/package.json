@@ -1,0 +1,26 @@
+{
+  "name": "@grandbox-bridge/web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "vitest run tests",
+    "typecheck": "tsc --noEmit",
+    "build": "vite build",
+    "preview": "vite preview --host 127.0.0.1 --port 4175 --strictPort"
+  },
+  "dependencies": {
+    "@grandbox-bridge/shared": "0.1.0",
+    "@zxing/browser": "0.1.5",
+    "graphology": "0.26.0",
+    "graphology-layout-forceatlas2": "0.10.1",
+    "idb": "8.0.3",
+    "sigma": "3.0.3"
+  },
+  "devDependencies": {
+    "fake-indexeddb": "6.2.5",
+    "typescript": "5.9.3",
+    "vite": "8.1.4",
+    "vitest": "4.1.10"
+  }
+}

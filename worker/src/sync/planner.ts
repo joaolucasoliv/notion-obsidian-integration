@@ -201,7 +201,8 @@ function pageIdFromValidatedUrl(value: unknown): string | null {
       parsed.hostname === "notion.so" ||
       parsed.hostname.endsWith(".notion.so") ||
       parsed.hostname === "notion.site" ||
-      parsed.hostname.endsWith(".notion.site");
+      parsed.hostname.endsWith(".notion.site") ||
+      parsed.hostname === "app.notion.com";
     if (
       parsed.protocol !== "https:" ||
       !trustedHost ||

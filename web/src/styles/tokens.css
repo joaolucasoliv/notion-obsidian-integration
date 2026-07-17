@@ -1,0 +1,50 @@
+:root {
+  color-scheme: dark;
+  --canvas: #191919;
+  --surface: #202020;
+  --surface-raised: #252a2f;
+  --border: #30363d;
+  --border-strong: #596675;
+  --text: #e8edf1;
+  --muted: #adb5bd;
+  --focus: #8ab4ff;
+  --button-active-text: #191919;
+  --github: #6fa8ff;
+  --academic: #d7a540;
+  --research: #a585e8;
+  --project: #62b78c;
+  --personal: #d9879f;
+  --other: #94a0ae;
+}
+
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme]) {
+    color-scheme: light;
+    --canvas: #f2f3f3;
+    --surface: #ffffff;
+    --surface-raised: #e7eaec;
+    --border: #c8d0d6;
+    --border-strong: #788795;
+    --text: #1e2933;
+    --muted: #52606d;
+    --focus: #2563a9;
+    --button-active-text: #ffffff;
+  }
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+  --canvas: #f2f3f3;
+  --surface: #ffffff;
+  --surface-raised: #e7eaec;
+  --border: #c8d0d6;
+  --border-strong: #788795;
+  --text: #1e2933;
+  --muted: #52606d;
+  --focus: #2563a9;
+  --button-active-text: #ffffff;
+}

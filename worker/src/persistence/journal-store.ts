@@ -118,6 +118,12 @@ function exactIntentSnapshot(intent: JournalIntentV1): Record<string, unknown> {
   value.resultSemanticHash = intent.resultSemanticHash;
   value.expectedRemoteEditedAt = intent.expectedRemoteEditedAt;
   value.createdAt = intent.createdAt;
+  if (intent.cortex !== undefined) {
+    value.cortex = intent.cortex;
+  }
+  if (intent.cortexTransaction !== undefined) {
+    value.cortexTransaction = intent.cortexTransaction;
+  }
   return value;
 }
 

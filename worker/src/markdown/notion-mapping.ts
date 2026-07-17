@@ -1,6 +1,6 @@
 import type { SemanticNote } from "@grandbox-bridge/shared";
 import { decodeString } from "micromark-util-decode-string";
-import type { Link, Nodes, Parent, Root, Text } from "mdast";
+import type { Link, Nodes, Parent, PhrasingContent, Root, Text } from "mdast";
 import { unified } from "unified";
 import remarkGfm from "remark-gfm";
 import remarkParse from "remark-parse";
@@ -158,7 +158,8 @@ function notionPageIdFromUrl(value: string): string | null {
         parsed.hostname === "notion.so" ||
         parsed.hostname.endsWith(".notion.so") ||
         parsed.hostname === "notion.site" ||
-        parsed.hostname.endsWith(".notion.site")
+        parsed.hostname.endsWith(".notion.site") ||
+        parsed.hostname === "app.notion.com"
       ) ||
       parsed.username !== "" ||
       parsed.password !== "" ||
@@ -902,6 +903,92 @@ function transformFromNotion(
   parent.children = transformed as Parent["children"];
 }
 
+/**
+ * Notion serializes consecutive top-level paragraph blocks with one newline.
+ * Preserve those raw boundaries before reverse mapping: tokenization can turn
+ * a text node into multiple children, at which point the original boundary is
+ * no longer observable. Only split boundaries carried by direct text nodes;
+ * a newline inside an inline construct remains untouched.
+ */
+function restoreNotionPlainTextBlockBoundaries(root: Root, document: ParsedMarkdownDocument): void {
+  const restored: Nodes[] = [];
+  for (const node of root.children as Nodes[]) {
+    if (node.type !== "paragraph") {
+      restored.push(node);
+      continue;
+    }
+
+    const paragraphs: PhrasingContent[][] = [[]];
+    let split = false;
+    let safe = true;
+    for (const child of node.children) {
+      if (child.type !== "text") {
+        const raw = nodeSource(document.source, child);
+        if (raw.includes("\n")) {
+          safe = false;
+          break;
+        }
+        paragraphs.at(-1)?.push(child);
+        continue;
+      }
+
+      const position = child.position;
+      const start = position?.start.offset;
+      const end = position?.end.offset;
+      if (position === undefined || typeof start !== "number" || typeof end !== "number") {
+        safe = false;
+        break;
+      }
+      const rawParts = document.source.slice(start, end).split("\n");
+      const decodedParts = child.value.split("\n");
+      if (rawParts.length !== decodedParts.length) {
+        safe = false;
+        break;
+      }
+
+      let offset = start;
+      for (let index = 0; index < rawParts.length; index += 1) {
+        const next = structuredClone(child);
+        next.value = decodedParts[index] as string;
+        next.position = {
+          ...position,
+          start: { ...position.start, offset },
+          end: { ...position.end, offset: offset + (rawParts[index] as string).length },
+        };
+        if (next.value.length > 0 || (rawParts[index] as string).length > 0) {
+          paragraphs.at(-1)?.push(next);
+        }
+        offset += (rawParts[index] as string).length;
+        if (index < rawParts.length - 1) {
+          offset += 1;
+          paragraphs.push([]);
+          split = true;
+        }
+      }
+    }
+
+    if (!safe || !split || paragraphs.some((children) => children.length === 0)) {
+      restored.push(node);
+      continue;
+    }
+    restored.push(...paragraphs.map((children) => {
+      const paragraph = structuredClone(node);
+      paragraph.children = children;
+      return paragraph;
+    }));
+  }
+  root.children = restored as Root["children"];
+}
+
+/** A remaining local soft wrap cannot be distinguished from separate Notion blocks. */
+function hasAmbiguousTopLevelPlainSoftWrap(root: Root): boolean {
+  return root.children.some(
+    (node) => node.type === "paragraph" && node.children.some(
+      (child) => child.type === "text" && child.value.includes("\n"),
+    ),
+  );
+}
+
 export function toNotionMarkdown(note: SemanticNote, links: LinkMapping): MappingResult {
   const index = validateLinkMapping(links);
   const semantic = normalizeLocal(parseMarkdown(note.bodyMarkdown), note.tags);
@@ -909,6 +996,9 @@ export function toNotionMarkdown(note: SemanticNote, links: LinkMapping): Mappin
   const masked = maskObsidianSyntax(document);
   const root = structuredClone(masked.root);
   const unsupported = new Set(document.unsupportedKinds);
+  if (hasAmbiguousTopLevelPlainSoftWrap(document.root)) {
+    unsupported.add("ambiguous-soft-break");
+  }
   transformToNotion(root, masked, index, unsupported, new Map());
   return {
     semantic,
@@ -929,6 +1019,7 @@ export function fromNotionMarkdown(
     document.unsupportedKinds.filter((kind) => kind !== "raw-html" && kind !== "html-comment"),
   );
   const registry = new LocalTokenRegistry(document, index.byTarget.keys());
+  restoreNotionPlainTextBlockBoundaries(root, document);
   transformFromNotion(root, document, index, unsupported, registry, new Map());
   const bodyMarkdown = registry.restore(stringifyMarkdown(root));
   const semantic = { bodyMarkdown, tags: normalizeTags(tags) };

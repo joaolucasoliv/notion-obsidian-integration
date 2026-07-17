@@ -1,5 +1,6 @@
 import type { SemanticNote } from "@grandbox-bridge/shared";
 import {
+  hasCortexFrontmatterKeys,
   parseLocalNote,
   replaceSyncedTags,
   type ParsedLocalNote,
@@ -8,6 +9,9 @@ import { normalizeLineEndings } from "./parse.js";
 
 export function renderLocalNote(note: ParsedLocalNote, semantic: SemanticNote): string {
   const original = parseLocalNote(note.path, note.bytes);
+  if (hasCortexFrontmatterKeys(original.frontmatter)) {
+    throw new Error("Cortex-owned notes require the Cortex renderer");
+  }
   const withTags = replaceSyncedTags(note.bytes, semantic.tags);
   const tagged = parseLocalNote(note.path, withTags);
   const bodyStart = withTags.length - tagged.body.length;

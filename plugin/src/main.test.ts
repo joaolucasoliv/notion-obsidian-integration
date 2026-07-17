@@ -5,7 +5,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { BridgeRunSummary } from "@grandbox-bridge/shared";
 import { App, Notice, TFile } from "../../tests/fakes/obsidian.js";
 import type { ExternalLocator } from "./locator.js";
-import type { BridgeStatus, ServiceStatus, WorkerController } from "./controller.js";
+import type { BridgeStatus, NotionConnectionInput, NotionConnectionResult, ServiceStatus, WorkerController } from "./controller.js";
 import { NodeServiceCommandRunner, type ServiceProcessCommand } from "./service-manager.js";
 import { deriveExternalLocator } from "./locator.js";
 
@@ -53,7 +53,9 @@ class ManualScheduler {
 
 class RecordingController implements WorkerController {
   public readonly calls: Array<{ readonly mode: "preview" | "apply"; readonly reason: "manual" | "obsidian-event" }> = [];
+  public readonly connectionCalls: NotionConnectionInput[] = [];
   public statusValue: BridgeStatus = { configuration: "ready", service: "disabled" };
+  public connectionResult: NotionConnectionResult = { configuration: "ready", created: true };
 
   public async preview(): Promise<BridgeRunSummary> {
     this.calls.push({ mode: "preview", reason: "manual" });
@@ -73,13 +75,17 @@ class RecordingController implements WorkerController {
   public async installService(): Promise<ServiceStatus> { return { enabled: true }; }
   public async disableService(): Promise<ServiceStatus> { return { enabled: false }; }
   public async status(): Promise<BridgeStatus> { return this.statusValue; }
+  public async connectNotion(input: NotionConnectionInput): Promise<NotionConnectionResult> {
+    this.connectionCalls.push(input);
+    return this.connectionResult;
+  }
 }
 
 async function serviceLocator(): Promise<ExternalLocator> {
   const homeDirectory = await realpath(await mkdtemp(join(tmpdir(), "grandbox-plugin-main-service-")));
   const nodeExecutable = join(homeDirectory, "node");
   const workerPath = join(homeDirectory, "bridge-worker.cjs");
-  const locator = deriveExternalLocator({ installationId: INSTALLATION_ID, homeDirectory, nodeExecutable, workerPath });
+  const locator = deriveExternalLocator({ installationId: INSTALLATION_ID, homeDirectory, vaultRoot: join(homeDirectory, "vault"), nodeExecutable, workerPath });
   await mkdir(dirname(locator.configPath), { recursive: true, mode: 0o700 });
   await Promise.all([
     writeFile(nodeExecutable, "node", { mode: 0o700 }),
@@ -244,6 +250,55 @@ describe("GrandboxBridgePlugin", () => {
 
     expect(Notice.messages.join("\n")).toContain("unavailable");
     expect(Notice.messages.join("\n")).not.toMatch(/synthetic-provider-token|Users\/private|note\.md/i);
+  });
+
+  it("wires the settings connection action to a setup-capable controller with a safe notice", async () => {
+    const { GrandboxBridgePlugin } = await import("./main.js");
+    const app = new App();
+    const controller = new RecordingController();
+    class TestPlugin extends GrandboxBridgePlugin {
+      protected override createWorkerController(_locator: ExternalLocator): WorkerController { return controller; }
+    }
+    const plugin = new TestPlugin(app, { id: "grandbox-bridge" });
+    await plugin.onload();
+    const tab = plugin.settingTabs[0] as unknown as { actions: { connectNotion(input: NotionConnectionInput): Promise<void> } };
+
+    await tab.actions.connectNotion({
+      parentPageId: "22222222-2222-4222-8222-222222222222",
+      token: "ntn_transient_token",
+    });
+
+    expect(controller.connectionCalls).toEqual([{
+      parentPageId: "22222222-2222-4222-8222-222222222222",
+      token: "ntn_transient_token",
+    }]);
+    expect(Notice.messages).toEqual(["Grandbox Bridge: Notion connected."]);
+  });
+
+  it("explains that a missing parent page is not a workspace ID", async () => {
+    const { GrandboxBridgePlugin } = await import("./main.js");
+    const app = new App();
+    const controller = new RecordingController();
+    controller.connectionResult = {
+      configuration: "unconfigured",
+      created: false,
+      error: "not-found",
+    } as unknown as NotionConnectionResult;
+    class TestPlugin extends GrandboxBridgePlugin {
+      protected override createWorkerController(_locator: ExternalLocator): WorkerController { return controller; }
+    }
+    const plugin = new TestPlugin(app, { id: "grandbox-bridge" });
+    await plugin.onload();
+    const tab = plugin.settingTabs[0] as unknown as { actions: { connectNotion(input: NotionConnectionInput): Promise<void> } };
+
+    await tab.actions.connectNotion({
+      parentPageId: "22222222-2222-4222-8222-222222222222",
+      token: "ntn_transient_token",
+    });
+
+    expect(Notice.messages).toEqual([
+      "Grandbox Bridge: choose a parent page, not a workspace ID, then add The Grandbox Connection to that page.",
+    ]);
   });
 
   it("runs opt-in and opt-out commands only against the active Markdown note", async () => {

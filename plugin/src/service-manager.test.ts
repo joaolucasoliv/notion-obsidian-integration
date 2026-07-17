@@ -15,7 +15,7 @@ async function serviceFixture(): Promise<ReturnType<typeof deriveExternalLocator
   const homeDirectory = await realpath(await mkdtemp(join(tmpdir(), "grandbox-plugin-service-")));
   const nodeExecutable = join(homeDirectory, "node");
   const workerPath = join(homeDirectory, "bridge-worker.cjs");
-  const locator = deriveExternalLocator({ installationId: INSTALLATION_ID, homeDirectory, nodeExecutable, workerPath });
+  const locator = deriveExternalLocator({ installationId: INSTALLATION_ID, homeDirectory, vaultRoot: join(homeDirectory, "vault"), nodeExecutable, workerPath });
   await mkdir(dirname(locator.configPath), { recursive: true, mode: 0o700 });
   await Promise.all([
     writeFile(nodeExecutable, "node", { mode: 0o700 }),

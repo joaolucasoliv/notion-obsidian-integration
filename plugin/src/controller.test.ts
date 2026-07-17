@@ -4,6 +4,7 @@ import { LocalWorkerController, type WorkerCommand, type WorkerProcessRunner } f
 import { deriveExternalLocator } from "./locator.js";
 
 const INSTALLATION_ID = "11111111-1111-4111-8111-111111111111";
+const PARENT_PAGE_ID = "22222222-2222-4222-8222-222222222222";
 
 function summary(overrides: Partial<BridgeRunSummary> = {}): BridgeRunSummary {
   return {
@@ -26,6 +27,7 @@ function locator() {
   return deriveExternalLocator({
     installationId: INSTALLATION_ID,
     homeDirectory: "/Users/synthetic",
+    vaultRoot: "/synthetic/vault",
     nodeExecutable: "/usr/local/bin/node",
     workerPath: "/synthetic/vault/.obsidian/plugins/grandbox-bridge/bridge-worker.cjs",
   });
@@ -60,6 +62,61 @@ describe("LocalWorkerController", () => {
       ],
       shell: false,
     }]);
+  });
+
+  it("sends a Notion connection token through stdin only to the installed setup worker", async () => {
+    const commands: WorkerCommand[] = [];
+    const runner: WorkerProcessRunner = {
+      run: async (command) => {
+        commands.push(command);
+        return { code: 0, stdout: '{"configuration":"ready","created":true}\n' };
+      },
+    };
+    const controller = new LocalWorkerController(locator(), runner, {
+      install: async () => ({ enabled: true }),
+      disable: async () => ({ enabled: false }),
+      status: async () => ({ configuration: "ready", service: "disabled" }),
+    });
+
+    await expect(controller.connectNotion({
+      parentPageId: PARENT_PAGE_ID,
+      token: "ntn_stdin_only_token",
+    })).resolves.toEqual({ configuration: "ready", created: true });
+
+    expect(commands).toEqual([{
+      executable: "/usr/local/bin/node",
+      args: [
+        "/synthetic/vault/.obsidian/plugins/grandbox-bridge/bridge-worker.cjs",
+        "setup",
+        "apply",
+        "--vault",
+        "/synthetic/vault",
+        "--parent-page-id",
+        PARENT_PAGE_ID,
+        "--json",
+      ],
+      shell: false,
+      stdin: "ntn_stdin_only_token\n",
+    }]);
+  });
+
+  it("returns a safe setup failure result from the worker instead of discarding it", async () => {
+    const runner: WorkerProcessRunner = {
+      run: async () => ({
+        code: 1,
+        stdout: '{"configuration":"unconfigured","created":false,"error":"not-found"}\n',
+      }),
+    };
+    const controller = new LocalWorkerController(locator(), runner, {
+      install: async () => ({ enabled: true }),
+      disable: async () => ({ enabled: false }),
+      status: async () => ({ configuration: "ready", service: "disabled" }),
+    });
+
+    await expect(controller.connectNotion({
+      parentPageId: PARENT_PAGE_ID,
+      token: "ntn_stdin_only_token",
+    })).resolves.toEqual({ configuration: "unconfigured", created: false, error: "not-found" });
   });
 
   it("rejects a nonzero worker exit even when stdout looks like a summary", async () => {

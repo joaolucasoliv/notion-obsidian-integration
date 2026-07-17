@@ -33,6 +33,11 @@ export interface ParsedLocalNote {
   tags: string[];
 }
 
+export interface FrontmatterScalarField {
+  readonly key: string;
+  readonly value: string | boolean | null;
+}
+
 export class LocalNoteParseError extends Error {
   public constructor() {
     super("Invalid local note");
@@ -331,6 +336,11 @@ export function parseLocalNote(path: string, bytes: string): ParsedLocalNote {
   return parseLocalNoteInternal(path, bytes).note;
 }
 
+/** Legacy mutators use this to refuse a separately owned Cortex note. */
+export function hasCortexFrontmatterKeys(frontmatter: Readonly<Record<string, unknown>>): boolean {
+  return Object.keys(frontmatter).some((key) => key.startsWith("cortex_"));
+}
+
 function requireFrontmatter(bytes: string): ParsedInternals & { readonly bounds: FrontmatterBounds } {
   const parsed = parseLocalNoteInternal("note.md", bytes);
   if (parsed.bounds === null) {
@@ -346,11 +356,101 @@ function replaceRange(bytes: string, start: number, end: number, replacement: st
   return `${bytes.slice(0, start)}${replacement}${bytes.slice(end)}`;
 }
 
+function renderFrontmatterScalar(value: string | boolean | null): string {
+  if (value === null) return "null";
+  if (typeof value === "boolean") return value ? "true" : "false";
+  const rendered = stringify(value, { schema: "core" });
+  return rendered.endsWith("\n") ? rendered.slice(0, -1) : rendered;
+}
+
+function assertFrontmatterScalarField(field: unknown): asserts field is FrontmatterScalarField {
+  if (
+    typeof field !== "object" ||
+    field === null ||
+    !("key" in field) ||
+    !("value" in field) ||
+    typeof field.key !== "string" ||
+    field.key.length === 0 ||
+    field.key.trim() !== field.key ||
+    !/^[A-Za-z][A-Za-z0-9_]*$/u.test(field.key) ||
+    (typeof field.value !== "string" && typeof field.value !== "boolean" && field.value !== null)
+  ) {
+    throw invalidLocalNote();
+  }
+}
+
+/**
+ * Surgically replaces or appends a small set of scalar frontmatter keys while
+ * preserving all unrelated YAML, comments, ordering, and body bytes.
+ */
+export function upsertFrontmatterScalars(bytes: string, fields: readonly FrontmatterScalarField[]): string {
+  if (!Array.isArray(fields) || fields.length === 0 || fields.length > 32) throw invalidLocalNote();
+  const keys = new Set<string>();
+  for (const field of fields) {
+    assertFrontmatterScalarField(field);
+    if (keys.has(field.key)) throw invalidLocalNote();
+    keys.add(field.key);
+  }
+
+  const parsed = parseLocalNoteInternal("note.md", bytes);
+  const lineEnding = parsed.bounds?.lineEnding ?? "\n";
+  if (parsed.bounds === null) {
+    const prefix = `---${lineEnding}${fields.map((field) => `${field.key}: ${renderFrontmatterScalar(field.value)}`).join(lineEnding)}${lineEnding}---${lineEnding}`;
+    const updated = `${prefix}${bytes}`;
+    const verified = parseLocalNote("note.md", updated);
+    if (verified.body !== bytes) throw invalidLocalNote();
+    return updated;
+  }
+
+  if (parsed.root === null) {
+    const insertion = fields.map((field) => `${field.key}: ${renderFrontmatterScalar(field.value)}${lineEnding}`).join("");
+    const updated = replaceRange(bytes, parsed.bounds.closeStart, parsed.bounds.closeStart, insertion);
+    const verified = parseLocalNote("note.md", updated);
+    if (verified.body !== parsed.note.body) throw invalidLocalNote();
+    return updated;
+  }
+
+  const edits: Array<Readonly<{ start: number; end: number; replacement: string }>> = [];
+  const additions: string[] = [];
+  for (const field of fields) {
+    const pair = pairForKey(parsed.root, field.key);
+    if (pair === null) {
+      additions.push(`${field.key}: ${renderFrontmatterScalar(field.value)}${lineEnding}`);
+      continue;
+    }
+    const value = pair.value;
+    if (!isScalar(value) || value.range === null || value.range === undefined) throw invalidLocalNote();
+    edits.push({
+      start: parsed.bounds.yamlStart + value.range[0],
+      end: parsed.bounds.yamlStart + value.range[1],
+      replacement: renderFrontmatterScalar(field.value),
+    });
+  }
+  if (additions.length > 0) {
+    edits.push({
+      start: parsed.bounds.closeStart,
+      end: parsed.bounds.closeStart,
+      replacement: additions.join(""),
+    });
+  }
+
+  let updated = bytes;
+  for (const edit of edits.sort((left, right) => right.start - left.start)) {
+    updated = replaceRange(updated, edit.start, edit.end, edit.replacement);
+  }
+  const verified = parseLocalNote("note.md", updated);
+  if (verified.body !== parsed.note.body) throw invalidLocalNote();
+  return updated;
+}
+
 export function upsertBridgeId(bytes: string, id: string): string {
   if (typeof id !== "string" || !isCanonicalUuid(id)) {
     throw invalidLocalNote();
   }
   const parsed = requireFrontmatter(bytes);
+  if (hasCortexFrontmatterKeys(parsed.note.frontmatter)) {
+    throw invalidLocalNote();
+  }
   if (parsed.note.bridgeId !== null) {
     if (parsed.note.bridgeId === id) {
       return bytes;
@@ -455,6 +555,9 @@ function replaceBlockTags(
 export function replaceSyncedTags(bytes: string, tags: readonly string[]): string {
   const normalized = normalizeTags(tags);
   const parsed = requireFrontmatter(bytes);
+  if (hasCortexFrontmatterKeys(parsed.note.frontmatter)) {
+    throw invalidLocalNote();
+  }
   if (parsed.tagsPair === null) {
     if (normalized.length === 0) {
       return bytes;

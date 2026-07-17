@@ -24,27 +24,23 @@ class RecordingRunner implements ProcessRunner {
 }
 
 describe("MacOSKeychainCredentialStore", () => {
-  it("writes a secret through stdin and never argv", async () => {
+  it("writes a secret through a hidden Keychain prompt and never argv", async () => {
     const runner = new RecordingRunner();
     const store = new MacOSKeychainCredentialStore(INSTALLATION_ID, runner);
 
     await store.set("notion-token", "fixture-notion-value");
 
-    expect(runner.last).toEqual({
-      executable: "/usr/bin/security",
+    expect(runner.last).toMatchObject({
+      executable: "/usr/bin/expect",
       args: [
-        "add-generic-password",
-        "-U",
-        "-a",
-        INSTALLATION_ID,
-        "-s",
-        "GrandboxBridge/notion-token",
-        "-w",
+        "-c",
+        expect.stringContaining(`spawn /usr/bin/security add-generic-password -U -a ${INSTALLATION_ID} -s GrandboxBridge/notion-token -w`),
       ],
       stdin: "fixture-notion-value\n",
       maxBytes: 8_192,
     });
     expect(JSON.stringify(runner.last?.args)).not.toContain("fixture-notion-value");
+    expect(runner.last?.args.join("\n")).toContain('send -- "$token\\r"');
   });
 
   it("reads a secret with an explicit bounded no-shell command", async () => {

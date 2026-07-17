@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { chmod, lstat, mkdir, mkdtemp, readdir, realpath, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import type { JournalCompletionV1, JournalIntentV1 } from "@grandbox-bridge/shared";
+import { parseJournalIntent, type JournalCompletionV1, type JournalIntentV1 } from "@grandbox-bridge/shared";
 import { describe, expect, it } from "vitest";
 import { FileJournalStore, type JournalCompactionPhase } from "./journal-store.js";
 
@@ -13,6 +13,67 @@ const INTENT_B = "44444444-4444-4444-8444-444444444444";
 const HASH_A = "a".repeat(64);
 const HASH_B = "b".repeat(64);
 const TIMESTAMP = "2026-07-14T12:34:56.000Z";
+const CORTEX_ROOT_ID = "55555555-5555-4555-8555-555555555555";
+const CORTEX_PARTICIPANT_ID = "66666666-6666-4666-8666-666666666666";
+const CORTEX_TRANSACTION_ID = "77777777-7777-4777-8777-777777777777";
+
+function cortexIntent(id: string): JournalIntentV1 {
+  return {
+    schemaVersion: 1,
+    id,
+    installationId: INSTALLATION_ID,
+    effectKind: "write-cortex-local",
+    relativePath: "The Cortex.md",
+    remoteId: CORTEX_ROOT_ID,
+    allocationId: null,
+    expectedByteHash: HASH_A,
+    expectedSemanticHash: HASH_A,
+    resultByteHash: HASH_B,
+    resultSemanticHash: HASH_B,
+    expectedRemoteEditedAt: TIMESTAMP,
+    createdAt: TIMESTAMP,
+    cortex: {
+      rootPageId: CORTEX_ROOT_ID,
+      pageId: CORTEX_ROOT_ID,
+      sourcePath: "The Cortex.md",
+      targetPath: "The Cortex.md",
+      expectedPostcondition: {
+        pageId: CORTEX_ROOT_ID,
+        parentPageId: null,
+        title: "The Cortex",
+        relativePath: "The Cortex.md",
+        byteHash: HASH_B,
+        semanticHash: HASH_B,
+        structureHash: HASH_A,
+        editedAt: TIMESTAMP,
+      },
+    },
+  };
+}
+
+function cortexTransactionIntent(id: string): JournalIntentV1 {
+  return parseJournalIntent({
+    schemaVersion: 1,
+    id,
+    installationId: INSTALLATION_ID,
+    effectKind: "commit-cortex-tree-transaction",
+    relativePath: null,
+    remoteId: null,
+    allocationId: null,
+    expectedByteHash: null,
+    expectedSemanticHash: null,
+    resultByteHash: null,
+    resultSemanticHash: null,
+    expectedRemoteEditedAt: null,
+    createdAt: TIMESTAMP,
+    cortexTransaction: {
+      rootPageId: CORTEX_ROOT_ID,
+      transactionId: CORTEX_TRANSACTION_ID,
+      manifestDigest: HASH_A,
+      participantIds: [CORTEX_ROOT_ID, CORTEX_PARTICIPANT_ID],
+    },
+  });
+}
 
 function intent(id: string, overrides: Partial<JournalIntentV1> = {}): JournalIntentV1 {
   return {
@@ -205,6 +266,34 @@ describe("FileJournalStore", () => {
     ]);
     expect((await lstat(journal)).mode & 0o777).toBe(0o700);
     expect((await lstat(join(journal, `intent-${INTENT_A}.json`))).mode & 0o777).toBe(0o600);
+  });
+
+  it("round-trips immutable Cortex recovery metadata through intent and retirement snapshots", async () => {
+    const directory = await temporaryDirectory();
+    const store = new FileJournalStore(join(directory, "journal"), INSTALLATION_ID, { rotationThreshold: 1 });
+    const cortex = cortexIntent(INTENT_A);
+
+    await store.begin(cortex);
+    await expect(store.incomplete()).resolves.toEqual([cortex]);
+    await store.complete(INTENT_A, completion());
+    await store.begin(intent(INTENT_B));
+
+    await expect(store.incomplete()).resolves.toEqual([intent(INTENT_B)]);
+  });
+
+  it("round-trips Cortex transaction metadata through journal snapshots without persisting note content", async () => {
+    const directory = await temporaryDirectory();
+    const store = new FileJournalStore(join(directory, "journal"), INSTALLATION_ID);
+    const transaction = cortexTransactionIntent(INTENT_A);
+    const noteBody = "fixture-note-body-must-not-enter-transaction-journal";
+
+    await store.begin(transaction);
+
+    expect(await store.incomplete()).toEqual([transaction]);
+    expect(JSON.stringify(await store.incomplete())).not.toContain(noteBody);
+    await expect(store.begin({ ...transaction, content: noteBody } as unknown as JournalIntentV1)).rejects.toThrow(
+      /journal store failed/i,
+    );
   });
 
   it("makes begin and complete exclusive, including concurrent duplicate races", async () => {

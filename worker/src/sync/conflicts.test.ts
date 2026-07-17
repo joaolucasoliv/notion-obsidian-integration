@@ -6,6 +6,7 @@ import { planPair } from "./planner.js";
 const BRIDGE_ID = "11111111-1111-4111-8111-111111111111";
 const PAGE_ID = "33333333-3333-4333-8333-333333333333";
 const PAGE_URL = `https://www.notion.so/Alpha-${PAGE_ID.replaceAll("-", "")}`;
+const APP_PAGE_URL = `https://app.notion.com/${PAGE_ID.replaceAll("-", "")}`;
 const COMMON_HASH = "1".repeat(64);
 const LOCAL_HASH = "2".repeat(64);
 const NOTION_HASH = "3".repeat(64);
@@ -79,6 +80,12 @@ describe("conflict artifact rendering", () => {
     expect(conflictArtifactPath(input)).toBe(
       `Bridge Conflicts/2026-07-14/Roadmap - phase — ${BRIDGE_ID}.md`,
     );
+  });
+
+  it("accepts canonical app.notion.com URLs when rendering a conflict artifact", () => {
+    const artifact = renderConflictArtifact(artifactFixture({ notionPageUrl: APP_PAGE_URL }));
+
+    expect(artifact).toContain(APP_PAGE_URL);
   });
 
   it("caps a Unicode-safe filename stem by UTF-8 bytes without splitting a code point", () => {

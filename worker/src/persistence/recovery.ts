@@ -30,6 +30,20 @@ export interface LocalRecoveryObserver {
   >;
 }
 
+/**
+ * Cortex effects carry a richer, cross-provider postcondition than the legacy
+ * pair journal.  Keep their recovery proof isolated so a legacy observer can
+ * never accidentally classify a Cortex mutation as complete.
+ */
+export interface CortexRecoveryObserver {
+  classify(intent: JournalIntentV1): Promise<
+    | { readonly kind: "pre"; readonly evidence: JournalCompletionV1 }
+    | { readonly kind: "post"; readonly evidence: JournalCompletionV1 }
+    | { readonly kind: "attention" }
+  >;
+  markAttention(intent: JournalIntentV1): Promise<void>;
+}
+
 export type RecoveryStatus = "clean" | "reconciled" | "retryable" | "recovery-required";
 
 export interface RecoveryResult {
@@ -47,10 +61,24 @@ export interface RecoveryDependencies {
   readonly journal: JournalStore;
   readonly localObserver: LocalRecoveryObserver;
   readonly remoteObserver: RemoteRecoveryObserver;
+  /** Optional until the Cortex executor wires its recovery observer. */
+  readonly cortexObserver?: CortexRecoveryObserver;
   readonly now?: () => string;
 }
 
 type ResolvedKind = "reconciled" | "retryable";
+
+const CORTEX_EFFECT_KINDS = new Set<JournalIntentV1["effectKind"]>([
+  "create-cortex-page",
+  "update-cortex-body",
+  "update-cortex-title",
+  "move-cortex-page",
+  "create-cortex-local",
+  "write-cortex-local",
+  "move-cortex-subtree",
+  "create-cortex-conflict",
+  "advance-cortex-state",
+]);
 
 function safeResult(
   status: RecoveryStatus,
@@ -147,6 +175,29 @@ function parseRemoteClassification(
   throw new Error("Invalid remote recovery observation");
 }
 
+function parseCortexClassification(
+  input: unknown,
+): { readonly kind: "pre" | "post"; readonly evidence: JournalCompletionV1 } | { readonly kind: "attention" } {
+  if (isExactObject(input, ["kind"]) && input.kind === "attention") {
+    return Object.freeze({ kind: "attention" });
+  }
+  if (
+    isExactObject(input, ["kind", "evidence"]) &&
+    (input.kind === "pre" || input.kind === "post")
+  ) {
+    return Object.freeze({ kind: input.kind, evidence: parseJournalCompletion(input.evidence) });
+  }
+  throw new Error("Invalid Cortex recovery observation");
+}
+
+function isCortexIntent(intent: JournalIntentV1): boolean {
+  return CORTEX_EFFECT_KINDS.has(intent.effectKind) && intent.cortex !== undefined && intent.cortex !== null;
+}
+
+function isStateFence(intent: JournalIntentV1): boolean {
+  return intent.effectKind === "commit-state" || intent.effectKind === "advance-cortex-state";
+}
+
 async function classifyLocal(
   intent: JournalIntentV1,
   observer: LocalRecoveryObserver,
@@ -224,8 +275,8 @@ export async function recoverIncompleteJournal(dependencies: RecoveryDependencie
     return safeResult("recovery-required", 0, 0, 0);
   }
   intents.sort((left, right) => {
-    if (left.effectKind === "commit-state" && right.effectKind !== "commit-state") return 1;
-    if (left.effectKind !== "commit-state" && right.effectKind === "commit-state") return -1;
+    if (isStateFence(left) && !isStateFence(right)) return 1;
+    if (!isStateFence(left) && isStateFence(right)) return -1;
     return left.id < right.id ? -1 : left.id > right.id ? 1 : 0;
   });
 
@@ -238,7 +289,20 @@ export async function recoverIncompleteJournal(dependencies: RecoveryDependencie
         return safeResult("recovery-required", processed, reconciled, retryable, intent);
       }
       let resolved: { readonly kind: ResolvedKind; readonly evidence: JournalCompletionV1 } | null;
-      if (
+      if (isCortexIntent(intent)) {
+        if (dependencies.cortexObserver === undefined) {
+          return safeResult("recovery-required", processed, reconciled, retryable, intent);
+        }
+        const classification = parseCortexClassification(await dependencies.cortexObserver.classify(intent));
+        if (classification.kind === "attention") {
+          await dependencies.cortexObserver.markAttention(intent);
+          return safeResult("recovery-required", processed, reconciled, retryable, intent);
+        }
+        resolved = Object.freeze({
+          kind: classification.kind === "post" ? "reconciled" : "retryable",
+          evidence: classification.evidence,
+        });
+      } else if (
         intent.effectKind === "initialize-pair" ||
         intent.effectKind === "write-local" ||
         intent.effectKind === "create-conflict"

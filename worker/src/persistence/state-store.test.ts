@@ -48,21 +48,25 @@ describe("FileStateStore", () => {
     await expect(store.load()).rejects.toThrow(/state store failed/i);
   });
 
-  it("strictly loads an immutable private state bound to its installation", async () => {
+  it("normalizes a strict persisted V1 state to immutable V2 and writes V2 on its next save", async () => {
     const directory = await temporaryDirectory();
     const path = join(directory, "state.json");
     const fixture = state();
-    expect(parseBridgeState(fixture)).toEqual(fixture);
+    const normalized = { ...fixture, schemaVersion: 2, cortex: null };
+    expect(parseBridgeState(fixture)).toEqual(normalized);
     await writeFile(path, JSON.stringify(fixture), { mode: 0o600 });
     await chmod(path, 0o600);
     const store = new FileStateStore(path, INSTALLATION_ID);
 
     const loaded = await store.load();
 
-    expect(loaded).toEqual(state());
+    expect(loaded).toEqual(normalized);
     expect(Object.isFrozen(loaded)).toBe(true);
     expect(Object.isFrozen(loaded.pairs)).toBe(true);
     expect(Object.isFrozen(loaded.pairs[PAIR_ID])).toBe(true);
+
+    await store.save(loaded);
+    expect(JSON.parse(await readFile(path, "utf8"))).toEqual(normalized);
   });
 
   it("rejects another installation and does not reflect malformed persisted bytes", async () => {
@@ -85,11 +89,12 @@ describe("FileStateStore", () => {
     const directory = await temporaryDirectory();
     const path = join(directory, "state.json");
     const store = new FileStateStore(path, INSTALLATION_ID);
-    await store.save(state());
+    const normalized = parseBridgeState(state());
+    await store.save(normalized);
 
-    expect(JSON.parse(await readFile(path, "utf8"))).toEqual(state());
+    expect(JSON.parse(await readFile(path, "utf8"))).toEqual({ ...state(), schemaVersion: 2, cortex: null });
     expect((await lstat(path)).mode & 0o777).toBe(0o600);
-    await expect(store.save(state(OTHER_INSTALLATION_ID))).rejects.toThrow(/state store failed/i);
-    expect(JSON.parse(await readFile(path, "utf8"))).toEqual(state());
+    await expect(store.save(parseBridgeState(state(OTHER_INSTALLATION_ID)))).rejects.toThrow(/state store failed/i);
+    expect(JSON.parse(await readFile(path, "utf8"))).toEqual({ ...state(), schemaVersion: 2, cortex: null });
   });
 });

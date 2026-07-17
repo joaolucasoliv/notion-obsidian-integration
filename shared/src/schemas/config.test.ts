@@ -30,24 +30,49 @@ function validConfig() {
 }
 
 describe("parseBridgeConfig", () => {
-  it("accepts the exact v1 shape including unconfigured nullable services", () => {
+  it("strictly reads an exact legacy V1 config and normalizes it to V2", () => {
     const configured = validConfig();
-    expect(parseBridgeConfig(configured)).toEqual(configured);
+    expect(parseBridgeConfig(configured)).toEqual({ ...configured, schemaVersion: 2, cortex: null });
 
     const unconfigured = { ...configured, notion: null, relay: null, graph: null };
-    expect(parseBridgeConfig(unconfigured)).toEqual(unconfigured);
+    expect(parseBridgeConfig(unconfigured)).toEqual({ ...unconfigured, schemaVersion: 2, cortex: null });
   });
 
-  it("rejects unknown root and nested keys", () => {
+  it("keeps legacy V1 parsing strict and rejects unknown root and nested keys", () => {
     expect(() => parseBridgeConfig({ ...validConfig(), extra: true })).toThrow(/unrecognized/i);
+    expect(() => parseBridgeConfig({ ...validConfig(), cortex: null })).toThrow(/unrecognized/i);
 
     const nested = validConfig();
     Object.assign(nested.graph.domains[0], { extra: true });
     expect(() => parseBridgeConfig(nested)).toThrow(/unrecognized/i);
   });
 
+  it("accepts a strict V2 Cortex root configuration", () => {
+    const configured = {
+      ...validConfig(),
+      schemaVersion: 2,
+      cortex: {
+        rootPageId: PAGE_ID,
+        rootFilePath: "The Cortex.md",
+        rootDirectoryPath: "The Cortex",
+      },
+    };
+
+    expect(parseBridgeConfig(configured)).toEqual(configured);
+    expect(() => parseBridgeConfig({ ...configured, extra: true })).toThrow(/unrecognized/i);
+    expect(() => parseBridgeConfig({ ...configured, cortex: { ...configured.cortex, rootFilePath: "Cortex.md" } })).toThrow(
+      /rootFilePath/i,
+    );
+    expect(() => parseBridgeConfig({ ...configured, cortex: { ...configured.cortex, rootDirectoryPath: "The Cortex/" } })).toThrow(
+      /rootDirectoryPath/i,
+    );
+    expect(() => parseBridgeConfig({ ...configured, cortex: { ...configured.cortex, rootPageId: "not-a-uuid" } })).toThrow(
+      /rootPageId/i,
+    );
+  });
+
   it("rejects unsupported versions, malformed UUIDs, hashes, URLs, and domains", () => {
-    expect(() => parseBridgeConfig({ ...validConfig(), schemaVersion: 2 })).toThrow(/schemaVersion/i);
+    expect(() => parseBridgeConfig({ ...validConfig(), schemaVersion: 3 })).toThrow(/schemaVersion/i);
     expect(() => parseBridgeConfig({ ...validConfig(), installationId: "not-a-uuid" })).toThrow(/installationId/i);
     expect(() => parseBridgeConfig({ ...validConfig(), vaultFingerprint: "not-a-hash" })).toThrow(/vaultFingerprint/i);
 
@@ -78,7 +103,7 @@ describe("parseBridgeConfig", () => {
     config.relay.baseUrl = baseUrl;
     config.graph.webOrigin = webOrigin;
 
-    expect(parseBridgeConfig(config)).toEqual(config);
+    expect(parseBridgeConfig(config)).toEqual({ ...config, schemaVersion: 2, cortex: null });
   });
 
   it.each([

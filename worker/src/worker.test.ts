@@ -53,4 +53,56 @@ describe("GrandboxBridgeWorker", () => {
     expect(harness.journal.begun).toHaveLength(begunBeforeNoops);
     expect(harness.journal.completed).toHaveLength(completedBeforeNoops);
   });
+
+  it("replaces a stale failed run with a clean no-op result", async () => {
+    const harness = await BridgeHarness.create();
+    await harness.writeNote("Recovered-noop.md", optedIn("settled\n"));
+    await harness.apply();
+    harness.state.value.lastRun = {
+      mode: "apply",
+      outcome: "failed",
+      planned: 0,
+      writes: 0,
+      pushed: 0,
+      pulled: 0,
+      conflicts: 0,
+      errors: 1,
+      graphUploads: 0,
+      startedAt: "2026-07-14T12:34:56.000Z",
+      completedAt: "2026-07-14T12:34:56.000Z",
+    };
+    const savesBeforeRecovery = harness.state.saves;
+
+    const result = await harness.apply();
+
+    expect(result).toMatchObject({ outcome: "noop", planned: 0, writes: 0, errors: 0 });
+    expect(harness.state.saves).toBe(savesBeforeRecovery + 1);
+    expect(harness.state.value.lastRun).toMatchObject({ outcome: "noop", errors: 0 });
+  });
+
+  it("synchronizes an unformatted local soft wrap without leaving a journal intent", async () => {
+    const harness = await BridgeHarness.create();
+    await harness.writeNote("Soft-wrap.md", optedIn("First soft line\nSecond soft line.\n"));
+
+    const first = await harness.apply();
+    const second = await harness.apply();
+
+    expect(first).toMatchObject({ outcome: "success", writes: 2, errors: 0 });
+    expect(second).toMatchObject({ outcome: "noop", writes: 0, errors: 0 });
+    expect(await harness.journal.incomplete()).toEqual([]);
+  });
+
+  it("rejects an ambiguous formatted soft wrap before a remote write or incomplete journal intent", async () => {
+    const harness = await BridgeHarness.create();
+    await harness.writeNote("Ambiguous-soft-wrap.md", optedIn("First\n**bold**\n"));
+
+    const result = await harness.apply();
+
+    expect(result).toMatchObject({ outcome: "failed", planned: 0, writes: 0, errors: 1 });
+    expect(harness.notion.creates).toBe(0);
+    expect(harness.journal.begun).toHaveLength(1);
+    expect(harness.journal.begun[0]?.effectKind).toBe("commit-state");
+    expect(harness.journal.completed.map((entry) => entry.id)).toEqual([harness.journal.begun[0]?.id]);
+    expect(await harness.journal.incomplete()).toEqual([]);
+  });
 });

@@ -2,6 +2,7 @@ import {
   fromBase64url,
   parseJournalCompletion,
   parseJournalIntent,
+  sha256Hex,
   type BridgeRunSummary,
   type BridgeStateV1,
   type Clock,
@@ -16,6 +17,7 @@ import {
   type ParsedBridgeStateV1,
   type JournalCompletionV1,
   type JournalIntentV1,
+  type CortexTreeNotionApi,
 } from "@grandbox-bridge/shared";
 import { buildGraphProjection, type GraphSourceNote } from "./graph/projection.js";
 import { GraphPublisher, type GraphNonceSource } from "./graph/publisher.js";
@@ -24,7 +26,7 @@ import { RelayEventSource, type RelayEvent } from "./relay/event-source.js";
 import { RelaySnapshotSink } from "./relay/snapshot-sink.js";
 import type { ConfigStore } from "./persistence/config-store.js";
 import type { JournalStore } from "./persistence/journal-store.js";
-import { recoverIncompleteJournal, type RemoteRecoveryObserver } from "./persistence/recovery.js";
+import { recoverIncompleteJournal, type CortexRecoveryObserver, type RemoteRecoveryObserver } from "./persistence/recovery.js";
 import type { StateStore } from "./persistence/state-store.js";
 import { safeErrorFrom, localRecoveryObservation, reconcilePairs, type ReconciliationResult } from "./sync/reconcile.js";
 import { executePlans, type PlannedPair } from "./sync/executor.js";
@@ -33,6 +35,7 @@ import { observeSafeVaultNoteBytes, scanVaultNotesWithStatus } from "./vault/sca
 import { type CanonicalVaultRoot } from "./vault/safety.js";
 import { AtomicVaultWriter, type VaultWriter } from "./vault/writer.js";
 import { semanticHash } from "./markdown/normalize.js";
+import { parseCortexLocalNote } from "./cortex/frontmatter.js";
 
 export type WorkerRunInput = {
   readonly mode: "preview" | "apply";
@@ -423,6 +426,129 @@ function asRemoteRecoveryObserver(
   };
 }
 
+export interface CortexRecoveryObserverInput {
+  readonly notion: CortexTreeNotionApi;
+  readonly clock: Clock;
+  readonly readLocalBytes: (relativePath: string) => Promise<string | null>;
+  readonly markAttention: (intent: JournalIntentV1) => Promise<void>;
+}
+
+/**
+ * Cortex recovery proves a single immutable effect directly.  It never runs a
+ * broad reconciliation while a journal is pending: a later parent-marker
+ * write, for example, must not invalidate an already ID-bound child rebind.
+ * Anything short of an exact proof is attention, not a replay candidate.
+ */
+export function createCortexRecoveryObserver(input: CortexRecoveryObserverInput): CortexRecoveryObserver {
+  return {
+    classify: async (intent) => {
+      try {
+        const cortex = intent.cortex;
+        if (
+          cortex === undefined ||
+          cortex === null ||
+          intent.effectKind === "move-cortex-subtree" ||
+          intent.effectKind === "create-cortex-page" ||
+          intent.effectKind === "advance-cortex-state"
+        ) {
+          return Object.freeze({ kind: "attention" as const });
+        }
+        const postcondition = cortex.expectedPostcondition;
+        if (
+          postcondition.pageId === null ||
+          postcondition.relativePath === null ||
+          postcondition.byteHash === null ||
+          postcondition.semanticHash === null ||
+          postcondition.structureHash === null ||
+          postcondition.title === null ||
+          cortex.pageId !== postcondition.pageId
+        ) {
+          return Object.freeze({ kind: "attention" as const });
+        }
+        const localBytes = await input.readLocalBytes(postcondition.relativePath);
+        if (localBytes === null || await sha256Hex(localBytes) !== postcondition.byteHash) {
+          return Object.freeze({ kind: "attention" as const });
+        }
+        if (intent.effectKind !== "create-cortex-conflict") {
+          const local = parseCortexLocalNote(postcondition.relativePath, localBytes);
+          if (
+            local.cortex.pageId !== postcondition.pageId ||
+            local.cortex.pageId !== cortex.pageId ||
+            local.cortex.rootPageId !== cortex.rootPageId ||
+            local.cortex.parentPageId !== postcondition.parentPageId
+          ) {
+            return Object.freeze({ kind: "attention" as const });
+          }
+        }
+        const remote = await input.notion.retrieveCortexPage({
+          rootPageId: cortex.rootPageId,
+          pageId: postcondition.pageId,
+        });
+        if (
+          remote === null ||
+          !remote.complete ||
+          remote.pageId !== postcondition.pageId ||
+          remote.rootPageId !== cortex.rootPageId ||
+          remote.parentPageId !== postcondition.parentPageId ||
+          remote.title !== postcondition.title ||
+          remote.semanticHash !== postcondition.semanticHash ||
+          remote.structureHash !== postcondition.structureHash
+        ) {
+          return Object.freeze({ kind: "attention" as const });
+        }
+        // The journal records `editedAt` as the immutable pre-mutation fence;
+        // remote mutations necessarily receive a new revision.  The observed
+        // post revision is captured only in completion evidence.
+        return Object.freeze({
+          kind: "post" as const,
+          evidence: parseJournalCompletion({
+            schemaVersion: 1,
+            resultByteHash: postcondition.byteHash,
+            resultSemanticHash: remote.semanticHash,
+            resultRemoteId: remote.pageId,
+            allocatedBridgeId: null,
+            observedRemoteEditedAt: remote.editedAt,
+            completedAt: safeTimestamp(input.clock),
+          }),
+        });
+      } catch {
+        return Object.freeze({ kind: "attention" as const });
+      }
+    },
+    markAttention: input.markAttention,
+  };
+}
+
+export async function markCortexRecoveryAttention(
+  store: StateStore,
+  state: Readonly<ParsedBridgeStateV1>,
+  intent: JournalIntentV1,
+): Promise<void> {
+  const cortex = state.cortex ?? null;
+  const details = intent.cortex;
+  if (cortex === null || details === undefined || details === null) return;
+  const pageId = [
+    details.pageId,
+    details.expectedPostcondition.pageId,
+    details.expectedPostcondition.parentPageId,
+    details.rootPageId,
+  ].find((candidate): candidate is string => candidate !== null && cortex.pages[candidate] !== undefined);
+  if (pageId === undefined) return;
+  const page = cortex.pages[pageId];
+  if (page === undefined || page.status === "attention") return;
+  await store.save({
+    ...state,
+    schemaVersion: 2,
+    cortex: {
+      ...cortex,
+      pages: {
+        ...cortex.pages,
+        [pageId]: { ...page, status: "attention" },
+      },
+    },
+  });
+}
+
 async function readCurrentLocal(root: CanonicalVaultRoot, relativePath: string): Promise<string | null> {
   try {
     const observed = await observeSafeVaultNoteBytes(root, relativePath);
@@ -651,12 +777,21 @@ export class GrandboxBridgeWorker implements BridgeWorker {
       }
 
       if (input.mode === "apply") {
+        const cortexObserver = context.config.cortex !== null && notion.cortexTree !== undefined
+          ? createCortexRecoveryObserver({
+              notion: notion.cortexTree,
+              clock: this.dependencies.clock,
+              readLocalBytes: async (relativePath) => readCurrentLocal(context.root, relativePath),
+              markAttention: async (intent) => markCortexRecoveryAttention(this.dependencies.state, context.state, intent),
+            })
+          : undefined;
         const recovery = await recoverIncompleteJournal({
           journal: this.dependencies.journal,
           localObserver: { observe: async (intent) => intent.relativePath === null
             ? Object.freeze({ kind: "missing" as const })
             : localRecoveryObservation(context.root, intent.relativePath) },
           remoteObserver: asRemoteRecoveryObserver(notion, this.dependencies.clock, context.state),
+          ...(cortexObserver === undefined ? {} : { cortexObserver }),
           now: () => safeTimestamp(this.dependencies.clock),
         });
         if (recovery.status === "recovery-required") {
@@ -825,7 +960,12 @@ export class GrandboxBridgeWorker implements BridgeWorker {
       counts.conflicts === 0 &&
       counts.errors === 0 &&
       sameDurableState(context.state, stateWithoutRun);
-    const nextState: BridgeStateV1 = trueSemanticNoop
+    const canKeepPreviousRunForNoop =
+      trueSemanticNoop &&
+      (context.state.lastRun === null ||
+        context.state.lastRun.outcome === "success" ||
+        context.state.lastRun.outcome === "noop");
+    const nextState: BridgeStateV1 = canKeepPreviousRunForNoop
       ? stateWithoutRun
       : { ...stateWithoutRun, lastRun: runSummary };
     if (!sameDurableState(context.state, nextState)) {

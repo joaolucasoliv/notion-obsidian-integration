@@ -3,6 +3,8 @@ import {
   inspectGithubManagedBytes,
   type GithubManagedState,
 } from "@grandbox-bridge/shared";
+import { inspectCortexFrontmatter } from "../cortex/frontmatter.js";
+import { isCortexLocalPath } from "../cortex/path.js";
 import type { ParsedLocalNote } from "../markdown/frontmatter.js";
 
 export type Eligibility =
@@ -13,6 +15,7 @@ export type Eligibility =
         | "not-opted-in"
         | "technical-path"
         | "generated-github"
+        | "cortex-owned"
         | "conflict-artifact"
         | "invalid-frontmatter"
         | "status-note";
@@ -47,6 +50,14 @@ export function classifyPathExclusion(
 }
 
 export function classifyEligibility(note: ParsedLocalNote): Eligibility {
+  const cortex = inspectCortexFrontmatter(note);
+  if (cortex.kind === "invalid") {
+    return { eligible: false, reason: "invalid-frontmatter" };
+  }
+  if (cortex.kind === "owned" || isCortexLocalPath(note.path)) {
+    return { eligible: false, reason: "cortex-owned" };
+  }
+
   const pathExclusion = classifyPathExclusion(note.path);
   if (pathExclusion !== null) {
     return pathExclusion;

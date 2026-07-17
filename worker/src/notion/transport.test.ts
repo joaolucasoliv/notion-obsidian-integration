@@ -61,6 +61,21 @@ describe("FetchNotionTransport", () => {
     expect(new Headers(init.headers).get("content-type")).toBe("application/json");
   });
 
+  it("encodes allowlisted block-children query values through the fixed API base", async () => {
+    const fetch = vi.fn(async () => jsonResponse({ object: "list", results: [] }));
+    const transport = new FetchNotionTransport({ fetch });
+
+    await transport.request({
+      ...request({ method: "GET", path: "/v1/blocks/33333333-3333-4333-8333-333333333333/children", body: undefined }),
+      query: { page_size: "100", start_cursor: "cursor /?&" },
+    });
+
+    expect(fetch).toHaveBeenCalledOnce();
+    expect(fetch.mock.calls[0]?.[0]).toBe(
+      "https://api.notion.com/v1/blocks/33333333-3333-4333-8333-333333333333/children?page_size=100&start_cursor=cursor+%2F%3F%26",
+    );
+  });
+
   it("accepts an application/json response with an optional charset", async () => {
     const transport = new FetchNotionTransport({ fetch: async () => jsonResponse({ ok: true }) });
 
@@ -94,6 +109,7 @@ describe("FetchNotionTransport", () => {
     "//api.notion.com/v1/users/me",
     "/v1/users/me?token=x",
     "/v1/users/me#fragment",
+    "/v1/users/me&cursor=forged",
     "/v1/users/../me",
     "/v2/users/me",
   ])("rejects unsafe raw path %s before calling fetch", async (path) => {
@@ -103,6 +119,29 @@ describe("FetchNotionTransport", () => {
     const error = await transport.request(request({ method: "GET", path, body: undefined })).catch((caught) => caught);
 
     expectSafeError(error, "invalid-response");
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("rejects structured query keys outside paginated block children before calling fetch", async () => {
+    const fetch = vi.fn();
+    const transport = new FetchNotionTransport({ fetch });
+
+    const unexpectedKey = await transport.request({
+      ...request({ method: "GET", path: "/v1/blocks/33333333-3333-4333-8333-333333333333/children", body: undefined }),
+      query: { access_token: "forged" },
+    }).catch((caught) => caught);
+    const wrongRoute = await transport.request({
+      ...request({ method: "GET", path: "/v1/users/me", body: undefined }),
+      query: { page_size: "100" },
+    }).catch((caught) => caught);
+    const wrongMethod = await transport.request({
+      ...request({ method: "POST", path: "/v1/blocks/33333333-3333-4333-8333-333333333333/children" }),
+      query: { page_size: "100" },
+    }).catch((caught) => caught);
+
+    expectSafeError(unexpectedKey, "invalid-response");
+    expectSafeError(wrongRoute, "invalid-response");
+    expectSafeError(wrongMethod, "invalid-response");
     expect(fetch).not.toHaveBeenCalled();
   });
 

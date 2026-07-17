@@ -1,11 +1,13 @@
-import { PluginSettingTab, Setting, type App, type Plugin } from "obsidian";
-import type { BridgeStatus } from "./controller.js";
+import { Notice, PluginSettingTab, Setting, type App, type Plugin } from "obsidian";
+import type { BridgeStatus, NotionConnectionInput } from "./controller.js";
+import { parseNotionParentPageId } from "./onboarding.js";
 
 export interface SettingsActions {
   preview(): Promise<void>;
   syncNow(): Promise<void>;
   installService(): Promise<void>;
   disableService(): Promise<void>;
+  connectNotion(input: NotionConnectionInput): Promise<void>;
   status(): Promise<BridgeStatus>;
 }
 
@@ -42,6 +44,35 @@ export class GrandboxBridgeSettingTab extends PluginSettingTab {
     new Setting(this.containerEl)
       .setName("Bridge status")
       .setDesc(describeStatus(status));
+    let parentReference: { getValue(): string; setValue(value: string): unknown } | null = null;
+    let token: { getValue(): string; setValue(value: string): unknown; inputEl: { type: string } } | null = null;
+    new Setting(this.containerEl)
+      .setName("Connect Notion")
+      .setDesc("Create or choose a Notion parent page, share it with The Grandbox Connection via ••• → Connections, then paste that page URL here — not workspace ID. The token is sent to the macOS Keychain only.")
+      .addText((text) => {
+        parentReference = text;
+        text.setPlaceholder("Notion parent page URL (not workspace ID)");
+      })
+      .addText((text) => {
+        token = text;
+        text.setPlaceholder("Notion integration token");
+        text.inputEl.type = "password";
+      })
+      .addButton((button) => button.setButtonText("Connect Notion").onClick(async () => {
+        try {
+          const tokenValue = token?.getValue() ?? "";
+          if (tokenValue.length === 0) throw new Error("Notion token unavailable");
+          await this.actions.connectNotion({
+            parentPageId: parseNotionParentPageId(parentReference?.getValue() ?? ""),
+            token: tokenValue,
+          });
+        } catch {
+          new Notice("Grandbox Bridge: enter a Notion parent-page URL (not a workspace ID) and integration token.");
+        } finally {
+          parentReference?.setValue("");
+          token?.setValue("");
+        }
+      }));
     new Setting(this.containerEl)
       .setName("Sync")
       .setDesc("Run a local preview or an explicit sync.")

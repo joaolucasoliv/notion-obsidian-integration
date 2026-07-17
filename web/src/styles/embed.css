@@ -1,0 +1,11 @@
+@media (max-width: 760px) {
+  .graph-shell {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto auto minmax(360px, 1fr) auto auto;
+    padding: 12px;
+  }
+
+  .graph-canvas {
+    min-height: 360px;
+  }
+}

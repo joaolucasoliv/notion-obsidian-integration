@@ -15,6 +15,12 @@ describe("normalizeLocal", () => {
     });
   });
 
+  it("canonicalizes an unformatted top-level soft wrap to one Notion-safe line", () => {
+    const semantic = normalizeLocal(parseMarkdown("First soft line\nSecond soft line.\n"));
+
+    expect(semantic.bodyMarkdown).toBe("First soft line Second soft line.\n");
+  });
+
   it("produces canonical JSON semantics for the asynchronous hash", async () => {
     const first = await semanticHash({ bodyMarkdown: "Body\r\n", tags: ["zeta", "alpha", "zeta"] });
     const second = await semanticHash({ bodyMarkdown: "Body\n", tags: ["alpha", "zeta"] });

@@ -7,6 +7,9 @@ export const NOTION_RESPONSE_MAX_BYTES = 2 * 1024 * 1024;
 const MAX_TIMEOUT_MS = 300_000;
 const MAX_RETRY_AFTER_SECONDS = 300n;
 const RELATIVE_NOTION_PATH = /^\/v1(?:\/[A-Za-z0-9_-]+)+$/u;
+const BLOCK_CHILDREN_PATH = /^\/v1\/blocks\/[A-Za-z0-9_-]+\/children$/u;
+const PAGE_SIZE = /^(?:[1-9]\d?|100)$/u;
+const MAX_QUERY_VALUE_BYTES = 2_048;
 const JSON_CONTENT_TYPE = /^application\/json(?:\s*;\s*charset\s*=\s*[^;\s]+)?\s*$/iu;
 
 export interface NotionTransportResponse<T> {
@@ -19,6 +22,7 @@ export interface NotionTransport {
   request<T>(input: {
     readonly method: "GET" | "POST" | "PATCH";
     readonly path: string;
+    readonly query?: Readonly<Record<string, string>>;
     readonly headers: Readonly<Record<string, string>>;
     readonly body?: unknown;
     readonly timeoutMs: number;
@@ -69,6 +73,38 @@ function isAllowedPath(path: unknown): path is string {
   return typeof path === "string" && path.length <= 2_048 && RELATIVE_NOTION_PATH.test(path);
 }
 
+function isSafeQueryValue(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    Buffer.byteLength(value, "utf8") <= MAX_QUERY_VALUE_BYTES &&
+    !/[\r\n\u0000]/u.test(value)
+  );
+}
+
+function isAllowedQuery(
+  method: unknown,
+  path: string,
+  query: unknown,
+): query is Readonly<Record<string, string>> | undefined {
+  if (query === undefined) return true;
+  if (method !== "GET" || !BLOCK_CHILDREN_PATH.test(path) || !isRecord(query)) return false;
+  const entries = Object.entries(query);
+  if (entries.length === 0 || entries.length > 2) return false;
+  for (const [key, value] of entries) {
+    if (key === "page_size") {
+      if (!isSafeQueryValue(value) || !PAGE_SIZE.test(value)) return false;
+      continue;
+    }
+    if (key === "start_cursor") {
+      if (!isSafeQueryValue(value)) return false;
+      continue;
+    }
+    return false;
+  }
+  return true;
+}
+
 function isBoundedPositiveInteger(value: unknown, maximum: number): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0 && value <= maximum;
 }
@@ -78,6 +114,7 @@ function isRequestInput(value: unknown): value is Parameters<NotionTransport["re
   return (
     (value.method === "GET" || value.method === "POST" || value.method === "PATCH") &&
     isAllowedPath(value.path) &&
+    isAllowedQuery(value.method, value.path, value.query) &&
     isSafeHeaders(value.headers) &&
     isBoundedPositiveInteger(value.timeoutMs, MAX_TIMEOUT_MS) &&
     isBoundedPositiveInteger(value.maxBytes, NOTION_RESPONSE_MAX_BYTES)
@@ -99,7 +136,7 @@ function jsonBody(input: Parameters<NotionTransport["request"]>[0]): string | un
   return serialized;
 }
 
-function requestUrl(path: string): string {
+function requestUrl(path: string, query: Readonly<Record<string, string>> | undefined): string {
   try {
     const url = new URL(path, NOTION_API_BASE);
     if (
@@ -111,6 +148,10 @@ function requestUrl(path: string): string {
       url.password !== ""
     ) {
       throw transportFailure("invalid-response");
+    }
+    for (const key of ["page_size", "start_cursor"] as const) {
+      const value = query?.[key];
+      if (value !== undefined) url.searchParams.set(key, value);
     }
     return url.toString();
   } catch (caught) {
@@ -244,7 +285,7 @@ export class FetchNotionTransport implements NotionTransport {
       let response: Response;
       try {
         response = await Promise.race([
-          this.fetchImpl(requestUrl(input.path), {
+          this.fetchImpl(requestUrl(input.path, input.query), {
             method: input.method,
             headers: requestHeaders(input, body),
             ...(body === undefined ? {} : { body }),

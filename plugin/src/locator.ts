@@ -3,6 +3,7 @@ const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3
 export interface ExternalLocator {
   readonly installationId: string;
   readonly homeDirectory: string;
+  readonly vaultRoot: string;
   readonly runtimeRoot: string;
   readonly configPath: string;
   readonly nodeExecutable: string;
@@ -12,6 +13,7 @@ export interface ExternalLocator {
 export interface ExternalLocatorInput {
   readonly installationId: string;
   readonly homeDirectory: string;
+  readonly vaultRoot: string;
   readonly nodeExecutable: string;
   readonly workerPath: string;
 }
@@ -48,6 +50,7 @@ export function deriveExternalLocator(input: ExternalLocatorInput): ExternalLoca
   if (
     !isCanonicalInstallationId(input.installationId) ||
     !isAbsoluteNormalizedPath(input.homeDirectory) ||
+    !isAbsoluteNormalizedPath(input.vaultRoot) ||
     !isAbsoluteNormalizedPath(input.nodeExecutable) ||
     !isAbsoluteNormalizedPath(input.workerPath)
   ) {
@@ -57,6 +60,7 @@ export function deriveExternalLocator(input: ExternalLocatorInput): ExternalLoca
   return Object.freeze({
     installationId: input.installationId,
     homeDirectory: input.homeDirectory,
+    vaultRoot: input.vaultRoot,
     runtimeRoot,
     configPath: `${runtimeRoot}/config.json`,
     nodeExecutable: input.nodeExecutable,

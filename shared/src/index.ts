@@ -1,4 +1,5 @@
 export * from "./contracts/core.ts";
+export * from "./contracts/cortex.ts";
 export * from "./contracts/graph.ts";
 export * from "./contracts/planning.ts";
 export * from "./contracts/ports.ts";

@@ -6,6 +6,7 @@ import { describe, expect, it, vi } from "vitest";
 import { FileJournalStore, type JournalStore } from "./journal-store.js";
 import {
   recoverIncompleteJournal,
+  type CortexRecoveryObserver,
   type LocalRecoveryObserver,
   type RemoteRecoveryObserver,
 } from "./recovery.js";
@@ -18,6 +19,79 @@ const HASH_B = "b".repeat(64);
 const HASH_C = "c".repeat(64);
 const TIMESTAMP = "2026-07-14T12:34:56.000Z";
 const BRIDGE_ID = "55555555-5555-4555-8555-555555555555";
+const CORTEX_ROOT_ID = "66666666-6666-4666-8666-666666666666";
+const CORTEX_PAGE_ID = "77777777-7777-4777-8777-777777777777";
+const CORTEX_PARENT_ID = "88888888-8888-4888-8888-888888888888";
+
+function cortexIntent(
+  id: string,
+  effectKind: Extract<JournalIntentV1["effectKind"],
+    | "create-cortex-page"
+    | "update-cortex-body"
+    | "update-cortex-title"
+    | "move-cortex-page"
+    | "create-cortex-local"
+    | "write-cortex-local"
+    | "move-cortex-subtree"
+    | "create-cortex-conflict"
+    | "advance-cortex-state">,
+): JournalIntentV1 {
+  const root = effectKind === "advance-cortex-state";
+  const create = effectKind === "create-cortex-page";
+  const localCreate = effectKind === "create-cortex-local" || effectKind === "create-cortex-conflict";
+  const move = effectKind === "move-cortex-subtree";
+  const targetPath = effectKind === "create-cortex-conflict"
+    ? `The Cortex/.conflicts/${CORTEX_PAGE_ID}.conflict.md`
+    : move
+      ? "The Cortex/Archive/Research.md"
+      : root
+        ? "The Cortex.md"
+        : create
+          ? "The Cortex/Research/New.md"
+          : "The Cortex/Research.md";
+  const sourcePath = localCreate
+    ? null
+    : move
+      ? "The Cortex/Research.md"
+      : create
+        ? targetPath
+        : root
+          ? null
+          : "The Cortex/Research.md";
+  const pageId = create ? null : root ? CORTEX_ROOT_ID : CORTEX_PAGE_ID;
+  const parentPageId = create || effectKind === "move-cortex-page" || move ? CORTEX_PARENT_ID : root ? null : CORTEX_ROOT_ID;
+  return {
+    schemaVersion: 1,
+    id,
+    installationId: INSTALLATION_ID,
+    effectKind,
+    relativePath: root ? null : targetPath,
+    remoteId: pageId,
+    allocationId: create ? HASH_C : null,
+    expectedByteHash: localCreate ? null : HASH_A,
+    expectedSemanticHash: HASH_A,
+    resultByteHash: HASH_B,
+    resultSemanticHash: HASH_B,
+    expectedRemoteEditedAt: TIMESTAMP,
+    createdAt: TIMESTAMP,
+    cortex: {
+      rootPageId: CORTEX_ROOT_ID,
+      pageId,
+      sourcePath,
+      targetPath,
+      expectedPostcondition: {
+        pageId,
+        parentPageId,
+        title: create ? "New" : root ? "The Cortex" : "Research",
+        relativePath: targetPath,
+        byteHash: HASH_B,
+        semanticHash: HASH_B,
+        structureHash: HASH_A,
+        editedAt: TIMESTAMP,
+      },
+    },
+  };
+}
 
 function intent(
   id: string,
@@ -76,6 +150,13 @@ function local(observation: Awaited<ReturnType<LocalRecoveryObserver["observe"]>
 
 function remote(result: Awaited<ReturnType<RemoteRecoveryObserver["classify"]>>): RemoteRecoveryObserver {
   return { classify: async () => result };
+}
+
+function cortex(result: Awaited<ReturnType<CortexRecoveryObserver["classify"]>>): CortexRecoveryObserver {
+  return {
+    classify: async () => result,
+    markAttention: async () => undefined,
+  };
 }
 
 async function temporaryDirectory(): Promise<string> {
@@ -333,6 +414,57 @@ describe("recoverIncompleteJournal", () => {
     expect(throwing.status).toBe("recovery-required");
     expect(JSON.stringify(throwing)).not.toContain("provider secret");
     expect(throwingJournal.completed).toEqual([]);
+  });
+
+  it.each([
+    "create-cortex-page",
+    "update-cortex-body",
+    "update-cortex-title",
+    "move-cortex-page",
+    "create-cortex-local",
+    "write-cortex-local",
+    "move-cortex-subtree",
+    "create-cortex-conflict",
+    "advance-cortex-state",
+  ] as const)("proves a Cortex %s postcondition only through the isolated Cortex observer", async (effectKind) => {
+    const pending = cortexIntent(INTENT_A, effectKind);
+    const journal = new MemoryJournalStore([pending]);
+    const localObserver = vi.fn<LocalRecoveryObserver["observe"]>();
+    const remoteObserver = vi.fn<RemoteRecoveryObserver["classify"]>();
+    const classify = vi.fn<CortexRecoveryObserver["classify"]>().mockResolvedValue({ kind: "post", evidence: evidence() });
+
+    const result = await recoverIncompleteJournal({
+      journal,
+      localObserver: { observe: localObserver },
+      remoteObserver: { classify: remoteObserver },
+      cortexObserver: { classify, markAttention: async () => undefined },
+    });
+
+    expect(result).toMatchObject({ status: "reconciled", reconciled: 1, retryable: 0 });
+    expect(classify).toHaveBeenCalledWith(pending);
+    expect(localObserver).not.toHaveBeenCalled();
+    expect(remoteObserver).not.toHaveBeenCalled();
+    expect(journal.completed).toEqual([{ id: INTENT_A, evidence: evidence() }]);
+  });
+
+  it("marks only Cortex attention and stops instead of replaying an ambiguous Cortex move", async () => {
+    const pending = cortexIntent(INTENT_A, "move-cortex-subtree");
+    const journal = new MemoryJournalStore([pending]);
+    const markAttention = vi.fn<CortexRecoveryObserver["markAttention"]>();
+
+    const result = await recoverIncompleteJournal({
+      journal,
+      localObserver: local({ kind: "missing" }),
+      remoteObserver: remote({ kind: "unprovable" }),
+      cortexObserver: {
+        classify: async () => ({ kind: "attention" }),
+        markAttention,
+      },
+    });
+
+    expect(result).toMatchObject({ status: "recovery-required", blockedId: INTENT_A });
+    expect(markAttention).toHaveBeenCalledWith(pending);
+    expect(journal.completed).toEqual([]);
   });
 
   it("sorts intents and stops at the first unrecoverable effect", async () => {

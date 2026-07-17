@@ -14,6 +14,7 @@ import {
   type NotionTransport,
   type NotionTransportResponse,
 } from "./transport.js";
+import { CortexNotionApi } from "../cortex/notion.js";
 
 export const NOTION_API_VERSION = "2026-03-11";
 export const NOTION_TIMEOUT_MS = 15_000;
@@ -25,6 +26,7 @@ const MAX_PLAIN_TEXT_BYTES = 2_000;
 const MAX_TAG_BYTES = 100;
 const MAX_TAGS = 100;
 const MAX_UNKNOWN_BLOCK_IDS = 100;
+const LEADING_H1_SENTINEL = "\u200B\n\n";
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const HASH_PATTERN = /^[0-9a-f]{64}$/u;
 const ISO_INSTANT_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u;
@@ -159,6 +161,7 @@ function isSafePageUrl(value: unknown, expectedPageId?: string): value is string
       parsed.protocol === "https:" &&
       (parsed.hostname === "notion.so" ||
         parsed.hostname.endsWith(".notion.so") ||
+        parsed.hostname === "app.notion.com" ||
         parsed.hostname === "notion.site" ||
         parsed.hostname.endsWith(".notion.site")) &&
       parsed.username === "" &&
@@ -478,6 +481,15 @@ function managedProperties(input: {
   };
 }
 
+/**
+ * Notion's Markdown surface can promote a first H1 into the page title even
+ * when the data-source title property is present. A zero-width leading block
+ * is discarded by Notion while keeping that H1 in the page body.
+ */
+function preserveLeadingH1(markdown: string): string {
+  return /^#[ \t]/u.test(markdown) ? `${LEADING_H1_SENTINEL}${markdown}` : markdown;
+}
+
 function blockParent(value: unknown, expectedBlockId: string): { readonly kind: "page" | "block"; readonly id: string } | null {
   if (!isRecord(value) || value.object !== "block" || value.id !== expectedBlockId || !isRecord(value.parent) || typeof value.parent.type !== "string") {
     throw clientFailure("invalid-response", false);
@@ -495,6 +507,7 @@ function blockParent(value: unknown, expectedBlockId: string): { readonly kind: 
 }
 
 export class NotionClient implements NotionApi {
+  public readonly cortexTree: CortexNotionApi;
   readonly #token: string;
   readonly #transport: NotionTransport;
   readonly #decoder: NotionObservationDecoder;
@@ -525,6 +538,9 @@ export class NotionClient implements NotionApi {
     this.#decoder = decoder;
     this.#clock = options.clock ?? defaultClock();
     this.#jitter = options.jitter ?? defaultJitter();
+    this.cortexTree = new CortexNotionApi({
+      request: async ({ method, path, body, query }) => this.#request(method, path, body, query),
+    });
   }
 
   public async verifyConnection(): Promise<{ userId: string; name: string | null }> {
@@ -578,7 +594,7 @@ export class NotionClient implements NotionApi {
           status: "synced",
           bridgeId: input.bridgeId,
         }),
-        markdown: input.markdown,
+        markdown: preserveLeadingH1(input.markdown),
       });
       const metadata = parsePageMetadata(created);
       return await this.retrievePage(metadata.pageId);
@@ -594,11 +610,12 @@ export class NotionClient implements NotionApi {
       if (observed.editedAt !== input.observedEditedAt) throw clientFailure("revision-race", false);
       const matches = bodyMatchCount(observed.sourceMarkdown, input.oldMarkdown);
       if (matches !== 1) throw clientFailure("revision-race", false);
+      const nextMarkdown = preserveLeadingH1(input.newMarkdown);
       const body = observed.sourceMarkdown.length === 0 && input.oldMarkdown.length === 0
-        ? { type: "replace_content", replace_content: { new_str: input.newMarkdown } }
+        ? { type: "replace_content", replace_content: { new_str: nextMarkdown } }
         : {
             type: "update_content",
-            update_content: { content_updates: [{ old_str: input.oldMarkdown, new_str: input.newMarkdown }] },
+            update_content: { content_updates: [{ old_str: input.oldMarkdown, new_str: nextMarkdown }] },
           };
       const updated = await this.#request<unknown>("PATCH", `/v1/pages/${input.pageId}/markdown`, body);
       parsePageMarkdown(updated, input.pageId);
@@ -650,7 +667,12 @@ export class NotionClient implements NotionApi {
     return decoded;
   }
 
-  async #request<T>(method: "GET" | "POST" | "PATCH", path: string, body?: unknown): Promise<T> {
+  async #request<T>(
+    method: "GET" | "POST" | "PATCH",
+    path: string,
+    body?: unknown,
+    query?: Readonly<Record<string, string>>,
+  ): Promise<T> {
     const canRetry = method === "GET";
     let retryAttempt = 0;
     while (true) {
@@ -666,6 +688,7 @@ export class NotionClient implements NotionApi {
             ...(body === undefined ? {} : { "Content-Type": "application/json" }),
           }),
           ...(body === undefined ? {} : { body }),
+          ...(query === undefined ? {} : { query }),
           timeoutMs: NOTION_TIMEOUT_MS,
           maxBytes: NOTION_RESPONSE_MAX_BYTES,
         });

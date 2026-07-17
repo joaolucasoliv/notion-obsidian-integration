@@ -1,10 +1,13 @@
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
+import { lstat } from "node:fs/promises";
 import { dirname, isAbsolute, normalize, resolve } from "node:path";
 import {
   parseBridgeConfig,
   parseBridgeRunSummary,
+  SAFE_ERROR_CODES,
   type BridgeRunSummary,
+  type SafeErrorCode,
 } from "@grandbox-bridge/shared";
 import { FileConfigStore } from "./persistence/config-store.js";
 import { FileJournalStore } from "./persistence/journal-store.js";
@@ -18,15 +21,25 @@ import { fromNotionMarkdown } from "./markdown/notion-mapping.js";
 import { semanticHash } from "./markdown/normalize.js";
 import { FetchNotionTransport } from "./notion/transport.js";
 import { NotionClient, type NotionObservationDecoder, type RawNotionPageRecord } from "./notion/client.js";
+import { createNotionWorkspaceProvisioner, NotionSetupError } from "./setup/notion-provision.js";
+import { InstallationInitializer, type NotionWorkspaceProvisioner } from "./setup/installation.js";
+import { readInstallationIdFromVault } from "./setup/vault-locator.js";
 import { persistedLinkMapping } from "./sync/reconcile.js";
 import { canonicalVaultRoot } from "./vault/safety.js";
 import { GrandboxBridgeWorker, type BridgeWorker, type WorkerLock } from "./worker.js";
 
 const MAX_SUMMARY_BYTES = 8 * 1_024;
+const MAX_SETUP_SUMMARY_BYTES = 1_024;
 const CLI_FAILURE_TIMESTAMP = "1970-01-01T00:00:00.000Z";
 
 export type ParsedCliArguments =
   | { readonly kind: "help" }
+  | {
+      readonly kind: "setup";
+      readonly mode: "preview" | "apply" | "status";
+      readonly vaultRoot: string;
+      readonly parentPageId: string | null;
+    }
   | {
       readonly kind: "run";
       readonly configPath: string;
@@ -42,6 +55,9 @@ export interface CliDependencies {
   readonly stdout: CliWritable;
   readonly stderr: CliWritable;
   readonly createWorker: (configPath: string) => Promise<BridgeWorker>;
+  readonly readSetupInstallationId?: (vaultRoot: string) => Promise<string>;
+  readonly readSetupToken?: () => Promise<string | null>;
+  readonly createInstallationInitializer?: (installationId: string) => Promise<Pick<InstallationInitializer, "initialize" | "status">>;
 }
 
 function cliError(): Error {
@@ -62,8 +78,50 @@ function validConfigPath(value: string): boolean {
   );
 }
 
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+
+function validPageId(value: string): boolean {
+  return UUID_PATTERN.test(value);
+}
+
+function parseSetupArguments(argv: readonly string[]): Extract<ParsedCliArguments, { readonly kind: "setup" }> {
+  const mode = argv[1];
+  if (mode !== "preview" && mode !== "apply" && mode !== "status") throw cliError();
+  let vaultRoot: string | null = null;
+  let parentPageId: string | null = null;
+  let json = false;
+  for (let index = 2; index < argv.length; index += 1) {
+    const current = argv[index];
+    if (current === "--vault" || current === "--parent-page-id") {
+      const value = argv[index + 1];
+      if (value === undefined || value.startsWith("--")) throw cliError();
+      index += 1;
+      if (current === "--vault") {
+        if (vaultRoot !== null || !validConfigPath(value)) throw cliError();
+        vaultRoot = value;
+      } else {
+        if (parentPageId !== null || !validPageId(value)) throw cliError();
+        parentPageId = value;
+      }
+      continue;
+    }
+    if (current === "--json") {
+      if (json) throw cliError();
+      json = true;
+      continue;
+    }
+    throw cliError();
+  }
+  if (vaultRoot === null || !json || ((mode === "preview" || mode === "apply") && parentPageId === null)) {
+    throw cliError();
+  }
+  if (mode === "status" && parentPageId !== null) throw cliError();
+  return Object.freeze({ kind: "setup" as const, mode, vaultRoot, parentPageId });
+}
+
 export function parseCliArguments(argv: readonly string[]): ParsedCliArguments {
   if (argv.length === 1 && argv[0] === "--help") return Object.freeze({ kind: "help" as const });
+  if (argv[0] === "setup") return parseSetupArguments(argv);
   let configPath: string | null = null;
   let reason: Extract<ParsedCliArguments, { readonly kind: "run" }> ["reason"] | null = null;
   let dryRun = false;
@@ -102,6 +160,7 @@ export function parseCliArguments(argv: readonly string[]): ParsedCliArguments {
 function helpText(): string {
   return [
     "Usage: bridge-worker.cjs --config <absolute-path> [--dry-run] --reason <manual|obsidian-event|schedule|reconciliation> --json",
+    "       bridge-worker.cjs setup <preview|apply|status> --vault <absolute-path> [--parent-page-id <uuid>] --json",
     "",
     "--config   Absolute normalized bridge configuration path.",
     "--dry-run  Plan safely without applying local, Notion, journal, state, or UUID mutations.",
@@ -137,6 +196,67 @@ function writeSummary(output: CliWritable, value: BridgeRunSummary): void {
   output.write(line);
 }
 
+function writeSetupSummary(output: CliWritable, value: unknown): void {
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    ((value as { readonly configuration?: unknown }).configuration !== "unconfigured" &&
+      (value as { readonly configuration?: unknown }).configuration !== "ready") ||
+    typeof (value as { readonly created?: unknown }).created !== "boolean"
+  ) {
+    throw new Error("Invalid setup summary");
+  }
+  const line = `${JSON.stringify({
+    configuration: (value as { readonly configuration: "unconfigured" | "ready" }).configuration,
+    created: (value as { readonly created: boolean }).created,
+  })}\n`;
+  if (Buffer.byteLength(line, "utf8") > MAX_SETUP_SUMMARY_BYTES) throw new Error("Setup summary exceeds output budget");
+  output.write(line);
+}
+
+function isSafeErrorCode(value: unknown): value is SafeErrorCode {
+  return typeof value === "string" && (SAFE_ERROR_CODES as readonly string[]).includes(value);
+}
+
+function setupFailureCode(caught: unknown): SafeErrorCode {
+  if (caught instanceof NotionSetupError && isSafeErrorCode(caught.code)) return caught.code;
+  return "internal-error";
+}
+
+function writeSetupFailure(output: CliWritable, code: SafeErrorCode): void {
+  const line = `${JSON.stringify({ configuration: "unconfigured", created: false, error: code })}\n`;
+  if (Buffer.byteLength(line, "utf8") > MAX_SETUP_SUMMARY_BYTES) throw new Error("Setup failure exceeds output budget");
+  output.write(line);
+}
+
+/** Reads one credential from stdin so it never appears in argv, a file, or a log. */
+export async function readSetupToken(source: AsyncIterable<Uint8Array | string>): Promise<string> {
+  const chunks: Buffer[] = [];
+  let bytes = 0;
+  try {
+    for await (const chunk of source) {
+      const next = Buffer.from(chunk);
+      bytes += next.byteLength;
+      if (bytes > 8_193) throw new Error("setup credential unavailable");
+      chunks.push(next);
+    }
+  } catch (caught) {
+    if (caught instanceof Error && caught.message === "setup credential unavailable") throw caught;
+    throw new Error("setup credential unavailable");
+  }
+  const input = Buffer.concat(chunks).toString("utf8");
+  const token = input.endsWith("\n") ? input.slice(0, -1) : input;
+  if (
+    token.length === 0 ||
+    Buffer.byteLength(token, "utf8") > 8_192 ||
+    /[\r\n\0]/u.test(token) ||
+    !Buffer.from(token, "utf8").equals(Buffer.concat(chunks).subarray(0, Buffer.byteLength(input.endsWith("\n") ? token : input, "utf8")))
+  ) {
+    throw new Error("setup credential unavailable");
+  }
+  return token;
+}
+
 function safeDiagnostic(stderr: CliWritable, message: string): void {
   try {
     stderr.write(`${redactSensitiveOutput(message)}\n`);
@@ -156,6 +276,38 @@ export async function runCli(argv: readonly string[], dependencies: CliDependenc
   if (parsed.kind === "help") {
     dependencies.stdout.write(helpText());
     return 0;
+  }
+  if (parsed.kind === "setup") {
+    try {
+      if (
+        dependencies.readSetupInstallationId === undefined ||
+        dependencies.createInstallationInitializer === undefined ||
+        (parsed.mode === "apply" && dependencies.readSetupToken === undefined)
+      ) {
+        throw new Error("setup unavailable");
+      }
+      const installationId = await dependencies.readSetupInstallationId(parsed.vaultRoot);
+      const initializer = await dependencies.createInstallationInitializer(installationId);
+      const result = parsed.mode === "status"
+        ? await initializer.status({ installationId, vaultRoot: parsed.vaultRoot })
+        : await initializer.initialize({
+          installationId,
+          vaultRoot: parsed.vaultRoot,
+          parentPageId: parsed.parentPageId as string,
+          token: parsed.mode === "apply" ? await dependencies.readSetupToken?.() ?? null : null,
+          mode: parsed.mode,
+        });
+      writeSetupSummary(dependencies.stdout, result);
+      return 0;
+    } catch (caught) {
+      try {
+        writeSetupFailure(dependencies.stdout, setupFailureCode(caught));
+      } catch {
+        // A failed stdout must not leak provider details through stderr.
+      }
+      safeDiagnostic(dependencies.stderr, "bridge-worker: setup failed");
+      return 1;
+    }
   }
   try {
     const worker = await dependencies.createWorker(parsed.configPath);
@@ -234,6 +386,91 @@ function processRunner(): ProcessRunner {
       if (input.stdin !== undefined) child.stdin?.end(input.stdin, "utf8");
     }),
   };
+}
+
+async function fileMissing(filePath: string): Promise<boolean> {
+  try {
+    await lstat(filePath);
+    return false;
+  } catch (caught) {
+    if ((caught as NodeJS.ErrnoException).code === "ENOENT") return true;
+    throw new Error("Runtime setup unavailable");
+  }
+}
+
+function initialInstallationState(installationId: string) {
+  return {
+    schemaVersion: 1 as const,
+    installationId,
+    pairs: {},
+    graph: null,
+    lastFullReconciliationAt: null,
+    lastRun: null,
+  };
+}
+
+export interface ProductionInstallationInitializerOptions {
+  readonly processRunner?: ProcessRunner;
+  readonly provisionNotion?: NotionWorkspaceProvisioner;
+}
+
+export interface ProductionCliDependenciesInput {
+  readonly stdout: CliWritable;
+  readonly stderr: CliWritable;
+  readonly homeDirectory: string;
+  readonly setupTokenSource: AsyncIterable<Uint8Array | string>;
+  readonly processRunner?: ProcessRunner;
+  readonly provisionNotion?: NotionWorkspaceProvisioner;
+}
+
+/** Composes file, Keychain, vault, and Notion adapters only for an explicit local setup action. */
+export function createProductionInstallationInitializer(
+  configPath: string,
+  installationId: string,
+  options: ProductionInstallationInitializerOptions = {},
+): InstallationInitializer {
+  const runtimePaths = deriveProductionRuntimePaths(configPath, installationId);
+  const config = new FileConfigStore(configPath, installationId);
+  const state = new FileStateStore(runtimePaths.statePath, installationId);
+  return new InstallationInitializer({
+    canonicalizeVault: async (vaultRoot, requestedInstallationId) => canonicalVaultRoot(vaultRoot, requestedInstallationId, {
+      mode: "bootstrap",
+    }),
+    config: {
+      load: async () => await fileMissing(configPath) ? null : config.load(),
+      save: async (value) => config.save(value),
+    },
+    state: {
+      ensureInitial: async (requestedInstallationId) => {
+        if (requestedInstallationId !== installationId) throw new Error("Runtime setup unavailable");
+        if (await fileMissing(runtimePaths.statePath)) {
+          await state.save(initialInstallationState(installationId));
+          return;
+        }
+        await state.load();
+      },
+    },
+    credentials: new MacOSKeychainCredentialStore(installationId, options.processRunner ?? processRunner()),
+    provisionNotion: options.provisionNotion ?? createNotionWorkspaceProvisioner(),
+  });
+}
+
+/** Production command composition; the setup-only dependencies remain inert until the setup subcommand is invoked. */
+export function createProductionCliDependencies(input: ProductionCliDependenciesInput): CliDependencies {
+  return Object.freeze({
+    stdout: input.stdout,
+    stderr: input.stderr,
+    createWorker: createProductionWorker,
+    readSetupInstallationId: readInstallationIdFromVault,
+    readSetupToken: async () => readSetupToken(input.setupTokenSource),
+    createInstallationInitializer: async (installationId: string) => {
+      const runtimePaths = deriveRuntimePaths(input.homeDirectory, installationId);
+      return createProductionInstallationInitializer(runtimePaths.configPath, installationId, {
+        ...(input.processRunner === undefined ? {} : { processRunner: input.processRunner }),
+        ...(input.provisionNotion === undefined ? {} : { provisionNotion: input.provisionNotion }),
+      });
+    },
+  });
 }
 
 function runtimeLock(lockPath: string): WorkerLock {
@@ -316,7 +553,12 @@ export async function createProductionWorker(configPath: string): Promise<Bridge
 }
 
 export async function main(argv: readonly string[] = process.argv.slice(2)): Promise<number> {
-  return runCli(argv, { stdout: process.stdout, stderr: process.stderr, createWorker: createProductionWorker });
+  return runCli(argv, createProductionCliDependencies({
+    stdout: process.stdout,
+    stderr: process.stderr,
+    homeDirectory: process.env.HOME ?? "",
+    setupTokenSource: process.stdin,
+  }));
 }
 
 if (process.argv[1]?.endsWith("bridge-worker.cjs")) {

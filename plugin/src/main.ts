@@ -3,12 +3,16 @@ import type { BridgeRunSummary } from "@grandbox-bridge/shared";
 import { changeNoteOptIn, isGeneratedGithubNote, isManageableMarkdownPath } from "./commands.js";
 import {
   LocalWorkerController,
+  supportsNotionSetup,
   NodeWorkerProcessRunner,
   supportsEventSync,
   type BridgeStatus,
+  type NotionConnectionInput,
+  type NotionConnectionResult,
   type WorkerController,
 } from "./controller.js";
 import { deriveExternalLocator, isCanonicalInstallationId, type ExternalLocator } from "./locator.js";
+import { resolveNodeExecutable } from "./node-runtime.js";
 import { NodeServiceCommandRunner, RuntimeServiceManager } from "./service-manager.js";
 import { GrandboxBridgeSettingTab } from "./settings.js";
 import { STATUS_NOTE_PATH, updateStatusNote } from "./status-note.js";
@@ -61,6 +65,24 @@ function actionNotice(summary: BridgeRunSummary): string {
   return `Grandbox Bridge: ${summary.writes} writes, ${summary.conflicts} conflicts, ${summary.errors} errors.`;
 }
 
+function notionConnectionNotice(result: NotionConnectionResult): string {
+  if (result.error === "not-found") {
+    return "Grandbox Bridge: choose a parent page, not a workspace ID, then add The Grandbox Connection to that page.";
+  }
+  if (result.error === "authentication-failed") {
+    return "Grandbox Bridge: Notion rejected the connection token. Create or copy a fresh token and try again.";
+  }
+  if (result.error === "authorization-failed") {
+    return "Grandbox Bridge: share the parent page with The Grandbox Connection and enable Read, Insert, and Update content.";
+  }
+  if (result.error === "rate-limited") return "Grandbox Bridge: Notion is temporarily rate-limiting this connection. Try again shortly.";
+  if (result.error === "network-failed" || result.error === "timeout") {
+    return "Grandbox Bridge: Notion could not be reached. Check your connection and try again.";
+  }
+  if (result.error !== undefined) return "Grandbox Bridge: Notion connection unavailable.";
+  return result.created ? "Grandbox Bridge: Notion connected." : "Grandbox Bridge: Notion connection restored.";
+}
+
 export class GrandboxBridgePlugin extends Plugin {
   private controller: WorkerController | null = null;
   private scheduler: DebounceScheduler | null = null;
@@ -77,6 +99,7 @@ export class GrandboxBridgePlugin extends Plugin {
     this.addSettingTab(new GrandboxBridgeSettingTab(this.app, this, {
       preview: () => this.preview(),
       syncNow: () => this.syncNow(),
+      connectNotion: (input) => this.connectNotion(input),
       installService: () => this.installService(),
       disableService: () => this.disableService(),
       status: () => this.readStatus(),
@@ -123,7 +146,8 @@ export class GrandboxBridgePlugin extends Plugin {
     return deriveExternalLocator({
       installationId: id,
       homeDirectory,
-      nodeExecutable: process.execPath,
+      vaultRoot,
+      nodeExecutable: resolveNodeExecutable({ homeDirectory, path: process.env.PATH }),
       workerPath: `${vaultRoot}/${this.app.vault.configDir}/plugins/${this.manifest.id}/bridge-worker.cjs`,
     });
   }
@@ -165,6 +189,18 @@ export class GrandboxBridgePlugin extends Plugin {
 
   private async syncNow(): Promise<void> {
     await this.runWorkerAction((controller) => controller.syncNow());
+  }
+
+  private async connectNotion(input: NotionConnectionInput): Promise<void> {
+    try {
+      const result = await this.serialize(async () => {
+        if (this.controller === null || !supportsNotionSetup(this.controller)) throw pluginError();
+        return this.controller.connectNotion(input);
+      });
+      new Notice(notionConnectionNotice(result));
+    } catch {
+      new Notice("Grandbox Bridge: Notion connection unavailable.");
+    }
   }
 
   private async syncFromVaultEvent(): Promise<void> {

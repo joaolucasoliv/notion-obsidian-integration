@@ -14,6 +14,7 @@ import {
 
 const MAX_TAG_COUNT = 128;
 const MAX_TAG_BYTES = 256;
+const NOTION_AMBIGUOUS_SOFT_WRAP_SPECIALS = /[\\*~`$\[\]<>{}|^]/u;
 
 export const REMARK_STRINGIFY_OPTIONS = Object.freeze({
   bullet: "-" as const,
@@ -79,6 +80,25 @@ export function stringifyMarkdown(root: Root): string {
     .stringify(root);
 }
 
+/**
+ * Notion's Markdown endpoint collapses a plain soft wrap and adjacent plain
+ * paragraph blocks to the same one-newline representation. Normalize locally
+ * authored soft wraps to a single line before that provider boundary so a
+ * successful remote write cannot later fail its semantic postcondition.
+ */
+function canonicalizeTopLevelPlainSoftWraps(root: Root): void {
+  for (const node of root.children) {
+    const child = node.type === "paragraph" && node.children.length === 1 ? node.children[0] : undefined;
+    if (
+      child?.type === "text" &&
+      child.value.includes("\n") &&
+      !NOTION_AMBIGUOUS_SOFT_WRAP_SPECIALS.test(child.value)
+    ) {
+      child.value = child.value.replaceAll("\n", " ");
+    }
+  }
+}
+
 export interface NormalizeLocalOptions {
   readonly onMaskRestorationPass?: () => void;
 }
@@ -89,6 +109,7 @@ export function normalizeLocal(
   options: NormalizeLocalOptions = {},
 ): SemanticNote {
   const masked = maskObsidianSyntax(document);
+  canonicalizeTopLevelPlainSoftWraps(masked.root);
   const bodyMarkdown = restoreMarkdownMask(
     stringifyMarkdown(masked.root),
     masked,

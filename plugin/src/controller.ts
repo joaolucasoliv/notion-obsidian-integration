@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { parseBridgeRunSummary, type BridgeRunSummary } from "@grandbox-bridge/shared";
+import { parseBridgeRunSummary, SAFE_ERROR_CODES, type BridgeRunSummary, type SafeErrorCode } from "@grandbox-bridge/shared";
 import { isCanonicalInstallationId, type ExternalLocator } from "./locator.js";
 
 const MAX_WORKER_SUMMARY_BYTES = 8 * 1_024;
@@ -26,6 +26,22 @@ export interface WorkerController {
   status(): Promise<BridgeStatus>;
 }
 
+export interface NotionConnectionInput {
+  readonly parentPageId: string;
+  readonly token: string;
+}
+
+export interface NotionConnectionResult {
+  readonly configuration: "unconfigured" | "ready";
+  readonly created: boolean;
+  readonly error?: SafeErrorCode;
+}
+
+/** Optional extension used only by the explicit settings onboarding control. */
+export interface SetupWorkerController extends WorkerController {
+  connectNotion(input: NotionConnectionInput): Promise<NotionConnectionResult>;
+}
+
 /** An optional extension used only for a debounced vault event reason. */
 export interface EventWorkerController extends WorkerController {
   syncFromVaultEvent(): Promise<BridgeRunSummary>;
@@ -35,6 +51,7 @@ export interface WorkerCommand {
   readonly executable: string;
   readonly args: readonly string[];
   readonly shell: false;
+  readonly stdin?: string;
 }
 
 export interface WorkerProcessResult {
@@ -83,8 +100,9 @@ function validExternalLocator(value: unknown): value is ExternalLocator {
   if (typeof value !== "object" || value === null) return false;
   const locator = value as ExternalLocator;
   if (
-    !isCanonicalInstallationId(locator.installationId) ||
-    !isAbsoluteNormalizedPath(locator.homeDirectory) ||
+      !isCanonicalInstallationId(locator.installationId) ||
+      !isAbsoluteNormalizedPath(locator.homeDirectory) ||
+      !isAbsoluteNormalizedPath(locator.vaultRoot) ||
     !isAbsoluteNormalizedPath(locator.runtimeRoot) ||
     !isAbsoluteNormalizedPath(locator.configPath) ||
     !isAbsoluteNormalizedPath(locator.nodeExecutable) ||
@@ -123,6 +141,56 @@ function validBridgeStatus(value: unknown): value is BridgeStatus {
   );
 }
 
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+
+function validConnectionInput(value: unknown): value is NotionConnectionInput {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    UUID_PATTERN.test((value as NotionConnectionInput).parentPageId) &&
+    typeof (value as NotionConnectionInput).token === "string" &&
+    (value as NotionConnectionInput).token.length > 0 &&
+    Buffer.byteLength((value as NotionConnectionInput).token, "utf8") <= 8_192 &&
+    !/[\r\n\0]/u.test((value as NotionConnectionInput).token)
+  );
+}
+
+function isSafeErrorCode(value: unknown): value is SafeErrorCode {
+  return typeof value === "string" && (SAFE_ERROR_CODES as readonly string[]).includes(value);
+}
+
+function parseConnectionResult(stdout: string): NotionConnectionResult {
+  if (Buffer.byteLength(stdout, "utf8") > MAX_WORKER_SUMMARY_BYTES) throw controllerError();
+  const line = stdout.trim();
+  if (line.length === 0 || line.includes("\n")) throw controllerError();
+  try {
+    const value = JSON.parse(line) as unknown;
+    if (typeof value !== "object" || value === null) throw controllerError();
+    const result = value as Record<string, unknown>;
+    if (
+      Object.keys(result).length === 2 &&
+      (result.configuration === "unconfigured" || result.configuration === "ready") &&
+      typeof result.created === "boolean"
+    ) {
+      return Object.freeze({
+        configuration: result.configuration,
+        created: result.created,
+      });
+    }
+    if (
+      Object.keys(result).length === 3 &&
+      result.configuration === "unconfigured" &&
+      result.created === false &&
+      isSafeErrorCode(result.error)
+    ) {
+      return Object.freeze({ configuration: "unconfigured", created: false, error: result.error });
+    }
+    throw controllerError();
+  } catch {
+    throw controllerError();
+  }
+}
+
 function workerArguments(
   locator: ExternalLocator,
   mode: "preview" | "apply",
@@ -134,12 +202,31 @@ function workerArguments(
   return Object.freeze(args);
 }
 
+function setupArguments(locator: ExternalLocator, input: NotionConnectionInput): WorkerCommand {
+  if (!validConnectionInput(input)) throw controllerError();
+  return Object.freeze({
+    executable: locator.nodeExecutable,
+    args: Object.freeze([
+      locator.workerPath,
+      "setup",
+      "apply",
+      "--vault",
+      locator.vaultRoot,
+      "--parent-page-id",
+      input.parentPageId,
+      "--json",
+    ]),
+    shell: false,
+    stdin: `${input.token}\n`,
+  });
+}
+
 /**
  * Runs the already-installed worker through a fixed argv boundary.  It holds
  * one queue for manual/event/service operations so concurrent UI gestures
  * cannot create overlapping processes.
  */
-export class LocalWorkerController implements EventWorkerController {
+export class LocalWorkerController implements EventWorkerController, SetupWorkerController {
   private tail: Promise<void> = Promise.resolve();
 
   public constructor(
@@ -160,6 +247,10 @@ export class LocalWorkerController implements EventWorkerController {
 
   public syncFromVaultEvent(): Promise<BridgeRunSummary> {
     return this.enqueue(() => this.runWorker("apply", "obsidian-event"));
+  }
+
+  public connectNotion(input: NotionConnectionInput): Promise<NotionConnectionResult> {
+    return this.enqueue(() => this.runSetup(input));
   }
 
   public installService(): Promise<ServiceStatus> {
@@ -217,6 +308,19 @@ export class LocalWorkerController implements EventWorkerController {
       throw controllerError();
     }
   }
+
+  private async runSetup(input: NotionConnectionInput): Promise<NotionConnectionResult> {
+    try {
+      const result = await this.runner.run(setupArguments(this.locator, input));
+      if (!validWorkerResult(result)) throw controllerError();
+      const connection = parseConnectionResult(result.stdout);
+      if (result.code === 0 && connection.error === undefined) return connection;
+      if (result.code === 1 && connection.error !== undefined) return connection;
+      throw controllerError();
+    } catch {
+      throw controllerError();
+    }
+  }
 }
 
 /** Electron/Node adapter used only after a user invokes an explicit command. */
@@ -227,7 +331,7 @@ export class NodeWorkerProcessRunner implements WorkerProcessRunner {
       try {
         child = spawn(command.executable, command.args, {
           shell: command.shell,
-          stdio: ["ignore", "pipe", "ignore"],
+        stdio: [command.stdin === undefined ? "ignore" : "pipe", "pipe", "ignore"],
           windowsHide: true,
         });
       } catch {
@@ -249,10 +353,15 @@ export class NodeWorkerProcessRunner implements WorkerProcessRunner {
       child.on("close", (code) => {
         resolve(Object.freeze({ code: typeof code === "number" ? code : 1, stdout: Buffer.concat(chunks).toString("utf8") }));
       });
+      if (command.stdin !== undefined) child.stdin?.end(command.stdin, "utf8");
     });
   }
 }
 
 export function supportsEventSync(controller: WorkerController): controller is EventWorkerController {
   return typeof (controller as Partial<EventWorkerController>).syncFromVaultEvent === "function";
+}
+
+export function supportsNotionSetup(controller: WorkerController): controller is SetupWorkerController {
+  return typeof (controller as Partial<SetupWorkerController>).connectNotion === "function";
 }

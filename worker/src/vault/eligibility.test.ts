@@ -18,6 +18,15 @@ const fixture = (relativePath: string): Promise<string> =>
   );
 
 describe("classifyEligibility", () => {
+  it("keeps a reserved Cortex note out of the legacy direct-pair flow before opt-in checks", () => {
+    const note = parseLocalNote(
+      "The Cortex/Research.md",
+      "---\ncortex_tree: true\ncortex_page_id: 22222222-2222-4222-8222-222222222222\ncortex_parent_page_id: 11111111-1111-4111-8111-111111111111\ncortex_root_page_id: 11111111-1111-4111-8111-111111111111\n---\nResearch",
+    );
+
+    expect(classifyEligibility(note)).toEqual({ eligible: false, reason: "cortex-owned" });
+  });
+
   it("requires the exact YAML boolean opt-in", () => {
     const optedIn = parseLocalNote("Notes/opted-in.md", "---\nnotion_sync: true\n---\nBody");
     const optedOut = parseLocalNote("Notes/opted-out.md", "---\nnotion_sync: false\n---\nBody");

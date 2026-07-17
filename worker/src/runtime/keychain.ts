@@ -2,6 +2,7 @@ import type { CredentialSlot, CredentialStore } from "@grandbox-bridge/shared";
 import { assertValidInstallationId } from "./paths.js";
 
 const SECURITY_EXECUTABLE = "/usr/bin/security";
+const EXPECT_EXECUTABLE = "/usr/bin/expect";
 const MAX_RUNNER_BYTES = 8_192;
 const VALID_SLOTS = new Set<CredentialSlot>(["notion-token", "relay-token", "relay-token-pending", "graph-key"]);
 
@@ -34,6 +35,27 @@ function assertCredentialSlot(slot: string): asserts slot is CredentialSlot {
 
 function serviceName(slot: CredentialSlot): string {
   return `GrandboxBridge/${slot}`;
+}
+
+/**
+ * `security add-generic-password -w` reads a password from its controlling
+ * terminal and asks for confirmation. A normal child-process stdin pipe is
+ * not that terminal, so it silently stores an empty value. Expect provides a
+ * private pseudo-terminal while the credential remains only on stdin.
+ */
+function hiddenPasswordPrompt(account: string, slot: CredentialSlot): string {
+  return [
+    "log_user 0",
+    "set timeout 10",
+    'set token [string trimright [read stdin] "\\r\\n"]',
+    `spawn ${SECURITY_EXECUTABLE} add-generic-password -U -a ${account} -s ${serviceName(slot)} -w`,
+    "expect -re {(?i)password.*:}",
+    'send -- "$token\\r"',
+    "expect -re {(?i)password.*:}",
+    'send -- "$token\\r"',
+    "expect eof",
+    "exit [lindex [wait] 3]",
+  ].join("\n");
 }
 
 export class MacOSKeychainCredentialStore implements CredentialStore {
@@ -77,8 +99,8 @@ export class MacOSKeychainCredentialStore implements CredentialStore {
       throw keychainError();
     }
     const result = await this.run({
-      executable: SECURITY_EXECUTABLE,
-      args: ["add-generic-password", "-U", "-a", this.account, "-s", serviceName(slot), "-w"],
+      executable: EXPECT_EXECUTABLE,
+      args: ["-c", hiddenPasswordPrompt(this.account, slot)],
       stdin: `${value}\n`,
       maxBytes: MAX_RUNNER_BYTES,
     });
